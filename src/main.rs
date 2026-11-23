@@ -253,10 +253,13 @@ impl Runtime {
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let mut frame_out = None;
-        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+        let mut full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             frame_out = Some(self.app.run_ui(ui));
         });
-        let Some(out) = frame_out else { return };
+        let Some(out) = frame_out else {
+            full_output.textures_delta.clear();
+            return;
+        };
 
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
@@ -269,6 +272,7 @@ impl Runtime {
             self.window.focus_window();
         }
         if out.close_cmd {
+            full_output.textures_delta.clear();
             event_loop.exit();
             return;
         }
@@ -285,9 +289,9 @@ impl Runtime {
 
         let ppp = full_output.pixels_per_point;
         let paint_jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
-        for (id, deltas) in &full_output.textures_delta.set {
-            for delta in deltas {
-                self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+        for (id, deltas) in full_output.textures_delta.set.drain() {
+            for delta in &deltas {
+                self.egui_renderer.update_texture(&self.device, &self.queue, id, delta);
             }
         }
 
@@ -312,16 +316,16 @@ impl Runtime {
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.needs_reconfigure = true;
-                for id in &full_output.textures_delta.free {
-                    self.egui_renderer.free_texture(id);
+                for id in full_output.textures_delta.free.drain() {
+                    self.egui_renderer.free_texture(&id);
                 }
                 return;
             }
             wgpu::CurrentSurfaceTexture::Timeout
             | wgpu::CurrentSurfaceTexture::Occluded
             | wgpu::CurrentSurfaceTexture::Validation => {
-                for id in &full_output.textures_delta.free {
-                    self.egui_renderer.free_texture(id);
+                for id in full_output.textures_delta.free.drain() {
+                    self.egui_renderer.free_texture(&id);
                 }
                 return;
             }
@@ -373,8 +377,8 @@ impl Runtime {
             .submit(extra_cmds.into_iter().chain(std::iter::once(encoder.finish())));
         self.queue.present(surface_tex);
 
-        for id in &full_output.textures_delta.free {
-            self.egui_renderer.free_texture(id);
+        for id in full_output.textures_delta.free.drain() {
+            self.egui_renderer.free_texture(&id);
         }
 
         // 4. Headless / CLI screenshot capture (clean SDR PNG readback)
