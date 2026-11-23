@@ -1,7 +1,7 @@
 use crate::audio::AudioEngine;
 use crate::gpu::{FrameInput, HdrStatus};
-use crate::guide::GuideState;
-use crate::jellyfin::{ChannelKind, JellyfinManager};
+use crate::guide::{GuideState, GuideView};
+use crate::jellyfin::{ChannelKind, JellyfinManager, MediaItem, TuneTarget};
 use crate::mpv::{Player, StartOpts};
 use crate::osd::TvOsd;
 use crate::settings::{self, Input, Mask, Pattern, PhosphorSet, Settings, TapeSpeed, UserPreset};
@@ -88,6 +88,7 @@ pub struct CrtApp {
     last_ended_item: Option<String>,
     muted: bool,
     show_api_key: bool,
+    panel_season_filter: Option<u32>,
     // sound
     audio: Option<AudioEngine>,
     // linking with the person's own mpv
@@ -298,6 +299,7 @@ impl CrtApp {
             last_ended_item: None,
             muted: false,
             show_api_key: false,
+            panel_season_filter: None,
             audio,
             inbox: if screenshot_mode { None } else { Some(crate::link::listen(egui_ctx.clone())) },
             use_my_mpv: true,
@@ -577,6 +579,7 @@ impl CrtApp {
         self.sim.switch_channel();
         self.reset_trails = true;
         if self.guide.active {
+            self.guide.close_picker();
             if let Some(cur) = self.current_channel {
                 let vis = self.jellyfin.visible_channels();
                 if let Some(pos) = vis.iter().position(|c| c.number == cur) {
@@ -586,12 +589,83 @@ impl CrtApp {
             }
             self.osd.show_channel(1, "GUIDE", "", self.s.mono);
         } else if let Some(cur) = self.current_channel {
+            self.guide.close_picker();
             if let Some(w) = &self.jellyfin.active_watch {
                 let cs = w.callsign.clone();
                 let title = w.title.clone();
                 self.osd.show_channel(cur, &cs, &title, self.s.mono);
             }
         }
+    }
+
+    fn apply_tune_target(&mut self, target: TuneTarget) {
+        self.pending_tune_channel = None;
+        self.last_ended_item = None;
+        self.current_channel = Some(target.channel_number);
+        self.guide.active = false;
+        self.guide.close_picker();
+        self.sim.switch_channel();
+        self.jellyfin.begin_watch(&target);
+        self.start_video_at(target.stream_url.clone(), target.start_secs);
+        self.video_name = format!("CH {:02} {}", target.channel_number, target.channel_name);
+        let sub = if target.is_live_clock {
+            format!("LIVE · {}", target.item.short_label())
+        } else {
+            target.item.short_label()
+        };
+        self.osd.show_channel(target.channel_number, &target.callsign, &sub, self.s.mono);
+    }
+
+    fn tune_specific(&mut self, channel_number: u16, item: MediaItem, from_start: bool) {
+        let Some(ch) = self.jellyfin.channel_by_number(channel_number).cloned() else { return };
+        let url = self.jellyfin.cfg.normalized_url();
+        let key = self.jellyfin.cfg.api_key.clone();
+        let target = ch.tune_specific_item(&item, &url, &key, from_start);
+        self.apply_tune_target(target);
+    }
+
+    fn open_episode_picker(&mut self, channel_number: u16) {
+        if !self.jellyfin.connected || channel_number <= 1 {
+            return;
+        }
+        let Some(ch) = self.jellyfin.channel_by_number(channel_number).cloned() else { return };
+        if let ChannelKind::Series { ref series_id, loaded_episodes: false, .. } = ch.kind {
+            self.jellyfin.ensure_series_episodes(series_id);
+        }
+        let active_id = self.jellyfin.active_watch.as_ref().map(|w| w.item_id.as_str());
+        let init_idx = ch.default_item_index(active_id);
+        self.guide.active = true;
+        self.guide.open_picker(channel_number, init_idx, ch.items().len());
+        self.reset_trails = true;
+    }
+
+    fn step_episode(&mut self, delta: isize) {
+        let Some(w) = self.jellyfin.active_watch.as_ref() else { return };
+        let ch_num = w.channel_number;
+        let item_id = w.item_id.clone();
+        let Some(ch) = self.jellyfin.channel_by_number(ch_num).cloned() else { return };
+        let url = self.jellyfin.cfg.normalized_url();
+        let key = self.jellyfin.cfg.api_key.clone();
+        let target = if delta > 0 {
+            ch.next_after(&item_id, &url, &key)
+        } else {
+            ch.prev_before(&item_id, &url, &key)
+        };
+        if let Some(t) = target {
+            self.apply_tune_target(t);
+            self.osd.show_action(if delta > 0 { "NEXT EPISODE" } else { "PREV EPISODE" });
+        } else {
+            self.osd.show_action(if delta > 0 { "LAST EPISODE" } else { "FIRST EPISODE" });
+        }
+    }
+
+    fn toggle_current_watched(&mut self) {
+        let Some(w) = self.jellyfin.active_watch.as_ref() else { return };
+        let ch_num = w.channel_number;
+        let item_id = w.item_id.clone();
+        let new_played = !w.marked_played;
+        self.jellyfin.set_item_played(ch_num, &item_id, new_played);
+        self.osd.show_action(if new_played { "MARKED WATCHED" } else { "MARKED UNWATCHED" });
     }
 
     fn tune_channel(&mut self, number: u16) {
@@ -627,20 +701,7 @@ impl CrtApp {
             self.osd.show_action(&format!("CH {:02} OFF AIR", number));
             return;
         };
-        self.pending_tune_channel = None;
-        self.last_ended_item = None;
-        self.current_channel = Some(number);
-        self.guide.active = false;
-        self.sim.switch_channel();
-        self.jellyfin.begin_watch(&target);
-        self.start_video_at(target.stream_url.clone(), target.start_secs);
-        self.video_name = format!("CH {:02} {}", number, target.channel_name);
-        let sub = if target.is_live_clock {
-            format!("LIVE · {}", target.item.short_label())
-        } else {
-            target.item.short_label()
-        };
-        self.osd.show_channel(number, &target.callsign, &sub, self.s.mono);
+        self.apply_tune_target(target);
     }
 
     fn surf_channel(&mut self, delta: isize) {
@@ -822,8 +883,132 @@ impl CrtApp {
                     if cfg_changed {
                         let _ = crate::jellyfin::save_config(&self.jellyfin.cfg);
                     }
+
+                    // Active playback quick actions (Mark Watched, Next/Prev Episode, Restart, Episode Picker)
+                    if let Some(w) = &self.jellyfin.active_watch {
+                        let ch_num = w.channel_number;
+                        let title = w.title.clone();
+                        let played = w.marked_played;
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("On air: CH {:02} · {}", ch_num, title))
+                                .strong()
+                                .small()
+                                .color(Color32::from_rgb(138, 240, 178)),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Prev Ep").on_hover_text("Previous episode (P)").clicked() {
+                                self.step_episode(-1);
+                            }
+                            if ui.small_button("Next Ep").on_hover_text("Next episode (N)").clicked() {
+                                self.step_episode(1);
+                            }
+                            let w_lbl = if played { "Mark Unwatched" } else { "Mark Watched" };
+                            if ui.small_button(w_lbl).on_hover_text("Toggle watched status in Jellyfin (W)").clicked() {
+                                self.toggle_current_watched();
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Pick Episode (E)").on_hover_text("Browse all episodes on the CRT guide (E)").clicked() {
+                                self.open_episode_picker(ch_num);
+                            }
+                            if ui.small_button("Restart 0:00").on_hover_text("Restart from the beginning (R)").clicked() {
+                                if let Some(p) = &self.player {
+                                    p.seek_abs(0.0);
+                                    self.osd.show_action("RESTART 0:00");
+                                }
+                            }
+                        });
+                    }
+
+                    // Quick Episode / Movie browser for the active (or guide-selected) channel
+                    let browse_ch_num = self
+                        .guide
+                        .picker_channel()
+                        .or(self.current_channel)
+                        .or_else(|| {
+                            self.jellyfin
+                                .visible_channels()
+                                .get(self.guide.selected_idx)
+                                .filter(|c| c.number > 1)
+                                .map(|c| c.number)
+                        });
+                    if let Some(bch_num) = browse_ch_num {
+                        if let Some(bch) = self.jellyfin.channel_by_number(bch_num).cloned() {
+                            if let ChannelKind::Series { ref series_id, loaded_episodes: false, .. } = bch.kind {
+                                self.jellyfin.ensure_series_episodes(series_id);
+                            }
+                            let items = bch.items().to_vec();
+                            let header = format!("Episodes / Movies — CH {:02} {}", bch.number, bch.name);
+                            let mut play_req: Option<(MediaItem, bool)> = None;
+                            let mut watch_toggle: Option<(String, bool)> = None;
+                            egui::CollapsingHeader::new(RichText::new(header).small().strong())
+                                .id_salt("jf_ep_browser")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    // Season filter buttons if series has multiple seasons
+                                    let mut seasons: Vec<u32> = items.iter().filter_map(|m| m.season).collect();
+                                    seasons.sort_unstable();
+                                    seasons.dedup();
+                                    if seasons.len() > 1 {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if ui.selectable_label(self.panel_season_filter.is_none(), "All").clicked() {
+                                                self.panel_season_filter = None;
+                                            }
+                                            for s in seasons {
+                                                if ui
+                                                    .selectable_label(self.panel_season_filter == Some(s), format!("S{s}"))
+                                                    .clicked()
+                                                {
+                                                    self.panel_season_filter = Some(s);
+                                                }
+                                            }
+                                        });
+                                    } else {
+                                        self.panel_season_filter = None;
+                                    }
+                                    let active_id = self.jellyfin.active_watch.as_ref().map(|w| w.item_id.as_str());
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("jf_ep_scroll")
+                                        .max_height(210.0)
+                                        .show(ui, |ui| {
+                                            for item in &items {
+                                                if let Some(sf) = self.panel_season_filter {
+                                                    if item.season != Some(sf) {
+                                                        continue;
+                                                    }
+                                                }
+                                                let is_now = active_id == Some(item.id.as_str());
+                                                ui.horizontal(|ui| {
+                                                    let mut checked = item.played;
+                                                    if ui
+                                                        .checkbox(&mut checked, "")
+                                                        .on_hover_text("Toggle watched status in Jellyfin")
+                                                        .changed()
+                                                    {
+                                                        watch_toggle = Some((item.id.clone(), checked));
+                                                    }
+                                                    let lbl = item.short_label();
+                                                    let r = ui.selectable_label(is_now, lbl);
+                                                    if r.clicked() {
+                                                        play_req = Some((item.clone(), false));
+                                                    }
+                                                });
+                                            }
+                                        });
+                                });
+                            if let Some((iid, played)) = watch_toggle {
+                                self.jellyfin.set_item_played(bch_num, &iid, played);
+                                self.osd.show_action(if played { "MARKED WATCHED" } else { "MARKED UNWATCHED" });
+                            }
+                            if let Some((item, from_start)) = play_req {
+                                self.tune_specific(bch_num, item, from_start);
+                            }
+                        }
+                    }
+
                     ui.label(
-                        RichText::new("Remote keys: G Guide · Arrows+Enter · 0-9 Dial · PgUp/PgDn Ch · -/+ Vol · M Mute · R Restart · I Info")
+                        RichText::new("Remote: G Guide · E Episodes · W Watched · N/P Next/Prev · 0-9 Dial · PgUp/Dn Ch · -/+ Vol · M Mute · R Restart · I Info")
                             .weak()
                             .small(),
                     );
@@ -1796,7 +1981,11 @@ impl CrtApp {
             if self.save_preset_open {
                 self.save_preset_open = false;
             } else if self.guide.active {
-                self.toggle_guide();
+                if self.guide.picker_channel().is_some() {
+                    self.guide.close_picker();
+                } else {
+                    self.toggle_guide();
+                }
             } else {
                 self.set_fullscreen(false);
             }
@@ -1849,8 +2038,57 @@ impl CrtApp {
                     self.show_info_osd();
                     remote_consumed = true;
                 }
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E)) {
+                    remote_consumed = true;
+                    if self.guide.active {
+                        if self.guide.picker_channel().is_some() {
+                            self.guide.close_picker();
+                        } else {
+                            let sel_ch = self
+                                .jellyfin
+                                .visible_channels()
+                                .get(self.guide.selected_idx)
+                                .map(|c| c.number);
+                            if let Some(n) = sel_ch.filter(|&n| n > 1) {
+                                self.open_episode_picker(n);
+                            }
+                        }
+                    } else if let Some(cur) = self.current_channel.filter(|&n| n > 1) {
+                        self.open_episode_picker(cur);
+                    }
+                }
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W)) {
+                    remote_consumed = true;
+                    if let (true, Some((ch_num, idx))) = (self.guide.active, self.guide.picker_selected()) {
+                        if let Some((iid, played)) = self
+                            .jellyfin
+                            .channel_by_number(ch_num)
+                            .and_then(|c| c.items().get(idx))
+                            .map(|m| (m.id.clone(), !m.played))
+                        {
+                            self.jellyfin.set_item_played(ch_num, &iid, played);
+                            self.osd.show_action(if played { "MARKED WATCHED" } else { "MARKED UNWATCHED" });
+                        }
+                    } else if self.jellyfin.active_watch.is_some() {
+                        self.toggle_current_watched();
+                    }
+                }
+                if !self.guide.active && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::N)) {
+                    self.step_episode(1);
+                    remote_consumed = true;
+                }
+                if !self.guide.active && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P)) {
+                    self.step_episode(-1);
+                    remote_consumed = true;
+                }
                 if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R)) {
-                    if let Some(p) = &self.player {
+                    if let (true, Some((ch_num, idx))) = (self.guide.active, self.guide.picker_selected()) {
+                        if let Some(item) = self.jellyfin.channel_by_number(ch_num).and_then(|c| c.items().get(idx)).cloned() {
+                            self.tune_specific(ch_num, item, true);
+                            self.osd.show_action("RESTART 0:00");
+                            remote_consumed = true;
+                        }
+                    } else if let Some(p) = &self.player {
                         p.seek_abs(0.0);
                         self.osd.show_action("RESTART 0:00");
                         remote_consumed = true;
@@ -1878,38 +2116,74 @@ impl CrtApp {
                     }
                 }
                 if self.guide.active {
-                    let vis_len = self.jellyfin.visible_channels().len();
-                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
-                        self.guide.move_selection(-1, vis_len);
-                        remote_consumed = true;
-                    }
-                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
-                        self.guide.move_selection(1, vis_len);
-                        remote_consumed = true;
-                    }
-                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)) {
-                        self.guide.shift_time(-1);
-                        remote_consumed = true;
-                    }
-                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)) {
-                        self.guide.shift_time(1);
-                        remote_consumed = true;
-                    }
-                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
-                        remote_consumed = true;
-                        if let Some(ch_num) = self.osd.commit_digits() {
-                            self.tune_channel(ch_num);
-                        } else {
-                            let target_ch = self
-                                .jellyfin
-                                .visible_channels()
-                                .get(self.guide.selected_idx)
-                                .map(|c| c.number);
-                            if let Some(n) = target_ch {
-                                if n == 1 {
-                                    self.toggle_guide();
-                                } else {
-                                    self.tune_channel(n);
+                    if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
+                        let items: Vec<MediaItem> = self
+                            .jellyfin
+                            .channel_by_number(pch_num)
+                            .map(|c| c.items().to_vec())
+                            .unwrap_or_default();
+                        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)) {
+                            self.guide.close_picker();
+                            remote_consumed = true;
+                        }
+                        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+                            self.guide.picker_move(-1, items.len());
+                            remote_consumed = true;
+                        }
+                        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+                            self.guide.picker_move(1, items.len());
+                            remote_consumed = true;
+                        }
+                        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)) {
+                            self.guide.picker_jump_season(-1, &items);
+                            remote_consumed = true;
+                        }
+                        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)) {
+                            self.guide.picker_jump_season(1, &items);
+                            remote_consumed = true;
+                        }
+                        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                            remote_consumed = true;
+                            if let Some(ch_num) = self.osd.commit_digits() {
+                                self.tune_channel(ch_num);
+                            } else if let Some(item) = items.get(sel_idx).cloned() {
+                                self.tune_specific(pch_num, item, false);
+                            }
+                        }
+                    } else {
+                        let vis_len = self.jellyfin.visible_channels().len();
+                        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+                            self.guide.move_selection(-1, vis_len);
+                            remote_consumed = true;
+                        }
+                        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+                            self.guide.move_selection(1, vis_len);
+                            remote_consumed = true;
+                        }
+                        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)) {
+                            self.guide.shift_time(-1);
+                            remote_consumed = true;
+                        }
+                        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)) {
+                            self.guide.shift_time(1);
+                            remote_consumed = true;
+                        }
+                        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                            remote_consumed = true;
+                            if let Some(ch_num) = self.osd.commit_digits() {
+                                self.tune_channel(ch_num);
+                            } else {
+                                let target_ch = self
+                                    .jellyfin
+                                    .visible_channels()
+                                    .get(self.guide.selected_idx)
+                                    .map(|c| c.number);
+                                if let Some(n) = target_ch {
+                                    if n == 1 {
+                                        self.toggle_guide();
+                                    } else {
+                                        self.tune_channel(n);
+                                    }
                                 }
                             }
                         }
@@ -2256,9 +2530,14 @@ impl CrtApp {
                     let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
                     if scroll.abs() > 0.0 {
                         if self.guide.active && self.jellyfin.connected && !ctrl_down {
-                            let vis_len = self.jellyfin.visible_channels().len();
                             let step = if scroll > 0.0 { -1 } else { 1 };
-                            self.guide.scroll_rows(step, vis_len);
+                            if let Some(pch_num) = self.guide.picker_channel() {
+                                let len = self.jellyfin.channel_by_number(pch_num).map(|c| c.items().len()).unwrap_or(0);
+                                self.guide.picker_scroll(step, len);
+                            } else {
+                                let vis_len = self.jellyfin.visible_channels().len();
+                                self.guide.scroll_rows(step, vis_len);
+                            }
                         } else if let Some(mp) = resp.hover_pos() {
                             let nx = (mp.x - rect.left()) / rect.width() * 2.0 - 1.0;
                             let ny = (mp.y - rect.top()) / rect.height() * 2.0 - 1.0;
@@ -2274,7 +2553,13 @@ impl CrtApp {
                     }
                 }
                 let mut guide_clicked_tune: Option<u16> = None;
-                if self.guide.active && self.jellyfin.connected && !overlay_active && (resp.clicked() || resp.double_clicked()) {
+                let mut guide_clicked_picker: Option<u16> = None;
+                let mut picker_clicked_play: Option<(u16, MediaItem)> = None;
+                if self.guide.active
+                    && self.jellyfin.connected
+                    && !overlay_active
+                    && (resp.clicked() || resp.double_clicked() || resp.secondary_clicked())
+                {
                     if let Some(mp) = resp.interact_pointer_pos() {
                         let nx = (mp.x - rect.left()) / rect.width().max(1.0) * 2.0 - 1.0;
                         let ny = (mp.y - rect.top()) / rect.height().max(1.0) * 2.0 - 1.0;
@@ -2283,18 +2568,44 @@ impl CrtApp {
                         let fy = ny * h + self.pan[1];
                         let gu = (fx / (4.0 / 3.0)) * 0.5 + 0.5;
                         let gv = fy * 0.5 + 0.5;
-                        let vis = self.jellyfin.visible_channels();
-                        if let Some(row_idx) = self.guide.hit_test_row(gu, gv, vis.len()) {
-                            let already = self.guide.selected_idx == row_idx;
-                            self.guide.selected_idx = row_idx;
-                            self.guide.clamp_selection(vis.len());
-                            if resp.double_clicked() || already {
-                                guide_clicked_tune = vis.get(row_idx).map(|c| c.number);
+                        if let Some((pch_num, cur_sel)) = self.guide.picker_selected() {
+                            if resp.secondary_clicked() {
+                                self.guide.close_picker();
+                            } else if let Some(ch) = self.jellyfin.channel_by_number(pch_num) {
+                                let items = ch.items();
+                                if let Some(idx) = self.guide.picker_hit_test(gu, gv, items.len()) {
+                                    let already = cur_sel == idx;
+                                    if let GuideView::ItemPicker { selected_item, .. } = &mut self.guide.view {
+                                        *selected_item = idx;
+                                    }
+                                    self.guide.clamp_picker(items.len());
+                                    if resp.double_clicked() || already {
+                                        if let Some(item) = items.get(idx).cloned() {
+                                            picker_clicked_play = Some((pch_num, item));
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            let vis = self.jellyfin.visible_channels();
+                            if let Some(row_idx) = self.guide.hit_test_row(gu, gv, vis.len()) {
+                                let already = self.guide.selected_idx == row_idx;
+                                self.guide.selected_idx = row_idx;
+                                self.guide.clamp_selection(vis.len());
+                                if resp.secondary_clicked() {
+                                    guide_clicked_picker = vis.get(row_idx).map(|c| c.number).filter(|&n| n > 1);
+                                } else if resp.double_clicked() || already {
+                                    guide_clicked_tune = vis.get(row_idx).map(|c| c.number);
+                                }
                             }
                         }
                     }
                 }
-                if let Some(n) = guide_clicked_tune {
+                if let Some((pch_num, item)) = picker_clicked_play {
+                    self.tune_specific(pch_num, item, false);
+                } else if let Some(n) = guide_clicked_picker {
+                    self.open_episode_picker(n);
+                } else if let Some(n) = guide_clicked_tune {
                     if n == 1 {
                         self.toggle_guide();
                     } else {
@@ -2366,8 +2677,27 @@ impl CrtApp {
                     fi.u.eye_k_frame = if self.s.eye_ms <= 0.5 { 1.0 } else { 1.0 - (-(frame_dt * 1000.0) / self.s.eye_ms).exp() };
                 }
                 if self.guide.active && self.jellyfin.connected {
-                    // Ensure episodes & artwork for the highlighted channel are fetched in background
-                    let (sel_series_id, sel_art_id) = {
+                    // Ensure episodes & artwork for the highlighted channel/episode are fetched in background
+                    let (sel_series_id, sel_art_id) = if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
+                        if let Some(pch) = self.jellyfin.channel_by_number(pch_num) {
+                            let len = pch.items().len();
+                            self.guide.clamp_picker(len);
+                            let sid = match &pch.kind {
+                                ChannelKind::Series { series_id, loaded_episodes: false, .. } => Some(series_id.clone()),
+                                _ => None,
+                            };
+                            let art = pch
+                                .items()
+                                .get(sel_idx)
+                                .map(|m| m.artwork_id.clone())
+                                .filter(|a| !a.is_empty())
+                                .unwrap_or_else(|| pch.artwork_id.clone());
+                            (sid, art)
+                        } else {
+                            self.guide.close_picker();
+                            (None, String::new())
+                        }
+                    } else {
                         let vis = self.jellyfin.visible_channels();
                         self.guide.clamp_selection(vis.len());
                         if let Some(ch) = vis.get(self.guide.selected_idx) {
@@ -2388,9 +2718,11 @@ impl CrtApp {
                     let now_lbl = self.jellyfin.active_watch.as_ref().map(|w| {
                         format!("NOW: CH {:02} {}", w.channel_number, w.callsign)
                     });
+                    let active_id = self.jellyfin.active_watch.as_ref().map(|w| w.item_id.as_str());
+                    let picker_ch = self.guide.picker_channel().and_then(|n| self.jellyfin.channel_by_number(n));
                     let vis = self.jellyfin.visible_channels();
                     let live_vid = self.video_image.as_ref().map(|(_, f)| f);
-                    let guide_frame = self.guide.render(&vis, live_vid, now_lbl.as_deref(), art_img.as_ref());
+                    let guide_frame = self.guide.render(&vis, picker_ch, active_id, live_vid, now_lbl.as_deref(), art_img.as_ref());
                     fi.image = Some(guide_frame);
                     fi.u.pattern = Pattern::Image.id();
                 } else {

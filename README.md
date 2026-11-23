@@ -105,7 +105,7 @@ cargo test
 | Toggle fullscreen | `F11` (press `F11` or `Esc` to exit) |
 | Open image or video | Drag & drop onto the window, or use **Open a picture…** / **Open a video…** |
 | Control `mpv` playback | Hover the TV and use your `mpv` keys (`Space`, arrow keys, etc.) |
-| 90s Cable Guide & TV Remote (Jellyfin) | `G` (Guide), Arrows + `Enter` (browse/tune), `0–9` (dial channel), `PgUp`/`PgDn` or `[`/`]` (Ch+/Ch-), `-`/`+` (Vol), `M` (Mute), `R` (Restart 0:00), `I` (Info OSD) |
+| 90s Cable Guide & TV Remote (Jellyfin) | `G` (Guide), `E` or right-click row (Episode/Movie Picker, Left/Right jumps seasons), `W` (Mark Watched/Unwatched), `N`/`P` (Next/Prev Episode), Arrows + `Enter`, `0–9` (dial channel), `PgUp`/`PgDn` or `[`/`]` (Ch+/Ch-), `-`/`+` (Vol), `M` (Mute), `R` (Restart 0:00), `I` (Info OSD) |
 
 ## CLI Options
 

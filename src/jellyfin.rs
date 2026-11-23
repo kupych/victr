@@ -173,6 +173,67 @@ pub fn make_callsign(name: &str) -> String {
 // ------------------------------------------------------------------ Scheduling
 
 impl Channel {
+    /// Returns all selectable items (episodes for Series, movies for MovieGenre).
+    pub fn items(&self) -> &[MediaItem] {
+        match &self.kind {
+            ChannelKind::Series { episodes, .. } => episodes,
+            ChannelKind::MovieGenre { movies, .. } => movies,
+            ChannelKind::Guide => &[],
+        }
+    }
+
+    /// Index of the recommended/next-unwatched item for initializing the Episode Picker.
+    pub fn default_item_index(&self, active_item_id: Option<&str>) -> usize {
+        let items = self.items();
+        if let Some(aid) = active_item_id {
+            if let Some(pos) = items.iter().position(|i| i.id == aid) {
+                return pos;
+            }
+        }
+        match &self.kind {
+            ChannelKind::Series { episodes, next_up_episode_id, .. } => {
+                pick_next_episode_index(episodes, next_up_episode_id.as_deref()).unwrap_or(0)
+            }
+            ChannelKind::MovieGenre { movies, .. } => {
+                let now = Utc::now().timestamp();
+                if let Some((m, _)) = schedule_live_movie(movies, self.number, now) {
+                    movies.iter().position(|x| x.id == m.id).unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            ChannelKind::Guide => 0,
+        }
+    }
+
+    /// Builds a `TuneTarget` for a specific episode or movie picked by the user.
+    pub fn tune_specific_item(
+        &self,
+        item: &MediaItem,
+        server_url: &str,
+        api_key: &str,
+        from_start: bool,
+    ) -> TuneTarget {
+        let start_secs = if from_start || item.played { 0.0 } else { item.resume_secs.max(0.0) };
+        TuneTarget {
+            channel_number: self.number,
+            callsign: self.callsign.clone(),
+            channel_name: self.name.clone(),
+            stream_url: build_stream_url(server_url, api_key, &item.id),
+            start_secs,
+            item: item.clone(),
+            is_live_clock: false,
+        }
+    }
+
+    /// Returns the previous episode before `current_item_id` (for Series / Movie channels).
+    pub fn prev_before(&self, current_item_id: &str, server_url: &str, api_key: &str) -> Option<TuneTarget> {
+        let items = self.items();
+        let pos = items.iter().position(|e| e.id == current_item_id)?;
+        let prev = items.get(pos.checked_sub(1)?)?;
+        Some(self.tune_specific_item(prev, server_url, api_key, true))
+    }
+
     /// Picks the episode or live-scheduled movie to play right now.
     pub fn resolve_now(&self, server_url: &str, api_key: &str, now_unix: i64) -> Option<TuneTarget> {
         match &self.kind {
@@ -730,6 +791,19 @@ fn mark_played(server_url: &str, api_key: &str, user_id: &str, item_id: &str) {
         .call();
 }
 
+fn mark_unplayed(server_url: &str, api_key: &str, user_id: &str, item_id: &str) {
+    let base = server_url.trim().trim_end_matches('/');
+    if base.is_empty() || api_key.trim().is_empty() || user_id.is_empty() || item_id.is_empty() {
+        return;
+    }
+    let agent = make_agent();
+    let _ = agent
+        .delete(&format!("{base}/Users/{user_id}/PlayedItems/{item_id}"))
+        .set("X-Emby-Token", api_key.trim())
+        .set("Authorization", &auth_header(api_key))
+        .call();
+}
+
 // ------------------------------------------------------------------ Async Manager
 
 /// Async messages returned from background Jellyfin worker threads.
@@ -970,6 +1044,59 @@ impl JellyfinManager {
         self.channels.iter().find(|c| c.number == number)
     }
 
+    /// Marks an episode or movie as watched/unwatched locally and syncs to Jellyfin in background.
+    pub fn set_item_played(&mut self, channel_number: u16, item_id: &str, played: bool) {
+        for ch in &mut self.channels {
+            if ch.number != channel_number {
+                continue;
+            }
+            match &mut ch.kind {
+                ChannelKind::Series { episodes, next_up_episode_id, .. } => {
+                    if let Some(ep) = episodes.iter_mut().find(|e| e.id == item_id) {
+                        ep.played = played;
+                        if played {
+                            ep.resume_secs = 0.0;
+                        }
+                    }
+                    // Recompute Next Up cleanly: first episode with resume > 10s, else first unplayed
+                    *next_up_episode_id = episodes
+                        .iter()
+                        .find(|e| e.resume_secs > 10.0)
+                        .or_else(|| episodes.iter().find(|e| !e.played))
+                        .or_else(|| episodes.first())
+                        .map(|e| e.id.clone());
+                }
+                ChannelKind::MovieGenre { movies, .. } => {
+                    if let Some(m) = movies.iter_mut().find(|m| m.id == item_id) {
+                        m.played = played;
+                        if played {
+                            m.resume_secs = 0.0;
+                        }
+                    }
+                }
+                ChannelKind::Guide => {}
+            }
+        }
+        if let Some(w) = &mut self.active_watch {
+            if w.item_id == item_id {
+                w.marked_played = played;
+            }
+        }
+        let url = self.cfg.normalized_url();
+        let key = self.cfg.api_key.clone();
+        let uid = self.cfg.user_id.clone();
+        let id = item_id.to_string();
+        if !url.is_empty() && !key.trim().is_empty() && !uid.is_empty() {
+            std::thread::spawn(move || {
+                if played {
+                    mark_played(&url, &key, &uid, &id);
+                } else {
+                    mark_unplayed(&url, &key, &uid, &id);
+                }
+            });
+        }
+    }
+
     pub fn begin_watch(&mut self, target: &TuneTarget) {
         self.finish_watch();
         self.active_watch = Some(ActiveWatch {
@@ -1119,5 +1246,59 @@ mod tests {
         assert_eq!(a.id, b.id);
         assert_eq!(off_a, off_b);
         assert!(off_a >= 0.0 && off_a <= a.runtime_secs);
+    }
+
+    #[test]
+    fn toggle_played_updates_next_up_and_prev_next() {
+        let mut mgr = JellyfinManager::new_offline();
+        let eps = vec![
+            MediaItem {
+                id: "e1".into(),
+                title: "Pilot".into(),
+                season: Some(1),
+                episode: Some(1),
+                overview: String::new(),
+                runtime_secs: 1500.0,
+                played: false,
+                resume_secs: 0.0,
+                artwork_id: "s1".into(),
+            },
+            MediaItem {
+                id: "e2".into(),
+                title: "Second".into(),
+                season: Some(1),
+                episode: Some(2),
+                overview: String::new(),
+                runtime_secs: 1500.0,
+                played: false,
+                resume_secs: 0.0,
+                artwork_id: "s1".into(),
+            },
+        ];
+        mgr.channels.push(Channel {
+            number: 2,
+            callsign: "SHOW".into(),
+            name: "Show".into(),
+            artwork_id: "s1".into(),
+            kind: ChannelKind::Series {
+                series_id: "s1".into(),
+                overview: String::new(),
+                is_continue: false,
+                is_favorite: false,
+                episodes: eps,
+                next_up_episode_id: Some("e1".into()),
+                loaded_episodes: true,
+            },
+        });
+        mgr.set_item_played(2, "e1", true);
+        let ch = mgr.channel_by_number(2).unwrap();
+        let next = ch.resolve_now("http://x", "k", 0).unwrap();
+        assert_eq!(next.item.id, "e2");
+        let prev = ch.prev_before("e2", "http://x", "k").unwrap();
+        assert_eq!(prev.item.id, "e1");
+        mgr.set_item_played(2, "e1", false);
+        let ch = mgr.channel_by_number(2).unwrap();
+        let back = ch.resolve_now("http://x", "k", 0).unwrap();
+        assert_eq!(back.item.id, "e1");
     }
 }
