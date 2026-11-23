@@ -83,19 +83,11 @@ fn main() -> eframe::Result<()> {
         }
     }
 
-    #[allow(unused_mut)]
-    let mut options = eframe::NativeOptions {
+    let options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
-    #[cfg(target_os = "macos")]
-    if screenshot.is_some() {
-        options.event_loop_builder = Some(Box::new(|b| {
-            use eframe::egui_winit::winit::platform::macos::EventLoopBuilderExtMacOS;
-            b.with_activate_ignoring_other_apps(false);
-        }));
-    }
 
     eframe::run_native(
         "ViCTR",
