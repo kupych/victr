@@ -493,7 +493,7 @@ pub fn build_stream_url(server_url: &str, api_key: &str, item_id: &str) -> Strin
 fn make_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(6))
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
 }
 
@@ -548,6 +548,8 @@ struct RawItem {
     #[serde(default)]
     run_time_ticks: Option<i64>,
     #[serde(default)]
+    location_type: Option<String>,
+    #[serde(default)]
     user_data: Option<RawUserData>,
 }
 
@@ -596,11 +598,53 @@ pub fn fetch_users(server_url: &str, api_key: &str) -> Result<Vec<JellyfinUser>,
 pub fn fetch_series_episodes(server_url: &str, api_key: &str, user_id: &str, series_id: &str) -> Result<Vec<MediaItem>, String> {
     let base = server_url.trim().trim_end_matches('/');
     let agent = make_agent();
-    let url = format!(
-        "{base}/Shows/{series_id}/Episodes?UserId={user_id}&Fields=Overview,RunTimeTicks,UserData&EnableUserData=true"
+    // Query `/Users/{uid}/Items?ParentId={series_id}&IncludeItemTypes=Episode&Recursive=true`
+    // so every real episode file (all seasons, specials, un-numbered episodes) is included.
+    let items_url = format!(
+        "{base}/Users/{user_id}/Items?ParentId={series_id}&IncludeItemTypes=Episode&Recursive=true&IsMissing=false&Fields=Overview,RunTimeTicks,UserData&EnableUserData=true&SortBy=ParentIndexNumber,IndexNumber,SortName&SortOrder=Ascending"
     );
-    let resp: RawItemsResp = get_json(&agent, &url, api_key)?;
-    Ok(resp.items.iter().map(|r| r.to_media_item(series_id)).collect())
+    let mut raw = match get_json::<RawItemsResp>(&agent, &items_url, api_key) {
+        Ok(r) if !r.items.is_empty() => r.items,
+        _ => {
+            let shows_url = format!(
+                "{base}/Shows/{series_id}/Episodes?UserId={user_id}&IsMissing=false&Fields=Overview,RunTimeTicks,UserData&EnableUserData=true"
+            );
+            get_json::<RawItemsResp>(&agent, &shows_url, api_key)?.items
+        }
+    };
+    raw.retain(|r| r.location_type.as_deref() != Some("Virtual"));
+    // Sort cleanly by (season, episode, title), putting Season 0 specials after regular seasons
+    raw.sort_by(|a, b| {
+        let sa = match a.parent_index_number {
+            Some(0) => u32::MAX - 1,
+            Some(n) => n,
+            None => u32::MAX,
+        };
+        let sb = match b.parent_index_number {
+            Some(0) => u32::MAX - 1,
+            Some(n) => n,
+            None => u32::MAX,
+        };
+        sa.cmp(&sb)
+            .then_with(|| a.index_number.unwrap_or(u32::MAX).cmp(&b.index_number.unwrap_or(u32::MAX)))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(raw.iter().map(|r| r.to_media_item(series_id)).collect())
+}
+
+pub fn trigger_library_scan(server_url: &str, api_key: &str) -> Result<(), String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if base.is_empty() || api_key.trim().is_empty() {
+        return Err("Jellyfin server not configured.".into());
+    }
+    let agent = make_agent();
+    agent
+        .post(&format!("{base}/Library/Refresh"))
+        .set("X-Emby-Token", api_key.trim())
+        .set("Authorization", &auth_header(api_key))
+        .call()
+        .map_err(|e| format!("Library scan request failed: {e}"))?;
+    Ok(())
 }
 
 pub fn fetch_artwork(server_url: &str, api_key: &str, item_id: &str) -> Option<ArtworkImage> {
@@ -810,7 +854,8 @@ fn mark_unplayed(server_url: &str, api_key: &str, user_id: &str, item_id: &str) 
 pub enum JellyfinEvent {
     UsersLoaded(Result<Vec<JellyfinUser>, String>),
     LineupLoaded(Result<Vec<Channel>, String>),
-    EpisodesLoaded(String, Vec<MediaItem>),
+    EpisodesLoaded(String, Result<Vec<MediaItem>, String>),
+    LibraryScanTriggered(Result<(), String>),
     ArtworkLoaded(String, ArtworkImage),
 }
 
@@ -885,6 +930,8 @@ impl JellyfinManager {
         let _ = save_config(&self.cfg);
         let cfg = self.cfg.clone();
         let ev = self.events.clone();
+        self.episodes_loading.clear();
+        self.artwork_cache.clear();
         self.busy = true;
         self.status = "Loading Jellyfin channels…".into();
         std::thread::spawn(move || {
@@ -893,11 +940,38 @@ impl JellyfinManager {
         });
     }
 
+    pub fn scan_server_library(&mut self) {
+        let url = self.cfg.normalized_url();
+        let key = self.cfg.api_key.clone();
+        let ev = self.events.clone();
+        self.busy = true;
+        self.status = "Requesting Jellyfin server library scan…".into();
+        std::thread::spawn(move || {
+            let res = trigger_library_scan(&url, &key);
+            ev.lock().unwrap().push(JellyfinEvent::LibraryScanTriggered(res));
+        });
+    }
+
     pub fn disconnect(&mut self) {
         self.finish_watch();
         self.channels.clear();
         self.connected = false;
         self.status = "Disconnected.".into();
+    }
+
+    pub fn reload_series_episodes(&mut self, series_id: &str) {
+        if series_id.is_empty() {
+            return;
+        }
+        self.episodes_loading.remove(series_id);
+        for ch in &mut self.channels {
+            if let ChannelKind::Series { series_id: sid, loaded_episodes, .. } = &mut ch.kind {
+                if sid == series_id {
+                    *loaded_episodes = false;
+                }
+            }
+        }
+        self.ensure_series_episodes(series_id);
     }
 
     pub fn ensure_series_episodes(&mut self, series_id: &str) {
@@ -918,9 +992,8 @@ impl JellyfinManager {
         let sid = series_id.to_string();
         let ev = self.events.clone();
         std::thread::spawn(move || {
-            if let Ok(eps) = fetch_series_episodes(&url, &key, &uid, &sid) {
-                ev.lock().unwrap().push(JellyfinEvent::EpisodesLoaded(sid, eps));
-            }
+            let res = fetch_series_episodes(&url, &key, &uid, &sid);
+            ev.lock().unwrap().push(JellyfinEvent::EpisodesLoaded(sid, res));
         });
     }
 
@@ -994,17 +1067,38 @@ impl JellyfinManager {
                     }
                     changed = true;
                 }
-                JellyfinEvent::EpisodesLoaded(sid, eps) => {
+                JellyfinEvent::EpisodesLoaded(sid, res) => {
                     self.episodes_loading.remove(&sid);
-                    for ch in &mut self.channels {
-                        if let ChannelKind::Series { series_id, episodes, loaded_episodes, .. } = &mut ch.kind {
-                            if series_id == &sid {
-                                *episodes = eps.clone();
-                                *loaded_episodes = true;
-                                changed = true;
+                    match res {
+                        Ok(eps) => {
+                            for ch in &mut self.channels {
+                                if let ChannelKind::Series { series_id, episodes, loaded_episodes, .. } = &mut ch.kind {
+                                    if series_id == &sid {
+                                        *episodes = eps.clone();
+                                        *loaded_episodes = true;
+                                        changed = true;
+                                    }
+                                }
                             }
                         }
+                        Err(e) => {
+                            self.status = format!("Episode fetch failed: {e}");
+                            changed = true;
+                        }
                     }
+                }
+                JellyfinEvent::LibraryScanTriggered(res) => {
+                    self.busy = false;
+                    match res {
+                        Ok(()) => {
+                            self.status = "Jellyfin library scan triggered — reloading guide…".into();
+                            self.connect_and_load();
+                        }
+                        Err(e) => {
+                            self.status = e;
+                        }
+                    }
+                    changed = true;
                 }
                 JellyfinEvent::ArtworkLoaded(id, img) => {
                     self.artwork_cache.insert(id, Some(img));

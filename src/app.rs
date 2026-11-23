@@ -795,8 +795,21 @@ impl CrtApp {
                         let _ = crate::jellyfin::save_config(&self.jellyfin.cfg);
                         self.jellyfin.fetch_users_async();
                     }
-                    if self.jellyfin.connected && ui.button("Refresh").clicked() {
+                    if self.jellyfin.connected
+                        && ui
+                            .add_enabled(!self.jellyfin.busy, egui::Button::new("Refresh"))
+                            .on_hover_text("Reload all channels, episodes, and watched states from Jellyfin")
+                            .clicked()
+                    {
                         self.jellyfin.connect_and_load();
+                    }
+                    if self.jellyfin.connected
+                        && ui
+                            .add_enabled(!self.jellyfin.busy, egui::Button::new("Rescan Server"))
+                            .on_hover_text("Ask Jellyfin to scan its media libraries for new files, then reload the guide")
+                            .clicked()
+                    {
+                        self.jellyfin.scan_server_library();
                     }
                     if self.jellyfin.connected && ui.button("Disconnect").clicked() {
                         self.guide.active = false;
@@ -941,9 +954,14 @@ impl CrtApp {
                                 self.jellyfin.ensure_series_episodes(series_id);
                             }
                             let items = bch.items().to_vec();
-                            let header = format!("Episodes / Movies — CH {:02} {}", bch.number, bch.name);
+                            let bch_series_id = match &bch.kind {
+                                ChannelKind::Series { series_id, .. } => Some(series_id.clone()),
+                                _ => None,
+                            };
+                            let header = format!("Episodes / Movies — CH {:02} {} ({})", bch.number, bch.name, items.len());
                             let mut play_req: Option<(MediaItem, bool)> = None;
                             let mut watch_toggle: Option<(String, bool)> = None;
+                            let mut reload_sid: Option<String> = None;
                             egui::CollapsingHeader::new(RichText::new(header).small().strong())
                                 .id_salt("jf_ep_browser")
                                 .default_open(false)
@@ -952,23 +970,32 @@ impl CrtApp {
                                     let mut seasons: Vec<u32> = items.iter().filter_map(|m| m.season).collect();
                                     seasons.sort_unstable();
                                     seasons.dedup();
-                                    if seasons.len() > 1 {
-                                        ui.horizontal_wrapped(|ui| {
+                                    if let Some(sf) = self.panel_season_filter {
+                                        if !seasons.contains(&sf) {
+                                            self.panel_season_filter = None;
+                                        }
+                                    }
+                                    ui.horizontal_wrapped(|ui| {
+                                        if seasons.len() > 1 {
                                             if ui.selectable_label(self.panel_season_filter.is_none(), "All").clicked() {
                                                 self.panel_season_filter = None;
                                             }
-                                            for s in seasons {
+                                            for s in &seasons {
+                                                let lbl = if *s == 0 { "Specials".to_string() } else { format!("S{s}") };
                                                 if ui
-                                                    .selectable_label(self.panel_season_filter == Some(s), format!("S{s}"))
+                                                    .selectable_label(self.panel_season_filter == Some(*s), lbl)
                                                     .clicked()
                                                 {
-                                                    self.panel_season_filter = Some(s);
+                                                    self.panel_season_filter = Some(*s);
                                                 }
                                             }
-                                        });
-                                    } else {
-                                        self.panel_season_filter = None;
-                                    }
+                                        }
+                                        if let Some(sid) = &bch_series_id {
+                                            if ui.small_button("Reload list").on_hover_text("Re-fetch all episodes for this series from Jellyfin").clicked() {
+                                                reload_sid = Some(sid.clone());
+                                            }
+                                        }
+                                    });
                                     let active_id = self.jellyfin.active_watch.as_ref().map(|w| w.item_id.as_str());
                                     egui::ScrollArea::vertical()
                                         .id_salt("jf_ep_scroll")
@@ -999,6 +1026,9 @@ impl CrtApp {
                                             }
                                         });
                                 });
+                            if let Some(sid) = reload_sid {
+                                self.jellyfin.reload_series_episodes(&sid);
+                            }
                             if let Some((iid, played)) = watch_toggle {
                                 self.jellyfin.set_item_played(bch_num, &iid, played);
                                 self.osd.show_action(if played { "MARKED WATCHED" } else { "MARKED UNWATCHED" });
@@ -2729,41 +2759,44 @@ impl CrtApp {
                     fi.u.eye_k_frame = if self.s.eye_ms <= 0.5 { 1.0 } else { 1.0 - (-(frame_dt * 1000.0) / self.s.eye_ms).exp() };
                 }
                 if self.guide.active && self.jellyfin.connected {
-                    // Ensure episodes & artwork for the highlighted channel/episode are fetched in background
-                    let (sel_series_id, sel_art_id) = if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
+                    // Ensure episodes for all visible rows & artwork for the highlighted channel are fetched
+                    let (needed_sids, sel_art_id) = if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
                         if let Some(pch) = self.jellyfin.channel_by_number(pch_num) {
                             let len = pch.items().len();
                             self.guide.clamp_picker(len);
-                            let sid = match &pch.kind {
-                                ChannelKind::Series { series_id, loaded_episodes: false, .. } => Some(series_id.clone()),
-                                _ => None,
-                            };
+                            let mut sids = Vec::new();
+                            if let ChannelKind::Series { series_id, loaded_episodes: false, .. } = &pch.kind {
+                                sids.push(series_id.clone());
+                            }
                             let art = pch
                                 .items()
                                 .get(sel_idx)
                                 .map(|m| m.artwork_id.clone())
                                 .filter(|a| !a.is_empty())
                                 .unwrap_or_else(|| pch.artwork_id.clone());
-                            (sid, art)
+                            (sids, art)
                         } else {
                             self.guide.close_picker();
-                            (None, String::new())
+                            (Vec::new(), String::new())
                         }
                     } else {
                         let vis = self.jellyfin.visible_channels();
                         self.guide.clamp_selection(vis.len());
-                        if let Some(ch) = vis.get(self.guide.selected_idx) {
-                            let sid = match &ch.kind {
-                                ChannelKind::Series { series_id, loaded_episodes: false, .. } => Some(series_id.clone()),
-                                _ => None,
-                            };
-                            let (_, _, _, art) = ch.preview_info(chrono::Utc::now().timestamp());
-                            (sid, art)
-                        } else {
-                            (None, String::new())
+                        let mut sids = Vec::new();
+                        for row in 0..6 {
+                            if let Some(ch) = vis.get(self.guide.scroll_row + row) {
+                                if let ChannelKind::Series { series_id, loaded_episodes: false, .. } = &ch.kind {
+                                    sids.push(series_id.clone());
+                                }
+                            }
                         }
+                        let art = vis
+                            .get(self.guide.selected_idx)
+                            .map(|ch| ch.preview_info(chrono::Utc::now().timestamp()).3)
+                            .unwrap_or_default();
+                        (sids, art)
                     };
-                    if let Some(sid) = sel_series_id {
+                    for sid in needed_sids {
                         self.jellyfin.ensure_series_episodes(&sid);
                     }
                     let art_img = self.jellyfin.request_artwork(&sel_art_id);
