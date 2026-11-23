@@ -1,0 +1,11 @@
+/target
+/vendor
+/.linker
+/.cargo/config.toml
+/shots
+/Phosphor Lab.desktop
+mpv-shot*.jpg
+mpv-shot*.png
+*.swp
+*~
+.DS_Store

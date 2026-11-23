@@ -1,0 +1,23 @@
+[package]
+name = "crt_sim"
+version = "0.1.0"
+edition = "2024"
+description = "Phosphor Lab — a physically based CRT television simulator with full NTSC signal chain, electron optics, phosphor persistence, rolling scan, and analog audio DSP."
+license = "MIT"
+readme = "README.md"
+keywords = ["crt", "retro", "physics", "shader", "simulator"]
+categories = ["multimedia::video", "simulation", "graphics"]
+
+[dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
+rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal", "pollster"] }
+
+[profile.release]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
