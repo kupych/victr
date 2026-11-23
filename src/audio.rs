@@ -307,7 +307,7 @@ impl Processor {
         let sig_gain = if p.rf { smooth(-10.0, 6.0, snr) } else { 1.0 };
         let static_amp = if p.rf { 0.6 * (1.0 - smooth(-6.0, 9.0, snr)) } else { 0.0 };
         let click_rate = if p.rf { 250.0 * (-((snr - 4.0) / 5.0).powi(2)).exp() } else { 0.0 } + p.impulse * 18.0;
-        let buzz_amp = if p.rf { 0.004 + 0.05 * p.fine_tune.abs() + 0.03 * (1.0 - smooth(5.0, 25.0, snr)) } else { 0.0 };
+        let buzz_amp = if p.rf { 0.045 * p.fine_tune.abs() + 0.025 * (1.0 - smooth(5.0, 25.0, snr)) } else { 0.0 };
         let detune_dist = p.fine_tune * 0.8;
         let track_err = if p.vcr { p.tracking.abs() } else { 0.0 };
         let track_noise = ((track_err - 0.05) * 2.6).clamp(0.0, 1.0);
@@ -415,10 +415,14 @@ impl Processor {
                 }
                 let click = self.click_env * self.click_sign;
                 self.click_env *= 0.93;
-                // intercarrier / sync buzz at the field rate (rich in harmonics)
-                let fph = (t * 59.94).fract();
-                let pulse = if fph < 0.06 { 1.0 } else { 0.0 };
-                let buzz = self.buzz_lp.run(pulse - 0.06) * buzz_amp * 6.0;
+                // intercarrier / sync buzz at the field rate (only when mistuned or weak RF signal)
+                let buzz = if buzz_amp > 1e-5 {
+                    let fph = (t * 59.94).fract();
+                    let pulse = if fph < 0.06 { 1.0 } else { 0.0 };
+                    self.buzz_lp.run(pulse - 0.06) * buzz_amp * 4.5
+                } else {
+                    0.0
+                };
                 // mains hum
                 let hum = p.hum
                     * 0.05
