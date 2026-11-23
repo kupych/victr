@@ -339,6 +339,7 @@ pub struct Settings {
     pub hdr_mode: bool,
     pub hdr_paper_white: f32,
     pub hdr_peak_nits: f32,
+    pub hdr_ui_nits: f32,
 
     // ---- rolling scan / flicker
     pub rolling_scan: bool,
@@ -444,6 +445,7 @@ impl Default for Settings {
             hdr_mode: false,
             hdr_paper_white: 200.0,
             hdr_peak_nits: 1000.0,
+            hdr_ui_nits: 160.0,
 
             rolling_scan: true,
             slow_mo: 1.0,
@@ -731,6 +733,7 @@ impl Settings {
         let _ = writeln!(out, "hdr_mode = {}", self.hdr_mode);
         let _ = writeln!(out, "hdr_paper_white = {}", self.hdr_paper_white);
         let _ = writeln!(out, "hdr_peak_nits = {}", self.hdr_peak_nits);
+        let _ = writeln!(out, "hdr_ui_nits = {}", self.hdr_ui_nits);
         let _ = writeln!(out, "rolling_scan = {}", self.rolling_scan);
         let _ = writeln!(out, "slow_mo = {}", self.slow_mo);
         let _ = writeln!(out, "decay_ms = {}", self.decay_ms);
@@ -842,6 +845,7 @@ impl Settings {
                 "hdr_mode" => if let Some(x) = parse_bool(v) { s.hdr_mode = x; },
                 "hdr_paper_white" => if let Ok(x) = v.parse() { s.hdr_paper_white = x; },
                 "hdr_peak_nits" => if let Ok(x) = v.parse() { s.hdr_peak_nits = x; },
+                "hdr_ui_nits" => if let Ok(x) = v.parse() { s.hdr_ui_nits = x; },
                 "rolling_scan" => if let Some(x) = parse_bool(v) { s.rolling_scan = x; },
                 "slow_mo" => if let Ok(x) = v.parse() { s.slow_mo = x; },
                 "decay_ms" => if let Ok(x) = v.parse() { s.decay_ms = x; },

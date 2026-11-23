@@ -1,13 +1,23 @@
 use crate::audio::AudioEngine;
-use crate::gpu::{FrameInput, Gpu};
+use crate::gpu::{FrameInput, HdrStatus};
 use crate::mpv::{Player, StartOpts};
 use crate::settings::{self, Input, Mask, Pattern, PhosphorSet, Settings, TapeSpeed, UserPreset};
 use crate::sim::Sim;
-use eframe::egui::{self, Color32, RichText, Slider};
-use eframe::egui_glow;
+use egui::{Color32, RichText, Slider};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+/// Output of one UI & simulation frame, consumed by the native wgpu/winit host.
+pub struct FrameOutput {
+    pub crt_rect: egui::Rect,
+    pub fi: FrameInput,
+    pub want_hdr: bool,
+    pub prefer_pq: bool,
+    pub fullscreen_cmd: Option<bool>,
+    pub focus_cmd: bool,
+    pub close_cmd: bool,
+    pub take_screenshot: Option<PathBuf>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PresetSel {
@@ -18,7 +28,9 @@ enum PresetSel {
 pub struct CrtApp {
     s: Settings,
     sim: Sim,
-    gpu: Option<Arc<Mutex<Gpu>>>,
+    hdr_status: HdrStatus,
+    hdr_seeded_peak: bool,
+    hdr_prefer_pq: bool,
     gpu_error: Option<String>,
     zoom: f32,
     pan: [f32; 2],
@@ -52,7 +64,6 @@ pub struct CrtApp {
     screenshot: Option<PathBuf>,
     frames: u32,
     shot_requested: bool,
-    shot_done: Arc<AtomicBool>,
     last_instant: std::time::Instant,
     fps: f32,
     scan_clock: ScanClock,
@@ -73,6 +84,7 @@ pub struct CrtApp {
     about_msg: String,
     tv_hovered: bool,
     fullscreen: bool,
+    pending_fullscreen: Option<bool>,
     fs_since: std::time::Instant,
     last_pointer_move: std::time::Instant,
 }
@@ -164,7 +176,14 @@ fn mpv_key_name(ev: &egui::Event) -> Option<String> {
 }
 
 impl CrtApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<PathBuf>, preset: Option<usize>, zoom: Option<f32>, pattern: Option<usize>, mpv_src: Option<(String, f64)>) -> Self {
+    pub fn new(
+        egui_ctx: &egui::Context,
+        screenshot: Option<PathBuf>,
+        preset: Option<usize>,
+        zoom: Option<f32>,
+        pattern: Option<usize>,
+        mpv_src: Option<(String, f64)>,
+    ) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(35, 33, 30);
         visuals.window_fill = Color32::from_rgb(40, 37, 33);
@@ -184,20 +203,13 @@ impl CrtApp {
         visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(218, 158, 84));
         visuals.widgets.active.bg_fill = Color32::from_rgb(182, 98, 32);
         visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(246, 204, 138));
-        cc.egui_ctx.set_theme(egui::Theme::Dark);
-        cc.egui_ctx.set_visuals_of(egui::Theme::Dark, visuals);
-        cc.egui_ctx.all_styles_mut(|style| {
+        egui_ctx.set_theme(egui::Theme::Dark);
+        egui_ctx.set_visuals_of(egui::Theme::Dark, visuals);
+        egui_ctx.all_styles_mut(|style| {
             style.spacing.slider_width = 136.0;
             style.spacing.item_spacing = egui::vec2(8.0, 5.0);
         });
 
-        let (gpu, gpu_error) = match &cc.gl {
-            Some(gl) => match Gpu::new(gl) {
-                Ok(g) => (Some(Arc::new(Mutex::new(g))), None),
-                Err(e) => (None, Some(e)),
-            },
-            None => (None, Some("OpenGL is not available.".to_string())),
-        };
         let mut sim = Sim::new();
         sim.warm = if screenshot.is_some() { 1.0 } else { 0.35 };
         if screenshot.is_some() {
@@ -214,8 +226,10 @@ impl CrtApp {
         let mut app = CrtApp {
             s,
             sim,
-            gpu,
-            gpu_error,
+            hdr_status: HdrStatus::default(),
+            hdr_seeded_peak: false,
+            hdr_prefer_pq: cfg!(target_os = "linux"),
+            gpu_error: None,
             zoom: zoom.unwrap_or(1.0).clamp(1.0, 60.0),
             pan: [0.0, 0.0],
             last_fi: FrameInput::default(),
@@ -247,7 +261,6 @@ impl CrtApp {
             screenshot,
             frames: 0,
             shot_requested: false,
-            shot_done: Arc::new(AtomicBool::new(false)),
             last_instant: std::time::Instant::now(),
             fps: 60.0,
             scan_clock: ScanClock::default(),
@@ -259,12 +272,13 @@ impl CrtApp {
             crop: false,
             seek_drag: None,
             audio,
-            inbox: if screenshot_mode { None } else { Some(crate::link::listen(cc.egui_ctx.clone())) },
+            inbox: if screenshot_mode { None } else { Some(crate::link::listen(egui_ctx.clone())) },
             use_my_mpv: true,
             link_msg: String::new(),
             about_msg: String::new(),
             tv_hovered: false,
             fullscreen: false,
+            pending_fullscreen: None,
             fs_since: std::time::Instant::now(),
             last_pointer_move: std::time::Instant::now(),
         };
@@ -274,8 +288,38 @@ impl CrtApp {
         app
     }
 
+    pub fn set_hdr_status(&mut self, status: HdrStatus) {
+        if !self.hdr_seeded_peak {
+            let os_confirmed_hdr = status.reported_peak_nits.is_some_and(|p| p > 350.0)
+                || status.reported_edr_headroom.is_some_and(|h| h > 1.15);
+            if os_confirmed_hdr && status.supported {
+                self.s.hdr_mode = true;
+            }
+            if let Some(peak) = status.reported_peak_nits {
+                self.s.hdr_peak_nits = peak.clamp(300.0, 2000.0);
+                self.hdr_seeded_peak = true;
+            }
+            if let Some(sdr) = status.reported_sdr_nits {
+                self.s.hdr_ui_nits = sdr.clamp(80.0, 400.0);
+            }
+        }
+        self.hdr_status = status;
+    }
+
+    pub fn prefer_pq(&self) -> bool {
+        self.hdr_prefer_pq
+    }
+
+    pub fn want_hdr(&self) -> bool {
+        self.s.hdr_mode
+    }
+
+    pub fn fps(&self) -> f32 {
+        self.fps
+    }
+
     /// Fullscreen = only the TV: the window fills the screen and the settings are hidden.
-    fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+    fn set_fullscreen(&mut self, on: bool) {
         if on == self.fullscreen {
             return;
         }
@@ -287,16 +331,26 @@ impl CrtApp {
         self.fs_since = std::time::Instant::now();
         self.last_pointer_move = std::time::Instant::now();
         self.reset_trails = true;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        self.pending_fullscreen = Some(on);
     }
 
     /// Starts in fullscreen (the --fullscreen option).
-    pub fn start_fullscreen(&mut self, ctx: &egui::Context, real_window: bool) {
+    pub fn start_fullscreen(&mut self, real_window: bool) {
         if real_window {
-            self.set_fullscreen(ctx, true);
+            self.set_fullscreen(true);
         } else {
             self.fullscreen = true;
             self.fs_since = std::time::Instant::now();
+        }
+    }
+
+    pub fn sync_window_fullscreen(&mut self, is_fullscreen: bool) {
+        if self.fullscreen
+            && self.screenshot.is_none()
+            && self.fs_since.elapsed().as_secs_f32() > 1.0
+            && !is_fullscreen
+        {
+            self.fullscreen = false;
         }
     }
 
@@ -339,7 +393,7 @@ impl CrtApp {
         if old.pattern == Pattern::Image || old.pattern == Pattern::Video {
             self.s.pattern = old.pattern;
         }
-        // keep the user's sound preferences when switching built-in presets
+        // keep the user's sound and display HDR preferences when switching built-in presets
         if matches!(sel, PresetSel::BuiltIn(_)) {
             self.s.sound = old.sound;
             self.s.volume = old.volume;
@@ -347,6 +401,10 @@ impl CrtApp {
             self.s.mono = old.mono;
             self.s.whine = old.whine;
             self.s.test_tone = old.test_tone;
+            self.s.hdr_mode = old.hdr_mode;
+            self.s.hdr_paper_white = old.hdr_paper_white;
+            self.s.hdr_peak_nits = old.hdr_peak_nits;
+            self.s.hdr_ui_nits = old.hdr_ui_nits;
         } else if let Some(p) = &self.player {
             p.volume((self.s.volume * 100.0) as f64);
         }
@@ -998,11 +1056,33 @@ impl CrtApp {
                 sl(ui, &mut s.eye_ms, 0.0..=60.0, "Eye / camera integration (ms)", "How long your eye (or a camera) blends successive fields. 0 = a fast shutter.");
                 ui.checkbox(&mut s.show_bezel, "Show cabinet bezel");
                 ui.separator();
-                ui.checkbox(&mut s.hdr_mode, "HDR10 PQ output (OLED / HDR)")
-                    .on_hover_text("Outputs BT.2020 ST.2084 PQ values so individual CRT phosphors can hit 600–1000+ nits. Requires forcing HDR10 PQ on the window/display externally (e.g. Gamescope / compositor override / Special K); looks dim on a normal SDR desktop.");
-                ui.add_enabled_ui(s.hdr_mode, |ui| {
+                let hdr_active = self.hdr_status.active_mode.is_hdr();
+                ui.checkbox(&mut s.hdr_mode, "Native HDR output (OLED / HDR)")
+                    .on_hover_text("Requests a native 16-bit float scRGB / EDR or 10-bit HDR10 PQ swapchain via wgpu so individual CRT phosphors can hit 600–1000+ nits while the UI stays comfortable. Automatically falls back to SDR when the display/compositor is in SDR.");
+                let status_col = if hdr_active {
+                    Color32::from_rgb(112, 236, 184)
+                } else {
+                    Color32::from_rgb(184, 174, 156)
+                };
+                let status_lbl = ui.label(RichText::new(format!("Output: {}", self.hdr_status.summary())).monospace().small().color(status_col));
+                if !self.hdr_status.adapter_name.is_empty() {
+                    status_lbl.on_hover_text(format!("GPU: {}", self.hdr_status.adapter_name));
+                }
+                if s.hdr_mode && !self.hdr_status.supported {
+                    ui.label(
+                        RichText::new("No HDR swapchain reported by OS/compositor — running in SDR fallback.")
+                            .weak()
+                            .small(),
+                    );
+                }
+                ui.add_enabled_ui(hdr_active, |ui| {
+                    if self.hdr_status.has_scrgb && self.hdr_status.has_pq {
+                        ui.checkbox(&mut self.hdr_prefer_pq, "Prefer 10-bit HDR10 PQ over scRGB")
+                            .on_hover_text("Switches between 16-bit float scRGB and 10-bit BT.2020 ST.2084 PQ if your compositor/display prefers one over the other.");
+                    }
                     sl(ui, &mut s.hdr_paper_white, 80.0..=500.0, "HDR paper white (nits)", "Average brightness of nominal white; individual lit phosphors peak 3–5× higher.");
                     sl(ui, &mut s.hdr_peak_nits, 300.0..=2000.0, "HDR peak luminance (nits)", "Peak brightness ceiling of your OLED/HDR display.");
+                    sl(ui, &mut s.hdr_ui_nits, 80.0..=400.0, "HDR UI brightness (nits)", "Brightness of the ViCTR control bar and service panel in HDR mode.");
                 });
                 ui.label(RichText::new("Tip: set Room light to 0 for true 0.000 OLED pure blacks.").weak().small());
             });
@@ -1354,8 +1434,8 @@ fn lamp(ui: &mut egui::Ui, on: bool, label: &str, tip: &str) {
     ui.label(RichText::new(label).small().color(Color32::from_rgb(218, 208, 188))).on_hover_text(tip);
 }
 
-impl eframe::App for CrtApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl CrtApp {
+    pub fn run_ui(&mut self, ui: &mut egui::Ui) -> FrameOutput {
         let ctx = ui.ctx().clone();
         let now = std::time::Instant::now();
         let real_dt = (now - self.last_instant).as_secs_f32();
@@ -1381,10 +1461,11 @@ impl eframe::App for CrtApp {
         }
 
         // videos sent from the person's mpv (Ctrl+T shortcut / second launch)
+        let mut focus_cmd = false;
         let requests: Vec<(String, f64)> = self.inbox.as_ref().map(|i| std::mem::take(&mut *i.lock().unwrap())).unwrap_or_default();
         for (src, start) in requests {
             self.start_video_at(src, start);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            focus_cmd = true;
         }
 
         // fullscreen: F11 toggles, Esc leaves; Ctrl+1 snaps screen size to 1:1 pixel-perfect phosphors
@@ -1394,24 +1475,16 @@ impl eframe::App for CrtApp {
         let ctrl_1 = !ctx.egui_wants_keyboard_input()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num1));
         if f11 {
-            self.set_fullscreen(&ctx, !self.fullscreen);
+            self.set_fullscreen(!self.fullscreen);
         } else if esc {
             if self.save_preset_open {
                 self.save_preset_open = false;
             } else {
-                self.set_fullscreen(&ctx, false);
+                self.set_fullscreen(false);
             }
         }
         if ctrl_1 {
             self.pixel_perfect_req = true;
-        }
-        // the window manager can also take us out of fullscreen
-        if self.fullscreen
-            && self.screenshot.is_none()
-            && self.fs_since.elapsed().as_secs_f32() > 1.0
-            && ctx.input(|i| i.viewport().fullscreen) == Some(false)
-        {
-            self.fullscreen = false;
         }
         // pointer activity: shows the hint, hides the idle pointer in fullscreen
         if ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_down()) {
@@ -1575,10 +1648,34 @@ impl eframe::App for CrtApp {
                                                     .monospace()
                                                     .color(Color32::from_rgb(206, 174, 118)),
                                             );
+                                            if self.hdr_status.active_mode.is_hdr() {
+                                                ui.label(
+                                                    RichText::new("HDR")
+                                                        .small()
+                                                        .strong()
+                                                        .monospace()
+                                                        .color(Color32::from_rgb(255, 206, 92)),
+                                                );
+                                            }
                                         });
                                     });
 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if self.hdr_status.supported {
+                                        let hdr_on = self.hdr_status.active_mode.is_hdr();
+                                        let hdr_lbl = if hdr_on {
+                                            RichText::new("HDR").color(Color32::from_rgb(255, 214, 96)).strong()
+                                        } else {
+                                            RichText::new("HDR").color(Color32::from_rgb(176, 168, 152))
+                                        };
+                                        if ui
+                                            .add(egui::Button::new(hdr_lbl).selected(hdr_on))
+                                            .on_hover_text(format!("Toggle native HDR output ({})", self.hdr_status.summary()))
+                                            .clicked()
+                                        {
+                                            self.s.hdr_mode = !self.s.hdr_mode;
+                                        }
+                                    }
                                     let btn_label = if self.sidebar_open {
                                         RichText::new("Controls >").color(Color32::WHITE).strong()
                                     } else {
@@ -1598,7 +1695,7 @@ impl eframe::App for CrtApp {
                 });
         }
         if go_fullscreen {
-            self.set_fullscreen(&ctx, true);
+            self.set_fullscreen(true);
         }
         if self.message == "pick" {
             self.message.clear();
@@ -1610,7 +1707,7 @@ impl eframe::App for CrtApp {
         }
         if self.message == "exitfs" {
             self.message.clear();
-            self.set_fullscreen(&ctx, false);
+            self.set_fullscreen(false);
         }
 
         // Advance drawer & right-edge handle animations BEFORE rendering the CRT,
@@ -1630,11 +1727,12 @@ impl eframe::App for CrtApp {
         }
 
         let mut central_rect = egui::Rect::NOTHING;
+        let mut frame_fi = FrameInput::default();
         let ptr_pos = ctx.input(|i| i.pointer.hover_pos());
         let eased = 1.0 - (1.0 - self.sidebar_anim).powi(3);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(Color32::BLACK))
+            .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 central_rect = rect;
@@ -1763,22 +1861,8 @@ impl eframe::App for CrtApp {
                 self.last_fi.clear_burn = false;
                 self.last_fi.burn_now = false;
                 self.last_fi.reset_trails = false;
+                frame_fi = fi;
 
-                if let Some(gpu) = &self.gpu {
-                    let gpu = gpu.clone();
-                    let cb = egui_glow::CallbackFn::new(move |info, painter| {
-                        let v = info.viewport_in_pixels();
-                        if let Ok(mut g) = gpu.lock() {
-                            g.paint(painter.gl(), &fi, [v.left_px, v.from_bottom_px, v.width_px, v.height_px]);
-                        }
-                    });
-                    ui.painter().add(egui::PaintCallback { rect, callback: Arc::new(cb) });
-                    if let Ok(g) = self.gpu.as_ref().unwrap().lock() {
-                        if let Some(e) = &g.error {
-                            self.gpu_error = Some(e.clone());
-                        }
-                    }
-                }
                 if let Some(e) = &self.gpu_error {
                     ui.painter().text(
                         rect.center(),
@@ -2061,35 +2145,25 @@ impl eframe::App for CrtApp {
 
         // screenshot mode
         self.frames += 1;
+        let mut take_screenshot = None;
         if let Some(path) = self.screenshot.clone() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
             if self.frames >= 120 && !self.shot_requested {
                 self.shot_requested = true;
-                let done = self.shot_done.clone();
-                let fps = self.fps;
-                let c2 = ctx.clone();
-                ctx.request_screenshot(move |img| {
-                    let [w, h] = img.size;
-                    let mut buf = Vec::with_capacity(w * h * 4);
-                    for p in &img.pixels {
-                        buf.extend_from_slice(&[p.r(), p.g(), p.b(), 255]);
-                    }
-                    if let Some(parent) = path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    match image::save_buffer(&path, &buf, w as u32, h as u32, image::ColorType::Rgba8) {
-                        Ok(()) => eprintln!("saved screenshot to {} ({fps:.0} fps)", path.display()),
-                        Err(e) => eprintln!("could not save screenshot: {e}"),
-                    }
-                    done.store(true, Ordering::SeqCst);
-                    c2.request_repaint();
-                });
-            }
-            if self.shot_done.load(Ordering::SeqCst) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                take_screenshot = Some(path);
             }
         }
         ctx.request_repaint();
+
+        FrameOutput {
+            crt_rect: central_rect,
+            fi: frame_fi,
+            want_hdr: self.s.hdr_mode,
+            prefer_pq: self.hdr_prefer_pq,
+            fullscreen_cmd: self.pending_fullscreen.take(),
+            focus_cmd,
+            close_cmd: false,
+            take_screenshot,
+        }
     }
 }
 

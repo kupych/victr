@@ -43,12 +43,12 @@ pub fn forward_to_running(_src: &str, _start: f64) -> bool {
 
 /// Listens for requests from later launches (e.g. from the mpv shortcut).
 #[cfg(unix)]
-pub fn listen(ctx: eframe::egui::Context) -> Inbox {
+pub fn listen(ctx: egui::Context) -> Inbox {
     listen_at(socket_path(), ctx)
 }
 
 #[cfg(unix)]
-fn listen_at(path: PathBuf, ctx: eframe::egui::Context) -> Inbox {
+fn listen_at(path: PathBuf, ctx: egui::Context) -> Inbox {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     let inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
@@ -80,7 +80,7 @@ fn listen_at(path: PathBuf, ctx: eframe::egui::Context) -> Inbox {
     inbox
 }
 #[cfg(not(unix))]
-pub fn listen(_ctx: eframe::egui::Context) -> Inbox {
+pub fn listen(_ctx: egui::Context) -> Inbox {
     Arc::new(Mutex::new(Vec::new()))
 }
 
@@ -168,7 +168,7 @@ mod tests {
     fn second_launch_hands_video_to_running_window() {
         // private socket in the temp folder, so a real running copy is never touched
         let sock = std::env::temp_dir().join(format!("victr-link-test-{}.sock", std::process::id()));
-        let inbox = listen_at(sock.clone(), eframe::egui::Context::default());
+        let inbox = listen_at(sock.clone(), egui::Context::default());
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(forward_at(&sock, "/videos/my clip.mkv", 83.5));
         assert!(forward_at(&sock, "https://example.com/watch?v=1", 0.0));
