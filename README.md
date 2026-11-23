@@ -24,7 +24,7 @@ ViCTR models the full analog television pipeline — from NTSC baseband encoding
 - **Video & Image Playback**
   - Play local video files or URLs (via `mpv` / `yt-dlp`), drag and drop images or videos onto the window, forward your own `mpv` key bindings while hovering the screen, or install the built-in `Ctrl+T` mpv script to hand off playback from mpv directly to ViCTR.
 - **Slide-in Service Panel & Custom Presets**
-  - Retro faux-walnut and brushed-metal slide-in controls drawer (hover the right edge, click the edge tab, or toggle **Controls**) that can be **locked open** beside the TV or tucked away for an unobstructed view.
+  - Retro faux-walnut and brushed-metal slide-in controls drawer: hover near the right edge to reveal the pull handle, and click it (or **Controls** in the top bar) to slide the panel open or closed while the CRT glides smoothly alongside it.
   - Includes 9 built-in presets and lets you **save, overwrite, and delete custom presets** stored in your user config directory.
 
 ## Screenshots
@@ -84,8 +84,9 @@ cargo test
 
 | Action | Input |
 | --- | --- |
-| Slide service panel in | Hover the right edge, click the right-edge pull tab, or click **Controls** |
-| Lock / unlock sidebar | Click **Lock open** / **Locked open** in the service panel header |
+| Reveal drawer handle | Hover near the right edge of the window |
+| Open / close service panel | Click the right-edge handle (or **Controls** in the top bar) |
+| Resize service panel | Drag the left edge of the open service panel |
 | Save a preset | Click **Save…** in the top bar or open **Presets** inside the service panel |
 | Zoom into phosphors | Mouse wheel over the screen |
 | Pan zoomed view | Click and drag on the screen |

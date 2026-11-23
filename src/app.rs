@@ -38,13 +38,11 @@ pub struct CrtApp {
     confirm_delete_idx: Option<usize>,
     degauss_mag_start: Option<f32>,
     degauss_pinned_t: Option<f32>,
-    // slide-in right sidebar
-    sidebar_locked: bool,
+    // slide-in right sidebar (click handle or Controls button to toggle open/closed)
     sidebar_open: bool,
     sidebar_anim: f32,
+    handle_anim: f32,
     sidebar_width: f32,
-    sidebar_hover_left: Option<std::time::Instant>,
-    sidebar_dismissed: bool,
     sidebar_resizing: bool,
     message: String,
     screenshot: Option<PathBuf>,
@@ -185,7 +183,7 @@ impl CrtApp {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         cc.egui_ctx.set_visuals_of(egui::Theme::Dark, visuals);
         cc.egui_ctx.all_styles_mut(|style| {
-            style.spacing.slider_width = 148.0;
+            style.spacing.slider_width = 136.0;
             style.spacing.item_spacing = egui::vec2(8.0, 5.0);
         });
 
@@ -232,12 +230,10 @@ impl CrtApp {
             confirm_delete_idx: None,
             degauss_mag_start: None,
             degauss_pinned_t: None,
-            sidebar_locked: false,
             sidebar_open: false,
             sidebar_anim: 0.0,
-            sidebar_width: 380.0,
-            sidebar_hover_left: None,
-            sidebar_dismissed: false,
+            handle_anim: 0.0,
+            sidebar_width: 440.0,
             sidebar_resizing: false,
             message: String::new(),
             screenshot,
@@ -292,15 +288,11 @@ impl CrtApp {
         }
     }
 
-    pub fn set_sidebar_locked(&mut self, locked: bool) {
-        if locked != self.sidebar_locked {
-            self.sidebar_locked = locked;
-            self.sidebar_open = locked;
-            self.sidebar_anim = if locked { 1.0 } else { 0.0 };
-            self.sidebar_hover_left = None;
-            self.sidebar_dismissed = false;
-            self.reset_trails = true;
-        }
+    pub fn set_sidebar_locked(&mut self, open: bool) {
+        self.sidebar_open = open;
+        self.sidebar_anim = if open { 1.0 } else { 0.0 };
+        self.handle_anim = if open { 1.0 } else { 0.0 };
+        self.reset_trails = true;
     }
 
     /// Pins the degauss clock to a specific timestamp (used by `--degauss` for captures).
@@ -408,7 +400,7 @@ impl CrtApp {
                     let te = ui.add(
                         egui::TextEdit::singleline(&mut self.preset_name_input)
                             .hint_text("New preset name…")
-                            .desired_width(210.0),
+                            .desired_width(250.0),
                     );
                     let btn_label = if exists { "Overwrite" } else { "Save" };
                     let submit = ui.button(btn_label).clicked()
@@ -515,7 +507,7 @@ impl CrtApp {
                 }
                 ui.horizontal(|ui| {
                     let te = ui.add(
-                        egui::TextEdit::singleline(&mut self.video_url).hint_text("file path or URL (mpv + yt-dlp)").desired_width(230.0),
+                        egui::TextEdit::singleline(&mut self.video_url).hint_text("file path or URL (mpv + yt-dlp)").desired_width(260.0),
                     );
                     let go = ui.button("Play").clicked() || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                     if go && !self.video_url.trim().is_empty() {
@@ -1014,7 +1006,7 @@ impl CrtApp {
         paint_screw(ui.painter(), metal_rect.left_bottom() + egui::vec2(7.0, -7.0), 2.5);
         paint_screw(ui.painter(), metal_rect.right_bottom() + egui::vec2(-7.0, -7.0), 2.5);
 
-        let inner_frame = egui::Frame::NONE.inner_margin(egui::Margin { left: 14, right: 14, top: 8, bottom: 8 });
+        let inner_frame = egui::Frame::NONE.inner_margin(egui::Margin { left: 16, right: 18, top: 10, bottom: 10 });
         inner_frame.show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
@@ -1024,34 +1016,18 @@ impl CrtApp {
                         .color(Color32::from_rgb(242, 184, 96)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if !self.sidebar_locked
-                        && ui.small_button("×").on_hover_text("Slide controls away").clicked()
-                    {
-                        self.sidebar_open = false;
-                        self.sidebar_dismissed = true;
-                        self.sidebar_hover_left = None;
-                    }
-                    let lock_text = if self.sidebar_locked {
-                        RichText::new("Locked open").color(Color32::WHITE).strong()
-                    } else {
-                        RichText::new("Lock open")
-                    };
-                    let lock_btn = egui::Button::new(lock_text).selected(self.sidebar_locked).small();
                     if ui
-                        .add(lock_btn)
-                        .on_hover_text(if self.sidebar_locked {
-                            "Unlock so the sidebar auto-hides and slides in from the right edge."
-                        } else {
-                            "Lock the sidebar open beside the TV."
-                        })
+                        .small_button("Close >")
+                        .on_hover_text("Slide the service panel closed")
                         .clicked()
                     {
-                        self.set_sidebar_locked(!self.sidebar_locked);
+                        self.sidebar_open = false;
                     }
                 });
             });
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_width((ui.available_width() - 6.0).max(200.0));
                 ui.add_space(2.0);
                 self.preset_controls(ui);
                 self.video_controls(ui);
@@ -1504,46 +1480,23 @@ impl eframe::App for CrtApp {
                                     });
 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let active = self.sidebar_locked || self.sidebar_open;
-                                    let btn_label = if self.sidebar_locked {
-                                        RichText::new("Controls (locked)").color(Color32::WHITE).strong()
-                                    } else if self.sidebar_open {
-                                        RichText::new("Controls >").color(Color32::WHITE)
+                                    let btn_label = if self.sidebar_open {
+                                        RichText::new("Controls >").color(Color32::WHITE).strong()
                                     } else {
                                         RichText::new("< Controls")
                                     };
-                                    let btn = egui::Button::new(btn_label).selected(active);
+                                    let btn = egui::Button::new(btn_label).selected(self.sidebar_open);
                                     if ui
                                         .add(btn)
-                                        .on_hover_text("Open or hide the right-side controls drawer (hover the right edge to slide it in, or lock it open inside).")
+                                        .on_hover_text("Toggle the right-side service panel open or closed (you can also click the right-edge handle).")
                                         .clicked()
                                     {
-                                        if self.sidebar_locked {
-                                            self.set_sidebar_locked(false);
-                                        } else {
-                                            self.sidebar_open = !self.sidebar_open;
-                                            self.sidebar_dismissed = !self.sidebar_open;
-                                            self.sidebar_hover_left = None;
-                                        }
+                                        self.sidebar_open = !self.sidebar_open;
                                     }
                                 });
                             });
                         });
                 });
-
-            if self.sidebar_locked {
-                let panel_resp = egui::Panel::right("controls_docked")
-                    .frame(egui::Frame::NONE)
-                    .resizable(true)
-                    .default_size(self.sidebar_width)
-                    .size_range(300.0..=560.0)
-                    .show(ui, |ui| {
-                        self.sidebar_contents(ui);
-                    });
-                self.sidebar_width = panel_resp.response.rect.width().clamp(300.0, 560.0);
-                self.sidebar_anim = 1.0;
-                self.sidebar_open = true;
-            }
         }
         if go_fullscreen {
             self.set_fullscreen(&ctx, true);
@@ -1557,30 +1510,64 @@ impl eframe::App for CrtApp {
             self.pick_video();
         }
 
-        // Pre-compute whether the floating right drawer (or modal) currently covers the pointer,
-        // so scrolling or dragging inside the overlay does not zoom or pan the CRT underneath.
+        // Advance drawer & right-edge handle animations BEFORE rendering the CRT,
+        // so the TV smoothly glides left to stay completely unobstructed beside the
+        // sliding panel with zero OpenGL FBO reallocations.
+        let dt_ui = real_dt.clamp(0.0, 0.05);
+        let prev_anim = self.sidebar_anim;
+        if !self.fullscreen {
+            let target = if self.sidebar_open { 1.0 } else { 0.0 };
+            let step = dt_ui / 0.20;
+            if self.sidebar_anim < target {
+                self.sidebar_anim = (self.sidebar_anim + step).min(target);
+            } else if self.sidebar_anim > target {
+                self.sidebar_anim = (self.sidebar_anim - step).max(target);
+            }
+            if (self.sidebar_anim - prev_anim).abs() > 1e-5 {
+                self.reset_trails = true;
+            }
+        }
+
         let mut central_rect = egui::Rect::NOTHING;
         let ptr_pos = ctx.input(|i| i.pointer.hover_pos());
-        let eased_pre = 1.0 - (1.0 - self.sidebar_anim).powi(3);
+        let eased = if self.fullscreen { 0.0 } else { 1.0 - (1.0 - self.sidebar_anim).powi(3) };
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(Color32::BLACK))
             .show(ui, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 central_rect = rect;
-                let drawer_w = self.sidebar_width.clamp(300.0, (rect.width() - 60.0).max(300.0));
-                let drawer_x = rect.right() - drawer_w * eased_pre;
+                let max_w = (rect.width() - 260.0).max(380.0).min(620.0);
+                let drawer_w = self.sidebar_width.clamp(380.0, max_w);
+                let drawer_vis_w = drawer_w * eased;
+                let drawer_x = rect.right() - drawer_vis_w;
+                let tab_w = 24.0;
+                let handle_eased = 1.0 - (1.0 - self.handle_anim).powi(3);
+                let over_handle = !self.fullscreen
+                    && handle_eased > 0.05
+                    && ptr_pos.is_some_and(|p| {
+                        let tab_left = drawer_x - tab_w * handle_eased;
+                        let cy = rect.center().y;
+                        p.x >= tab_left - 2.0 && p.x <= drawer_x + 4.0 && (p.y - cy).abs() <= 50.0
+                    });
                 let over_drawer = !self.fullscreen
-                    && !self.sidebar_locked
                     && self.sidebar_anim > 0.01
                     && ptr_pos.is_some_and(|p| p.x >= drawer_x - 6.0 && p.y >= rect.top());
-                let overlay_active = over_drawer || self.sidebar_resizing || self.save_preset_open;
+                let overlay_active = over_drawer || over_handle || self.sidebar_resizing || self.save_preset_open;
 
                 let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
                 self.tv_hovered = resp.hovered() && !overlay_active;
 
+                // Visible TV region to the left of the sliding service panel:
+                // the TV smoothly shifts & fits into this rect with zero FBO churn.
+                let vis_rect = egui::Rect::from_min_max(
+                    rect.min,
+                    egui::pos2((rect.right() - drawer_vis_w).max(rect.left() + 120.0), rect.bottom()),
+                );
+
                 // zoom & pan
-                let h = self.view_half(rect);
+                let h = self.view_half(vis_rect);
+                let shift_x = (drawer_vis_w / rect.height().max(1.0)) * h;
                 if self.tv_hovered {
                     let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
                     if scroll.abs() > 0.0 {
@@ -1588,11 +1575,12 @@ impl eframe::App for CrtApp {
                             let nx = (mp.x - rect.left()) / rect.width() * 2.0 - 1.0;
                             let ny = (mp.y - rect.top()) / rect.height() * 2.0 - 1.0;
                             let a = rect.width() / rect.height();
-                            let px = nx * a * h + self.pan[0];
+                            let px = nx * a * h + (self.pan[0] + shift_x);
                             let py = ny * h + self.pan[1];
                             self.zoom = (self.zoom * (scroll * 0.004).exp()).clamp(1.0, 60.0);
-                            let h2 = self.view_half(rect);
-                            self.pan = [px - nx * a * h2, py - ny * h2];
+                            let h2 = self.view_half(vis_rect);
+                            let shift_x2 = (drawer_vis_w / rect.height().max(1.0)) * h2;
+                            self.pan = [px - nx * a * h2 - shift_x2, py - ny * h2];
                             self.reset_trails = true;
                         }
                     }
@@ -1616,8 +1604,9 @@ impl eframe::App for CrtApp {
                 let lim = (1.0 - 1.0 / self.zoom).max(0.0);
                 self.pan[0] = self.pan[0].clamp(-1.45 * lim, 1.45 * lim);
                 self.pan[1] = self.pan[1].clamp(-1.1 * lim, 1.1 * lim);
-                let h = self.view_half(rect);
-                let view = [self.pan[0], self.pan[1], h];
+                let h = self.view_half(vis_rect);
+                let shift_x = (drawer_vis_w / rect.height().max(1.0)) * h;
+                let view = [self.pan[0] + shift_x, self.pan[1], h];
 
                 // simulation step
                 // In slow motion the whole TV (beam, signal, animation) runs on a slowed clock.
@@ -1731,116 +1720,36 @@ impl eframe::App for CrtApp {
                 }
             });
 
-        // Slide-in right controls drawer when unlocked (overlay so the CRT FBO never churns)
-        if !self.fullscreen && !self.sidebar_locked && central_rect.width() > 0.0 && central_rect.height() > 0.0 {
-            let max_w = (central_rect.width() - 60.0).max(300.0);
-            let drawer_w = self.sidebar_width.clamp(300.0, max_w.min(560.0));
-            let dt = real_dt.clamp(0.0, 0.05);
+        // Slide-in right service panel & hover-revealed pull handle
+        if !self.fullscreen && central_rect.width() > 0.0 && central_rect.height() > 0.0 {
+            let max_w = (central_rect.width() - 260.0).max(380.0).min(620.0);
+            let drawer_w = self.sidebar_width.clamp(380.0, max_w);
+            let drawer_x = central_rect.right() - drawer_w * eased;
 
-            // Detect right-edge hover to open, and pointer exit (with grace delay) to close.
+            // When closed, hovering near the right edge reveals the pull handle;
+            // clicking the handle toggles the service panel open or closed.
             let near_right_edge = ptr_pos.is_some_and(|p| {
-                p.x >= central_rect.right() - 18.0 && p.x <= central_rect.right() + 4.0 && p.y >= central_rect.top() && p.y <= central_rect.bottom()
+                p.x >= central_rect.right() - 56.0
+                    && p.x <= central_rect.right() + 4.0
+                    && p.y >= central_rect.top()
+                    && p.y <= central_rect.bottom()
             });
-            if !near_right_edge {
-                self.sidebar_dismissed = false;
+            let show_handle = self.sidebar_open || self.sidebar_anim > 0.01 || (near_right_edge && !self.save_preset_open);
+            let h_target = if show_handle { 1.0 } else { 0.0 };
+            let h_step = dt_ui / if show_handle { 0.14 } else { 0.20 };
+            if self.handle_anim < h_target {
+                self.handle_anim = (self.handle_anim + h_step).min(h_target);
+            } else if self.handle_anim > h_target {
+                self.handle_anim = (self.handle_anim - h_step).max(h_target);
             }
-            if near_right_edge && !self.sidebar_dismissed && !self.save_preset_open {
-                self.sidebar_open = true;
-                self.sidebar_hover_left = None;
-            }
+            let handle_eased = 1.0 - (1.0 - self.handle_anim).powi(3);
 
-            let eased = 1.0 - (1.0 - self.sidebar_anim).powi(3);
-            let drawer_x = central_rect.right() - drawer_w * eased;
-            let in_drawer_zone = ptr_pos.is_some_and(|p| {
-                p.x >= drawer_x - 20.0 && p.y >= central_rect.top() - 4.0 && p.y <= central_rect.bottom() + 4.0
-            });
-            let ui_busy = self.sidebar_resizing || ctx.any_popup_open() || ctx.dragged_id().is_some() || ctx.egui_wants_keyboard_input();
+            let tab_w = 24.0;
+            let tab_h = 92.0;
+            let tab_top = central_rect.center().y - tab_h * 0.5;
+            let tab_bottom = tab_top + tab_h;
 
-            if self.sidebar_open {
-                if in_drawer_zone || ui_busy {
-                    self.sidebar_hover_left = None;
-                } else {
-                    let left_at = *self.sidebar_hover_left.get_or_insert_with(std::time::Instant::now);
-                    if left_at.elapsed().as_secs_f32() >= 0.25 {
-                        self.sidebar_open = false;
-                        self.sidebar_hover_left = None;
-                    }
-                }
-            }
-
-            let target = if self.sidebar_open { 1.0 } else { 0.0 };
-            let step = dt / 0.20;
-            if self.sidebar_anim < target {
-                self.sidebar_anim = (self.sidebar_anim + step).min(target);
-            } else if self.sidebar_anim > target {
-                self.sidebar_anim = (self.sidebar_anim - step).max(target);
-            }
-
-            let eased = 1.0 - (1.0 - self.sidebar_anim).powi(3);
-            let drawer_x = central_rect.right() - drawer_w * eased;
-
-            // Tactile retro walnut & brushed-metal pull-tab when the drawer is tucked away
-            if self.sidebar_anim < 0.85 {
-                let tab_w = 24.0;
-                let tab_h = 92.0;
-                let tab_pos = egui::pos2((drawer_x - tab_w).max(central_rect.left()), central_rect.center().y - tab_h * 0.5);
-                egui::Area::new(egui::Id::unique("controls_pull_tab"))
-                    .order(egui::Order::Foreground)
-                    .fixed_pos(tab_pos)
-                    .interactable(true)
-                    .show(&ctx, |ui| {
-                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(tab_w, tab_h), egui::Sense::click());
-                        let hot = resp.hovered();
-                        let rounding = egui::CornerRadius { nw: 7, sw: 7, ne: 0, se: 0 };
-                        // Faux walnut outer tab rim
-                        let wood_bg = if hot {
-                            Color32::from_rgb(92, 54, 30)
-                        } else {
-                            Color32::from_rgb(66, 39, 21)
-                        };
-                        let stroke = if hot {
-                            Color32::from_rgb(232, 168, 86)
-                        } else {
-                            Color32::from_rgb(142, 128, 106)
-                        };
-                        ui.painter().rect_filled(rect, rounding, wood_bg);
-                        // Inset brushed-metal grip plate
-                        let plate = egui::Rect::from_min_max(
-                            rect.min + egui::vec2(3.0, 4.0),
-                            rect.max - egui::vec2(0.0, 4.0),
-                        );
-                        ui.painter().rect_filled(
-                            plate,
-                            egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 },
-                            if hot { Color32::from_rgb(56, 52, 46) } else { Color32::from_rgb(40, 38, 35) },
-                        );
-                        ui.painter().rect_stroke(rect, rounding, egui::Stroke::new(1.1, stroke), egui::StrokeKind::Inside);
-                        let c = plate.center();
-                        // Subtle knurled metal grip ridges above & below chevron
-                        let ridge_col = Color32::from_rgb(112, 104, 90);
-                        for &dy in &[-24.0f32, -19.0, 19.0, 24.0] {
-                            ui.painter().line_segment(
-                                [egui::pos2(plate.left() + 4.0, c.y + dy), egui::pos2(plate.right() - 4.0, c.y + dy)],
-                                egui::Stroke::new(1.0, ridge_col),
-                            );
-                        }
-                        let arrow_col = if hot { Color32::from_rgb(248, 186, 92) } else { Color32::from_rgb(214, 200, 176) };
-                        let arrow_stroke = egui::Stroke::new(2.0, arrow_col);
-                        ui.painter().line_segment([c + egui::vec2(3.0, -6.0), c + egui::vec2(-3.0, 0.0)], arrow_stroke);
-                        ui.painter().line_segment([c + egui::vec2(-3.0, 0.0), c + egui::vec2(3.0, 6.0)], arrow_stroke);
-                        if hot && !self.sidebar_dismissed {
-                            self.sidebar_open = true;
-                            self.sidebar_hover_left = None;
-                        }
-                        if resp.on_hover_text("Slide out service panel").clicked() {
-                            self.sidebar_open = true;
-                            self.sidebar_dismissed = false;
-                            self.sidebar_hover_left = None;
-                        }
-                    });
-            }
-
-            // Animated floating drawer
+            // Animated service panel drawer
             if self.sidebar_anim > 0.005 {
                 let drawer_rect = egui::Rect::from_min_size(egui::pos2(drawer_x, central_rect.top()), egui::vec2(drawer_w, central_rect.height()));
                 // Subtle drop shadow along the left edge of the drawer
@@ -1856,21 +1765,31 @@ impl eframe::App for CrtApp {
                     );
                 }
 
-                // Left-edge resize grip
-                egui::Area::new(egui::Id::unique("controls_drawer_resize"))
-                    .order(egui::Order::Tooltip)
-                    .fixed_pos(egui::pos2(drawer_rect.left() - 3.0, drawer_rect.top()))
-                    .interactable(true)
-                    .show(&ctx, |ui| {
-                        let (_, rresp) = ui.allocate_exact_size(egui::vec2(7.0, drawer_rect.height()), egui::Sense::drag());
-                        if rresp.hovered() || rresp.dragged() {
-                            ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                        }
-                        self.sidebar_resizing = rresp.dragged();
-                        if rresp.dragged() {
-                            self.sidebar_width = (self.sidebar_width - rresp.drag_delta().x).clamp(300.0, max_w.min(560.0));
-                        }
-                    });
+                // Left-edge resize grip (split above & below the pull handle so clicks never collide)
+                let mut resizing = false;
+                for (tag, y0, y1) in [
+                    ("controls_drawer_resize_top", drawer_rect.top(), (tab_top - 4.0).max(drawer_rect.top())),
+                    ("controls_drawer_resize_bot", (tab_bottom + 4.0).min(drawer_rect.bottom()), drawer_rect.bottom()),
+                ] {
+                    if y1 > y0 + 2.0 {
+                        egui::Area::new(egui::Id::unique(tag))
+                            .order(egui::Order::Tooltip)
+                            .fixed_pos(egui::pos2(drawer_rect.left() - 3.0, y0))
+                            .interactable(true)
+                            .show(&ctx, |ui| {
+                                let (_, rresp) = ui.allocate_exact_size(egui::vec2(7.0, y1 - y0), egui::Sense::drag());
+                                if rresp.hovered() || rresp.dragged() {
+                                    ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                                }
+                                if rresp.dragged() {
+                                    resizing = true;
+                                    self.sidebar_width = (self.sidebar_width - rresp.drag_delta().x).clamp(380.0, max_w);
+                                    self.reset_trails = true;
+                                }
+                            });
+                    }
+                }
+                self.sidebar_resizing = resizing;
 
                 egui::Area::new(egui::Id::unique("controls_drawer"))
                     .order(egui::Order::Foreground)
@@ -1886,6 +1805,74 @@ impl eframe::App for CrtApp {
                     });
             } else {
                 self.sidebar_resizing = false;
+            }
+
+            // Retro walnut & brushed-metal pull handle (appears on right-edge mouseover when closed,
+            // stays attached to the drawer edge when open; clicking toggles open/closed).
+            if handle_eased > 0.01 {
+                let tab_x = (drawer_x - tab_w * handle_eased).max(central_rect.left());
+                let tab_pos = egui::pos2(tab_x, tab_top);
+                egui::Area::new(egui::Id::unique("controls_pull_tab"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(tab_pos)
+                    .interactable(true)
+                    .show(&ctx, |ui| {
+                        ui.set_clip_rect(central_rect);
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(tab_w, tab_h), egui::Sense::click());
+                        let hot = resp.hovered();
+                        if hot {
+                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        let rounding = egui::CornerRadius { nw: 7, sw: 7, ne: 0, se: 0 };
+                        let wood_bg = if hot {
+                            Color32::from_rgb(92, 54, 30)
+                        } else {
+                            Color32::from_rgb(66, 39, 21)
+                        };
+                        let stroke = if hot {
+                            Color32::from_rgb(232, 168, 86)
+                        } else {
+                            Color32::from_rgb(142, 128, 106)
+                        };
+                        ui.painter().rect_filled(rect, rounding, wood_bg);
+                        let plate = egui::Rect::from_min_max(
+                            rect.min + egui::vec2(3.0, 4.0),
+                            rect.max - egui::vec2(0.0, 4.0),
+                        );
+                        ui.painter().rect_filled(
+                            plate,
+                            egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 },
+                            if hot { Color32::from_rgb(56, 52, 46) } else { Color32::from_rgb(40, 38, 35) },
+                        );
+                        ui.painter().rect_stroke(rect, rounding, egui::Stroke::new(1.1, stroke), egui::StrokeKind::Inside);
+                        let c = plate.center();
+                        let ridge_col = Color32::from_rgb(112, 104, 90);
+                        for &dy in &[-24.0f32, -19.0, 19.0, 24.0] {
+                            ui.painter().line_segment(
+                                [egui::pos2(plate.left() + 4.0, c.y + dy), egui::pos2(plate.right() - 4.0, c.y + dy)],
+                                egui::Stroke::new(1.0, ridge_col),
+                            );
+                        }
+                        let arrow_col = if hot { Color32::from_rgb(248, 186, 92) } else { Color32::from_rgb(214, 200, 176) };
+                        let arrow_stroke = egui::Stroke::new(2.0, arrow_col);
+                        if self.sidebar_open {
+                            // ">" chevron to close
+                            ui.painter().line_segment([c + egui::vec2(-3.0, -6.0), c + egui::vec2(3.0, 0.0)], arrow_stroke);
+                            ui.painter().line_segment([c + egui::vec2(3.0, 0.0), c + egui::vec2(-3.0, 6.0)], arrow_stroke);
+                        } else {
+                            // "<" chevron to open
+                            ui.painter().line_segment([c + egui::vec2(3.0, -6.0), c + egui::vec2(-3.0, 0.0)], arrow_stroke);
+                            ui.painter().line_segment([c + egui::vec2(-3.0, 0.0), c + egui::vec2(3.0, 6.0)], arrow_stroke);
+                        }
+                        let tip = if self.sidebar_open {
+                            "Close service panel"
+                        } else {
+                            "Open service panel"
+                        };
+                        if resp.on_hover_text(tip).clicked() {
+                            self.sidebar_open = !self.sidebar_open;
+                        }
+                    });
             }
         } else {
             self.sidebar_resizing = false;
