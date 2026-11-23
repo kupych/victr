@@ -207,14 +207,25 @@ struct Processor {
     spk_peak: Biquad,
     spk_lp: [Biquad; 2],
     cfg_key: (i32, i32, i32),
-    // power & level
+    // power, degauss & electrostatic crackle
+    inited: bool,
     gain: f32,
     was_on: bool,
+    last_degauss_t: f32,
     crackle: f32,
+    spark_env_l: f32,
+    spark_env_r: f32,
+    spark_decay: f32,
+    crackle_hp_l: Biquad,
+    crackle_hp_r: Biquad,
 }
 
 impl Processor {
     fn new() -> Self {
+        let mut crackle_hp_l = Biquad::default();
+        let mut crackle_hp_r = Biquad::default();
+        crackle_hp_l.set(1, 3800.0, 0.8, 0.0);
+        crackle_hp_r.set(1, 3800.0, 0.8, 0.0);
         Processor {
             t: 0.0,
             rng: 0x9e37_79b9_7f4a_7c15,
@@ -234,9 +245,16 @@ impl Processor {
             spk_peak: Biquad::default(),
             spk_lp: [Biquad::default(); 2],
             cfg_key: (-1, -1, -1),
+            inited: false,
             gain: 0.0,
             was_on: false,
+            last_degauss_t: 10.0,
             crackle: 0.0,
+            spark_env_l: 0.0,
+            spark_env_r: 0.0,
+            spark_decay: 0.94,
+            crackle_hp_l,
+            crackle_hp_r,
         }
     }
 
@@ -292,6 +310,25 @@ impl Processor {
         let track_err = if p.vcr { p.tracking.abs() } else { 0.0 };
         let track_noise = ((track_err - 0.05) * 2.6).clamp(0.0, 1.0);
         let off_target = if p.power_on && p.enabled { smooth(0.2, 0.45, p.warm) } else { 0.0 };
+
+        if !self.inited {
+            self.inited = true;
+            self.was_on = p.power_on;
+            self.last_degauss_t = p.degauss_t;
+            if p.power_on && p.degauss_t < 0.08 {
+                self.crackle = 0.85;
+            }
+        } else {
+            // Static electricity discharge/charge crackle on power switch or fresh degauss
+            if p.power_on != self.was_on {
+                self.was_on = p.power_on;
+                self.crackle = 1.0;
+            }
+            if p.degauss_t < self.last_degauss_t - 0.05 || (p.degauss_t < 0.05 && self.last_degauss_t > 0.2) {
+                self.crackle = self.crackle.max(0.75);
+            }
+            self.last_degauss_t = p.degauss_t;
+        }
 
         let mut b = ring.buf.lock().unwrap();
         for i in 0..n {
@@ -418,9 +455,11 @@ impl Processor {
             if p.ripple > 0.0 {
                 y += p.ripple * 0.01 * (std::f32::consts::TAU * 120.0 * t).sin().abs();
             }
+            // ---- Chassis & picture-tube acoustic sounds (bypass the warming audio amp)
+            let mut chassis_c = 0.0f32;
             // flyback transformer whine at the line rate (15.734 kHz)
             if p.power_on && p.warm > 0.1 {
-                y += p.whine * (0.004 + 0.006 * p.age) * (std::f32::consts::TAU * 15734.26 * t).sin();
+                chassis_c += p.whine * (0.004 + 0.006 * p.age) * (std::f32::consts::TAU * 15734.26 * t).sin();
             }
             // degauss coil: loud 60 Hz buzz (120 Hz force ripple) + initial relay/coil thump,
             // decaying along the same PTC thermistor envelope as the visual warp.
@@ -431,30 +470,42 @@ impl Processor {
                 let a = rise * ptc * (-dg / 1.15).exp();
                 let buzz = (std::f32::consts::TAU * 60.0 * t).sin().abs() - 0.63;
                 let harm = 0.25 * (std::f32::consts::TAU * 120.0 * t).sin();
-                y += 0.36 * a * (buzz + harm);
+                chassis_c += 0.36 * a * (buzz + harm);
                 if dg < 0.075 {
                     let k = 1.0 - dg / 0.075;
-                    y += 0.42 * k * k * (std::f32::consts::TAU * 48.0 * dg).sin();
+                    chassis_c += 0.42 * k * k * (std::f32::consts::TAU * 48.0 * dg).sin();
                 }
             }
-            // static discharge crackle on power on/off
-            if p.power_on != self.was_on {
-                self.was_on = p.power_on;
-                self.crackle = 1.0;
-            }
-            if self.crackle > 0.001 {
-                if self.rnd() < 0.004 {
-                    y += (self.rnd() - 0.5) * self.crackle;
+            // Subtle high-voltage electrostatic faceplate crackle on power switch / degauss:
+            // delicate high-passed micro-sparks & soft corona fizz across the glass.
+            let mut crackle_l = 0.0f32;
+            let mut crackle_r = 0.0f32;
+            if self.crackle > 0.002 || self.spark_env_l > 0.001 || self.spark_env_r > 0.001 {
+                let rate = 0.0028 * (0.18 + 0.82 * self.crackle);
+                if self.crackle > 0.002 && self.rnd() < rate {
+                    let u = self.rnd();
+                    let amp = (0.22 + 0.78 * u * u) * self.crackle;
+                    let pan = 0.22 + 0.56 * self.rnd();
+                    self.spark_env_l = (self.spark_env_l + amp * (1.0 - pan)).min(1.0);
+                    self.spark_env_r = (self.spark_env_r + amp * pan).min(1.0);
+                    self.spark_decay = 0.91 + 0.065 * self.rnd();
                 }
-                self.crackle *= 0.99993;
+                let fizz = 0.028 * self.crackle * self.crackle;
+                let raw_l = (self.rnd() * 2.0 - 1.0) * (self.spark_env_l + fizz);
+                let raw_r = (self.rnd() * 2.0 - 1.0) * (self.spark_env_r + fizz);
+                crackle_l = self.crackle_hp_l.run(raw_l) * 0.22;
+                crackle_r = self.crackle_hp_r.run(raw_r) * 0.22;
+                self.spark_env_l *= self.spark_decay;
+                self.spark_env_r *= self.spark_decay;
+                self.crackle *= 0.999952;
             }
 
             self.gain += (off_target - self.gain) * 0.0004;
             let vol = p.volume * p.volume * 1.6;
-            let g = self.gain * vol;
-            let mut ol = (y + side) * g;
-            let mut or = (y - side) * g;
-            // crackle and degauss are heard even while the audio amp is warming
+            let amp_g = self.gain * vol;
+            let chassis_g = if p.enabled { vol } else { 0.0 };
+            let mut ol = (y + side) * amp_g + (chassis_c + crackle_l) * chassis_g;
+            let mut or = (y - side) * amp_g + (chassis_c + crackle_r) * chassis_g;
             ol = soft_clip(ol);
             or = soft_clip(or);
             out[2 * i] = (ol * 32767.0) as i16;
@@ -658,6 +709,37 @@ mod tests {
         let (tape, ok) = rms(&v, true, 3.0);
         assert!(ok && tape > 0.01, "tape path should pass sound: {tape}");
         println!("clean {clean:.3} static {snow:.3} strong {quiet:.4} off {off:.4} tape {tape:.3}");
+    }
+
+    #[test]
+    fn static_crackle_on_power_and_degauss() {
+        let ring = AudioRing::new();
+        let mut proc = Processor::new();
+        let mut out = vec![0i16; BLOCK * 2];
+
+        // Start powered off and idle -> silent
+        let mut p = AudioParams { whine: 0.0, degauss_t: 10.0, power_on: false, warm: 0.0, ..Default::default() };
+        proc.process(&p, &ring, &mut out);
+        assert!(out.iter().all(|&s| s == 0), "idle powered-off TV should be silent");
+
+        // Switch power on (cold heater, warm = 0.0, no degauss buzz yet) -> subtle static crackle audible
+        p.power_on = true;
+        let mut energy = 0f64;
+        for _ in 0..80 {
+            proc.process(&p, &ring, &mut out);
+            energy += out.iter().map(|&s| (s as f64 / 32768.0).powi(2)).sum::<f64>();
+        }
+        let pwr_rms = (energy / (80 * BLOCK * 2) as f64).sqrt();
+        assert!(pwr_rms > 0.0005 && pwr_rms < 0.08, "power-on crackle should be subtle and audible: {pwr_rms}");
+
+        // Let crackle decay, then trigger a degauss -> crackle re-triggers cleanly
+        for _ in 0..400 {
+            proc.process(&p, &ring, &mut out);
+        }
+        assert!(proc.crackle < 0.01, "crackle should decay cleanly");
+        p.degauss_t = 0.0;
+        proc.process(&p, &ring, &mut out);
+        assert!(proc.crackle >= 0.7, "degauss should trigger subtle static crackle: {}", proc.crackle);
     }
 
     #[test]

@@ -804,11 +804,13 @@ void main() {
     P *= 1.0 - u_burn_amt * burn * 0.85;
 
     vec3 avg;
-    // Filter the mask over ~1.5 screen pixels, and fade it out as a triad shrinks
-    // below ~6 pixels: finer structure can't be shown and only beats against the
-    // monitor's pixel grid (moire). Zoom in to see the full phosphor pattern.
-    vec3 cov = maskCoverage(f, pxw * 1.5, avg);
-    float resolvable = smoothstep(2.0, 6.0, u_pitch / pxw);
+    // Use an exact 1-pixel footprint once triads reach Nyquist (>= 3 px/triad) so
+    // 1:1 pixel-perfect phosphors stay razor-sharp, while widening and fading out
+    // below ~3 px/triad to avoid moire against the display pixel grid.
+    float px_per_triad = u_pitch / pxw;
+    float filter_w = pxw * mix(1.5, 1.0, smoothstep(2.2, 2.95, px_per_triad));
+    vec3 cov = maskCoverage(f, filter_w, avg);
+    float resolvable = smoothstep(2.0, 2.95, px_per_triad);
     cov = mix(avg, cov, resolvable);
     vec3 T = mix(vec3(1.0), cov / avg, u_mask_strength);
     vec3 out_e = P * T;

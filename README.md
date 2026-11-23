@@ -24,7 +24,7 @@ ViCTR models the full analog television pipeline — from NTSC baseband encoding
 - **Video & Image Playback**
   - Play local video files or URLs (via `mpv` / `yt-dlp`), drag and drop images or videos onto the window, forward your own `mpv` key bindings while hovering the screen, or install the built-in `Ctrl+T` mpv script to hand off playback from mpv directly to ViCTR.
 - **Slide-in Service Panel & Custom Presets**
-  - Retro faux-walnut and brushed-metal slide-in controls drawer (hover the right edge, click the edge tab, or toggle **Controls**) that can be **locked open** beside the TV or tucked away for an unobstructed view.
+  - Retro faux-walnut and brushed-metal slide-in controls drawer accessible in both windowed and fullscreen modes: a subtle low-opacity pull handle rests on the right edge, brightens on hover, and toggles the panel open or closed on click while the CRT glides smoothly alongside it.
   - Includes 9 built-in presets and lets you **save, overwrite, and delete custom presets** stored in your user config directory.
 
 ## Screenshots
@@ -48,6 +48,10 @@ ViCTR models the full analog television pipeline — from NTSC baseband encoding
 | Single-instance `Ctrl+T` handoff socket | Native (Unix socket) | Native (Unix socket) | Launches a new window |
 
 ## Getting Started
+
+### Prebuilt Releases
+
+Prebuilt binaries for **Windows (x86_64)**, **macOS (Apple Silicon & Intel)**, and **Linux (x86_64)** are published on the [GitHub Releases](../../releases) page whenever a version tag (`v*`) is pushed.
 
 ### Prerequisites
 
@@ -84,12 +88,13 @@ cargo test
 
 | Action | Input |
 | --- | --- |
-| Slide service panel in | Hover the right edge, click the right-edge pull tab, or click **Controls** |
-| Lock / unlock sidebar | Click **Lock open** / **Locked open** in the service panel header |
+| Open / close service panel | Click the right-edge pull handle (works in fullscreen too) or **Controls** in the top bar |
+| Resize service panel | Drag the left edge of the open service panel |
 | Save a preset | Click **Save…** in the top bar or open **Presets** inside the service panel |
 | Zoom into phosphors | Mouse wheel over the screen |
 | Pan zoomed view | Click and drag on the screen |
 | Reset zoom & pan | Double-click the screen (or click **Reset view**) |
+| Pixel-perfect 1× phosphors | `Ctrl+1` (`Cmd+1` on macOS) or click **1:1** next to **Screen size (in)** |
 | Toggle fullscreen | `F11` (press `F11` or `Esc` to exit) |
 | Open image or video | Drag & drop onto the window, or use **Open a picture…** / **Open a video…** |
 | Control `mpv` playback | Hover the TV and use your `mpv` keys (`Space`, arrow keys, etc.) |

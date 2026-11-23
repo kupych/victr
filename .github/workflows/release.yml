@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_suffix: linux-x86_64
+            archive: tar.gz
+            bin: victr
+          - label: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_suffix: windows-x86_64
+            archive: zip
+            bin: victr.exe
+          - label: macOS Apple Silicon (ARM64)
+            os: macos-latest
+            target: aarch64-apple-darwin
+            asset_suffix: macos-arm64
+            archive: tar.gz
+            bin: victr
+          - label: macOS Intel (x86_64)
+            os: macos-latest
+            target: x86_64-apple-darwin
+            asset_suffix: macos-x86_64
+            archive: tar.gz
+            bin: victr
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME:-dev}"
+          PKG="victr-${TAG}-${{ matrix.asset_suffix }}"
+          mkdir -p "dist/${PKG}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${PKG}/"
+          cp README.md LICENSE "dist/${PKG}/"
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            cp victr.sh "dist/${PKG}/"
+          fi
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+          rm -rf "dist/${PKG}"
+
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "dev" }
+          $pkg = "victr-$tag-${{ matrix.asset_suffix }}"
+          New-Item -ItemType Directory -Force -Path "dist/$pkg" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/$pkg/"
+          Copy-Item README.md, LICENSE "dist/$pkg/"
+          Compress-Archive -Path "dist/$pkg" -DestinationPath "dist/$pkg.zip"
+          Remove-Item -Recurse -Force "dist/$pkg"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: victr-${{ matrix.asset_suffix }}
+          path: dist/victr-*.*
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all release archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        working-directory: dist
+        run: sha256sum victr-* > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
