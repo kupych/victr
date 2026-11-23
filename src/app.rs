@@ -997,6 +997,14 @@ impl CrtApp {
                 sl(ui, &mut s.exposure, 0.3..=3.0, "Viewing exposure", "");
                 sl(ui, &mut s.eye_ms, 0.0..=60.0, "Eye / camera integration (ms)", "How long your eye (or a camera) blends successive fields. 0 = a fast shutter.");
                 ui.checkbox(&mut s.show_bezel, "Show cabinet bezel");
+                ui.separator();
+                ui.checkbox(&mut s.hdr_mode, "HDR10 PQ output (OLED / HDR)")
+                    .on_hover_text("Outputs BT.2020 ST.2084 PQ values so individual CRT phosphors can hit 600–1000+ nits. Requires forcing HDR10 PQ on the window/display externally (e.g. Gamescope / compositor override / Special K); looks dim on a normal SDR desktop.");
+                ui.add_enabled_ui(s.hdr_mode, |ui| {
+                    sl(ui, &mut s.hdr_paper_white, 80.0..=500.0, "HDR paper white (nits)", "Average brightness of nominal white; individual lit phosphors peak 3–5× higher.");
+                    sl(ui, &mut s.hdr_peak_nits, 300.0..=2000.0, "HDR peak luminance (nits)", "Peak brightness ceiling of your OLED/HDR display.");
+                });
+                ui.label(RichText::new("Tip: set Room light to 0 for true 0.000 OLED pure blacks.").weak().small());
             });
     }
 

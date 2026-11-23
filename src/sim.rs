@@ -409,6 +409,9 @@ impl Sim {
             exposure: s.exposure,
             glass,
             bezel: s.show_bezel as i32,
+            hdr: s.hdr_mode as i32,
+            hdr_paper_white: s.hdr_paper_white,
+            hdr_peak_nits: s.hdr_peak_nits,
         };
 
         FrameInput {

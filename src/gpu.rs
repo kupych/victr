@@ -127,6 +127,9 @@ pub struct Uniforms {
     pub exposure: f32,
     pub glass: [f32; 3],
     pub bezel: i32,
+    pub hdr: i32,
+    pub hdr_paper_white: f32,
+    pub hdr_peak_nits: f32,
 }
 
 struct Program {
@@ -807,6 +810,9 @@ impl Gpu {
             p.f1(gl, "u_exposure", u.exposure);
             p.f3(gl, "u_glass", u.glass);
             p.i1(gl, "u_bezel", u.bezel);
+            p.i1(gl, "u_hdr", u.hdr);
+            p.f1(gl, "u_hdr_paper", u.hdr_paper_white);
+            p.f1(gl, "u_hdr_peak", u.hdr_peak_nits);
             p.u1(gl, "u_frame", u.frame);
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
 

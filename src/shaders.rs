@@ -968,11 +968,47 @@ uniform mat3 u_phos;
 uniform float u_diffuse, u_halation, u_ambient, u_reflect, u_vignette, u_exposure;
 uniform vec3 u_glass;
 uniform int u_bezel;
+uniform int u_hdr;
+uniform float u_hdr_paper;
+uniform float u_hdr_peak;
 uniform uint u_frame;
+
+const mat3 REC709_TO_REC2020 = mat3(
+    0.627404, 0.069097, 0.016391,
+    0.329283, 0.919540, 0.088013,
+    0.043313, 0.011362, 0.895595
+);
 
 vec3 tonemap(vec3 x) {
     vec3 hi = 0.8 + 0.2 * (1.0 - exp(-(x - 0.8) / 0.2));
     return mix(x, hi, step(vec3(0.8), x));
+}
+
+vec3 hdrRollOff(vec3 nits, float peak) {
+    float knee = peak * 0.82;
+    float span = max(peak - knee, 1.0);
+    vec3 hi = knee + span * (1.0 - exp(-(nits - knee) / span));
+    return mix(nits, hi, step(vec3(knee), nits));
+}
+
+// SMPTE ST.2084 PQ OETF (linear luminance in nits -> [0, 1] PQ code value)
+vec3 linearToPq(vec3 nits) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 4096.0 * 128.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 4096.0 * 32.0;
+    const float c3 = 2392.0 / 4096.0 * 32.0;
+    vec3 y = pow(clamp(nits / 10000.0, 0.0, 1.0), vec3(m1));
+    return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
+}
+
+vec3 encodeDisplay(vec3 linear_rgb) {
+    if (u_hdr == 1) {
+        vec3 nits = max(linear_rgb, 0.0) * u_hdr_paper;
+        vec3 bt2020 = max(REC709_TO_REC2020 * nits, 0.0);
+        return linearToPq(hdrRollOff(bt2020, max(u_hdr_peak, 100.0)));
+    }
+    return pow(clamp(tonemap(linear_rgb), 0.0, 1.0), vec3(1.0 / 2.2));
 }
 
 void main() {
@@ -987,13 +1023,15 @@ void main() {
     float r2 = dot(f / vec2(4.0 / 3.0, 1.0), f / vec2(4.0 / 3.0, 1.0));
     lin *= 1.0 - u_vignette * 0.25 * r2;
     // room light reflected by the grey phosphor screen and the curved glass
+    // (scales to true 0.000 OLED black when room light is 0)
     float glassArea = smoothstep(0.07 + pxw, 0.07 - pxw, sdf);
     vec3 screenGrey = vec3(0.30, 0.31, 0.30) * 0.05 * u_ambient * smoothstep(pxw, -pxw, sdf);
     vec2 hl = f - vec2(-0.75, -0.62);
     float spec = exp(-dot(hl, hl) / 0.18) * 0.06 + exp(-pow(abs(f.y + 0.85), 2.0) / 0.01) * 0.015;
     vec3 refl = vec3(0.9, 0.95, 1.0) * spec * u_reflect * u_ambient * glassArea;
-    lin = lin * glassArea + screenGrey + refl + vec3(0.002, 0.0022, 0.0025) * glassArea;
-    vec3 col = tonemap(lin * u_exposure);
+    float ambFloor = min(u_ambient * 2.0, 1.0);
+    lin = lin * glassArea + screenGrey + refl + vec3(0.002, 0.0022, 0.0025) * ambFloor * glassArea;
+    vec3 scene_lin = lin * u_exposure;
     vec3 room = vec3(0.0);   // pure black around the TV
     if (u_bezel == 1 && sdf > 0.07 - pxw) {
         // Retro woodgrain television cabinet: moulded dark charcoal inner mask,
@@ -1035,15 +1073,15 @@ void main() {
         cab *= 0.55 + u_ambient * 1.9;
         // subtle picture light spill onto the inner bevel lip
         cab += lin * 0.032 * bevel;
-        vec3 bz = tonemap(cab * u_exposure);
+        vec3 bz_lin = cab * u_exposure;
         float a = smoothstep(0.07 - pxw, 0.07 + pxw, sdf);
         float outside = smoothstep(bw - pxw, bw + pxw, d);
-        col = mix(col, bz, a);
-        col = mix(col, room, outside);
+        scene_lin = mix(scene_lin, bz_lin, a);
+        scene_lin = mix(scene_lin, room, outside);
     } else if (u_bezel == 0 && sdf > 0.07) {
-        col = room;
+        scene_lin = room;
     }
-    col = pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2));
+    vec3 col = encodeDisplay(scene_lin);
     float dn = rnd3(uint(gl_FragCoord.x), uint(gl_FragCoord.y), u_frame) - 0.5;
     // dither against banding, but leave true black exactly black
     col += dn / 255.0 * step(1.0 / 512.0, max(col.r, max(col.g, col.b)));
