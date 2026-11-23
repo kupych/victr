@@ -93,6 +93,7 @@ pub struct Uniforms {
     pub pitch: f32,
     pub bm: f32,
     pub mask_strength: f32,
+    pub anti_moire: f32,
     pub wire: f32,
     pub purity: f32,
     pub purity_seed: [f32; 2],
@@ -727,6 +728,7 @@ impl Gpu {
                 p.f1(gl, "u_pitch", u.pitch);
                 p.f1(gl, "u_bm", u.bm);
                 p.f1(gl, "u_mask_strength", u.mask_strength);
+                p.f1(gl, "u_anti_moire", u.anti_moire);
                 p.f1(gl, "u_wire", u.wire);
                 p.f1(gl, "u_purity", u.purity);
                 p.f2(gl, "u_purity_seed", u.purity_seed);

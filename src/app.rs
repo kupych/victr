@@ -307,6 +307,10 @@ impl CrtApp {
         self.reset_trails = true;
     }
 
+    pub fn request_pixel_perfect(&mut self) {
+        self.pixel_perfect_req = true;
+    }
+
     /// Pins the degauss clock to a specific timestamp (used by `--degauss` for captures).
     pub fn set_degauss_time(&mut self, t: f32) {
         self.sim.degauss();
@@ -875,8 +879,9 @@ impl CrtApp {
                             ui.selectable_value(&mut s.mask, p, p.label());
                         }
                     });
-                sl(ui, &mut s.pitch_mm, 0.2..=1.5, "Mask pitch (mm)", "Distance between phosphor triads. Zoom in on the screen to see them.");
+                sl(ui, &mut s.pitch_mm, 0.2..=1.5, "Mask pitch (mm)", "Distance between phosphor triads (default 0.62 mm). Zoom in or press Ctrl+1 to see them.");
                 sl(ui, &mut s.mask_strength, 0.0..=1.0, "Mask visibility", "1 = physically correct; lower blends the phosphor pattern away.");
+                sl(ui, &mut s.anti_moire, 0.0..=1.0, "Anti-moiré", "Aligns the mask to display pixels around 1× zoom and pre-filters scanlines so curved glass stays free of moiré rings.");
                 sl(ui, &mut s.black_matrix, 0.0..=0.6, "Black matrix", "Dark surround between phosphors (improves contrast, costs brightness).");
                 sl(ui, &mut s.spot, 0.12..=1.0, "Beam spot height", "Electron spot size relative to the line pitch: small = visible scanlines.");
                 sl(ui, &mut s.spot_h, 0.3..=4.0, "Beam spot width", "Horizontal spot size (in samples).");
@@ -1650,7 +1655,7 @@ impl eframe::App for CrtApp {
                 );
                 let ppp = ctx.pixels_per_point();
                 self.last_vis_rect = vis_rect;
-                self.last_full_h_px = rect.height() * ppp;
+                self.last_full_h_px = (rect.height() * ppp).round();
                 if self.pixel_perfect_req {
                     self.pixel_perfect_req = false;
                     self.apply_pixel_perfect_screen_size();

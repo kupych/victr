@@ -23,6 +23,7 @@ fn main() -> eframe::Result<()> {
     let mut start: f64 = 0.0;
     let fullscreen = args.iter().any(|a| a == "--fullscreen");
     let sidebar_open = args.iter().any(|a| a == "--sidebar");
+    let pixel_perfect = args.iter().any(|a| a == "--pixel-perfect");
     let degauss_at: Option<f32> = args
         .windows(2)
         .find(|w| w[0] == "--degauss")
@@ -35,7 +36,7 @@ fn main() -> eframe::Result<()> {
         } else if args[i] == "--preset" && i + 1 < args.len() {
             preset = args[i + 1].parse().ok();
             i += 1;
-        } else if args[i] == "--fullscreen" || args[i] == "--sidebar" {
+        } else if args[i] == "--fullscreen" || args[i] == "--sidebar" || args[i] == "--pixel-perfect" {
             // handled above
         } else if args[i] == "--degauss" && i + 1 < args.len() {
             i += 1;
@@ -97,6 +98,9 @@ fn main() -> eframe::Result<()> {
             let mut a = app::CrtApp::new(cc, screenshot, preset, zoom, pattern, mpv_src.map(|s| (s, start)));
             if sidebar_open {
                 a.set_sidebar_locked(true);
+            }
+            if pixel_perfect {
+                a.request_pixel_perfect();
             }
             if let Some(t) = degauss_at {
                 a.set_degauss_time(t);

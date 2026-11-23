@@ -377,6 +377,7 @@ impl Sim {
             pitch: s.pitch_mm * mm,
             bm: s.black_matrix,
             mask_strength: s.mask_strength,
+            anti_moire: s.anti_moire,
             wire: 0.15 * mm,
             purity: s.magnetization,
             purity_seed: self.purity_seed,

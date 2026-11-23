@@ -578,7 +578,7 @@ uniform float u_conv_dyn;
 uniform float u_spot, u_spot_h, u_bloom, u_gamma;
 uniform vec3 u_focus, u_emission, u_cutoff, u_imax;
 uniform int u_mask;
-uniform float u_pitch, u_bm, u_mask_strength;
+uniform float u_pitch, u_bm, u_mask_strength, u_anti_moire;
 uniform float u_purity;
 uniform vec2 u_purity_seed;
 uniform vec3 u_degauss;
@@ -591,6 +591,7 @@ uniform float u_wire;
 
 float g_abl;
 float g_breath;
+float g_scan_floor;
 
 vec2 rasterPos(vec2 f) {
     vec2 q = f;
@@ -637,6 +638,7 @@ float gunEnergy(int g, vec2 f) {
         I += 0.2442 * current(textureLod(u_drive, vec2((s + sh) / SW, ty), 0.0)[g], g);
         I += 0.0545 * current(textureLod(u_drive, vec2((s + 2.0 * sh) / SW, ty), 0.0)[g], g);
         float sg = sig0 * (1.0 + u_bloom * sqrt(I));
+        sg = sqrt(sg * sg + g_scan_floor * g_scan_floor);
         e += I * exp(-0.5 * dy * dy / (sg * sg)) / (sg * 2.5066283);
     }
     return e;
@@ -650,7 +652,7 @@ float stripe(float x, float start, float duty, float w) {
     return (boxI(a + 0.5 * w, duty) - boxI(a - 0.5 * w, duty)) / w;
 }
 
-vec3 maskCoverage(vec2 f, float w, out vec3 avg) {
+vec3 maskCoverage(vec2 f, float tube_y, float w, float flat_k, out vec3 avg) {
     float P = u_pitch;
     float bm = u_bm;
     if (u_mask == 0 || u_mask == 1) {
@@ -661,7 +663,11 @@ vec3 maskCoverage(vec2 f, float w, out vec3 avg) {
                        stripe(u, 2.0 / 3.0 + bm / 6.0, duty, w / P));
         avg = vec3(duty);
         if (u_mask == 1) {
-            float hs = P * 2.2;
+            // Snap vertical slot period to an even integer number of pixels when screen-aligned
+            // so staggered slot bridges never beat against display rows.
+            float hs_raw = P * 2.2;
+            float hs_even_px = max(floor(hs_raw / (2.0 * max(w, 1e-5)) + 0.5) * 2.0, 4.0);
+            float hs = mix(hs_raw, hs_even_px * w, flat_k);
             float col = floor(u);
             float v = f.y / hs + 0.5 * mod(col, 2.0);
             float bridge = 0.12 + 0.3 * bm;
@@ -669,9 +675,9 @@ vec3 maskCoverage(vec2 f, float w, out vec3 avg) {
             cx *= cy;
             avg *= (1.0 - bridge);
         } else {
-            // two damper wires of the grille
+            // two damper wires of the grille (fixed to physical tube height)
             float wt = u_wire;
-            float d1 = abs(f.y - 1.0 / 3.0), d2 = abs(f.y + 1.0 / 3.0);
+            float d1 = abs(tube_y - 1.0 / 3.0), d2 = abs(tube_y + 1.0 / 3.0);
             float cov = clamp((min(d1, d2) - 0.5 * wt) / max(w, 1e-4) + 0.5, 0.0, 1.0);
             cx *= mix(1.0, cov, 0.85);
         }
@@ -705,7 +711,8 @@ vec3 maskCoverage(vec2 f, float w, out vec3 avg) {
 
 void main() {
     vec2 f = faceFromPixel(gl_FragCoord.xy, u_view_px, u_view, u_curv);
-    float pxw = 2.0 * u_view.z / u_view_px.y * (1.0 + 3.0 * u_curv * dot(f, f));
+    float pxw_flat = 2.0 * u_view.z / u_view_px.y;
+    float pxw = pxw_flat * (1.0 + 3.0 * u_curv * dot(f, f));
     float sdf = tubeSDF(f, u_corner);
     if (sdf > pxw) { o_col = vec4(0.0); return; }
 
@@ -713,6 +720,9 @@ void main() {
     float apl = dot(apl3, vec3(0.3, 0.59, 0.11));
     g_abl = 1.0 / (1.0 + u_abl * 3.0 * max(apl - 0.3, 0.0));
     g_breath = 1.0 + u_breath * 0.06 * apl;
+    // Pixel-scale Gaussian pre-filter floor for scanline anti-moire
+    float lines_per_px = pxw * 0.5 * VLINES * (1.0 - u_overscan) / max(u_vsize * g_breath, 0.2);
+    g_scan_floor = u_anti_moire * 0.42 * lines_per_px;
 
     vec2 fn = f / vec2(4.0 / 3.0, 1.0);
     float r2_fn = dot(fn, fn);
@@ -804,12 +814,17 @@ void main() {
     P *= 1.0 - u_burn_amt * burn * 0.85;
 
     vec3 avg;
-    // Use an exact 1-pixel footprint once triads reach Nyquist (>= 3 px/triad) so
-    // 1:1 pixel-perfect phosphors stay razor-sharp, while widening and fading out
-    // below ~3 px/triad to avoid moire against the display pixel grid.
-    float px_per_triad = u_pitch / pxw;
-    float filter_w = pxw * mix(1.5, 1.0, smoothstep(2.2, 2.95, px_per_triad));
-    vec3 cov = maskCoverage(f, filter_w, avg);
+    // Anti-moire: around 1x viewing zoom, align the phosphor mask to the flat display
+    // pixel grid so curved glass never creates rainbow interference rings; smoothly fade
+    // back to true curved faceplate coordinates as the user zooms in.
+    float low_zoom = 1.0 - smoothstep(5.5, 10.0, u_pitch / pxw_flat);
+    float flat_k = u_anti_moire * low_zoom;
+    vec2 p_grid = vec2(gl_FragCoord.x - 0.5 * u_view_px.x, 0.5 * u_view_px.y - gl_FragCoord.y) * pxw_flat;
+    vec2 f_mask = mix(f, p_grid, flat_k);
+    float pxw_mask = mix(pxw, pxw_flat, flat_k);
+    float px_per_triad = u_pitch / pxw_mask;
+    float filter_w = pxw_mask * mix(1.5, 1.0, smoothstep(2.2, 2.95, px_per_triad));
+    vec3 cov = maskCoverage(f_mask, f.y, filter_w, flat_k, avg);
     float resolvable = smoothstep(2.0, 2.95, px_per_triad);
     cov = mix(avg, cov, resolvable);
     vec3 T = mix(vec3(1.0), cov / avg, u_mask_strength);

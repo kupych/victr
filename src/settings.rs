@@ -291,6 +291,7 @@ pub struct Settings {
     pub mask: Mask,
     pub pitch_mm: f32,
     pub mask_strength: f32,
+    pub anti_moire: f32,
     pub black_matrix: f32,
     pub curvature: f32,
     pub corner: f32,
@@ -394,6 +395,7 @@ impl Default for Settings {
             mask: Mask::SlotMask,
             pitch_mm: 0.62,
             mask_strength: 1.0,
+            anti_moire: 1.0,
             black_matrix: 0.25,
             curvature: 0.035,
             corner: 0.10,
@@ -679,6 +681,7 @@ impl Settings {
         let _ = writeln!(out, "mask = {}", self.mask.as_key());
         let _ = writeln!(out, "pitch_mm = {}", self.pitch_mm);
         let _ = writeln!(out, "mask_strength = {}", self.mask_strength);
+        let _ = writeln!(out, "anti_moire = {}", self.anti_moire);
         let _ = writeln!(out, "black_matrix = {}", self.black_matrix);
         let _ = writeln!(out, "curvature = {}", self.curvature);
         let _ = writeln!(out, "corner = {}", self.corner);
@@ -786,6 +789,7 @@ impl Settings {
                 "mask" => if let Some(x) = Mask::from_key(v) { s.mask = x; },
                 "pitch_mm" => if let Ok(x) = v.parse() { s.pitch_mm = x; },
                 "mask_strength" => if let Ok(x) = v.parse() { s.mask_strength = x; },
+                "anti_moire" => if let Ok(x) = v.parse() { s.anti_moire = x; },
                 "black_matrix" => if let Ok(x) = v.parse() { s.black_matrix = x; },
                 "curvature" => if let Ok(x) = v.parse() { s.curvature = x; },
                 "corner" => if let Ok(x) = v.parse() { s.corner = x; },
