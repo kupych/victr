@@ -76,6 +76,7 @@ pub struct AudioParams {
     pub warm: f32,
     pub degauss_t: f32,
     pub channel_switch_t: f32,
+    pub whack_t: f32,
     pub test_tone: bool,
     // RF
     pub rf: bool,
@@ -111,6 +112,7 @@ impl Default for AudioParams {
             warm: 1.0,
             degauss_t: 10.0,
             channel_switch_t: 10.0,
+            whack_t: 10.0,
             test_tone: false,
             rf: false,
             snr_db: 60.0,
@@ -498,6 +500,23 @@ impl Processor {
                 if ct < 0.018 {
                     let k = 1.0 - ct / 0.018;
                     chassis_c += 0.34 * k * k * (std::f32::consts::TAU * 880.0 * ct).sin();
+                }
+            }
+            // Percussive maintenance: hollow walnut CRT cabinet THWACK + internal chassis rattle
+            if p.whack_t >= 0.0 && p.whack_t < 0.16 {
+                let wt = p.whack_t + i as f32 / RATE;
+                if wt < 0.15 {
+                    let body = (-wt * 26.0).exp()
+                        * (0.58 * (std::f32::consts::TAU * 108.0 * wt).sin()
+                            + 0.34 * (std::f32::consts::TAU * 172.0 * wt).sin());
+                    let slap = if wt < 0.018 {
+                        let k = 1.0 - wt / 0.018;
+                        k * k * (0.45 * self.noise() + 0.35 * (std::f32::consts::TAU * 390.0 * wt).sin())
+                    } else {
+                        0.0
+                    };
+                    let rattle = (-wt * 38.0).exp() * 0.14 * self.noise() * (std::f32::consts::TAU * 62.0 * wt).sin();
+                    chassis_c += 0.72 * (body + slap + rattle);
                 }
             }
             // Subtle high-voltage electrostatic faceplate crackle on power switch / degauss:

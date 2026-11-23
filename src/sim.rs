@@ -5,6 +5,104 @@
 use crate::gpu::{FrameInput, NL, Uniforms};
 use crate::settings::{Input, Settings, TapeSpeed};
 
+#[derive(Default, Clone, Debug)]
+struct ChaosState {
+    // Current live drift offsets (smoothly slew toward targets, snapped back on whack)
+    h_hold: f32,
+    v_hold: f32,
+    tint_deg: f32,
+    color_drop: f32,
+    noise: f32,
+    hum: f32,
+    v_size_sag: f32,
+    ripple: f32,
+    conv_r: [f32; 2],
+    focus: f32,
+    // Target fault offsets
+    t_h_hold: f32,
+    t_v_hold: f32,
+    t_tint_deg: f32,
+    t_color_drop: f32,
+    t_noise: f32,
+    t_hum: f32,
+    t_v_size_sag: f32,
+    t_ripple: f32,
+    t_conv_r: [f32; 2],
+    t_focus: f32,
+    // Countdown until the next cold-solder glitch
+    next_glitch_s: f32,
+    whack_streak: u8,
+}
+
+impl ChaosState {
+    fn clear(&mut self) {
+        self.h_hold = 0.0;
+        self.v_hold = 0.0;
+        self.tint_deg = 0.0;
+        self.color_drop = 0.0;
+        self.noise = 0.0;
+        self.hum = 0.0;
+        self.v_size_sag = 0.0;
+        self.ripple = 0.0;
+        self.conv_r = [0.0, 0.0];
+        self.focus = 0.0;
+        self.clear_targets();
+    }
+
+    fn clear_targets(&mut self) {
+        self.t_h_hold = 0.0;
+        self.t_v_hold = 0.0;
+        self.t_tint_deg = 0.0;
+        self.t_color_drop = 0.0;
+        self.t_noise = 0.0;
+        self.t_hum = 0.0;
+        self.t_v_size_sag = 0.0;
+        self.t_ripple = 0.0;
+        self.t_conv_r = [0.0, 0.0];
+        self.t_focus = 0.0;
+    }
+
+    fn scale_all(&mut self, k: f32) {
+        self.h_hold *= k;
+        self.v_hold *= k;
+        self.tint_deg *= k;
+        self.color_drop *= k;
+        self.noise *= k;
+        self.hum *= k;
+        self.v_size_sag *= k;
+        self.ripple *= k;
+        self.conv_r[0] *= k;
+        self.conv_r[1] *= k;
+        self.focus *= k;
+        self.t_h_hold *= k;
+        self.t_v_hold *= k;
+        self.t_tint_deg *= k;
+        self.t_color_drop *= k;
+        self.t_noise *= k;
+        self.t_hum *= k;
+        self.t_v_size_sag *= k;
+        self.t_ripple *= k;
+        self.t_conv_r[0] *= k;
+        self.t_conv_r[1] *= k;
+        self.t_focus *= k;
+    }
+
+    fn active_faults(&self) -> Vec<&'static str> {
+        let mut f = Vec::new();
+        if self.v_hold.abs() > 0.015 { f.push("V-hold roll"); }
+        if self.h_hold.abs() > 0.025 { f.push("H-hold tear"); }
+        if self.tint_deg.abs() > 6.0 { f.push("tint drift"); }
+        if self.color_drop > 0.15 { f.push("colour drop"); }
+        if self.noise > 0.02 { f.push("loose antenna"); }
+        if self.hum > 0.08 { f.push("hum bar"); }
+        if self.v_size_sag > 0.03 { f.push("vertical sag"); }
+        if self.ripple > 0.12 { f.push("cap ripple"); }
+        if self.conv_r[0].abs() + self.conv_r[1].abs() > 0.25 { f.push("convergence slip"); }
+        if self.focus > 0.12 { f.push("focus drift"); }
+        f
+    }
+}
+
 pub struct Sim {
     pub fields: u64,
     acc: f64,
@@ -22,6 +120,8 @@ pub struct Sim {
     pub degauss_t: f32,
     degauss_phase: f32,
     pub channel_switch_t: f32,
+    pub whack_t: f32,
+    chaos: ChaosState,
     lines: Vec<f32>,
     pub purity_seed: [f32; 2],
 }
@@ -45,6 +145,8 @@ impl Sim {
             degauss_t: 0.0,
             degauss_phase: 0.7,
             channel_switch_t: 10.0,
+            whack_t: 10.0,
+            chaos: ChaosState { next_glitch_s: 8.0, ..Default::default() },
             lines: vec![0.0; (NL * 2 * 4) as usize],
             purity_seed: [3.7, 11.2],
         }
@@ -86,6 +188,80 @@ impl Sim {
         self.channel_switch_t = 0.0;
     }
 
+    /// Percussive maintenance: slaps the side of the CRT cabinet to knock loose
+    /// solder joints and drifting oscillators back into gear!
+    pub fn whack(&mut self) -> bool {
+        self.whack_t = 0.0;
+        self.chaos.whack_streak = self.chaos.whack_streak.saturating_add(1);
+        let had_faults = !self.chaos.active_faults().is_empty();
+        // 85% chance of an instant clean fix on the first slap; 2nd slap ALWAYS locks 100%.
+        let stubborn = had_faults && self.chaos.whack_streak == 1 && self.next() < 0.15;
+        if stubborn {
+            self.chaos.scale_all(0.32);
+            self.chaos.next_glitch_s = self.chaos.next_glitch_s.max(6.0);
+            false
+        } else {
+            self.chaos.clear();
+            self.chaos.whack_streak = 0;
+            self.chaos.next_glitch_s = 18.0 + self.next() * 20.0;
+            true
+        }
+    }
+
+    pub fn chaos_active_faults(&self) -> Vec<&'static str> {
+        self.chaos.active_faults()
+    }
+
+    fn step_chaos(&mut self, enabled: bool, rate: f32, dt: f32) {
+        if !enabled {
+            self.chaos.clear();
+            self.chaos.next_glitch_s = 8.0;
+            return;
+        }
+        let rate = rate.clamp(0.1, 2.0);
+        // Smoothly drift live values toward their fault targets (like warming cold solder joints)
+        let slew = (dt * 0.65).min(1.0);
+        self.chaos.h_hold += (self.chaos.t_h_hold - self.chaos.h_hold) * slew;
+        self.chaos.v_hold += (self.chaos.t_v_hold - self.chaos.v_hold) * slew;
+        self.chaos.tint_deg += (self.chaos.t_tint_deg - self.chaos.tint_deg) * slew;
+        self.chaos.color_drop += (self.chaos.t_color_drop - self.chaos.color_drop) * slew;
+        self.chaos.noise += (self.chaos.t_noise - self.chaos.noise) * slew;
+        self.chaos.hum += (self.chaos.t_hum - self.chaos.hum) * slew;
+        self.chaos.v_size_sag += (self.chaos.t_v_size_sag - self.chaos.v_size_sag) * slew;
+        self.chaos.ripple += (self.chaos.t_ripple - self.chaos.ripple) * slew;
+        self.chaos.conv_r[0] += (self.chaos.t_conv_r[0] - self.chaos.conv_r[0]) * slew;
+        self.chaos.conv_r[1] += (self.chaos.t_conv_r[1] - self.chaos.conv_r[1]) * slew;
+        self.chaos.focus += (self.chaos.t_focus - self.chaos.focus) * slew;
+
+        self.chaos.next_glitch_s -= dt * rate;
+        if self.chaos.next_glitch_s <= 0.0 {
+            self.chaos.whack_streak = 0;
+            self.chaos.next_glitch_s = 10.0 + self.next() * 16.0;
+            // Cap concurrent faults at 2 so it stays fun/watchable until whacked
+            if self.chaos.active_faults().len() >= 2 {
+                return;
+            }
+            let sign = if self.next() > 0.5 { 1.0 } else { -1.0 };
+            let pick = (self.next() * 8.0) as u32;
+            match pick {
+                0 => self.chaos.t_v_hold = sign * (0.045 + 0.055 * self.next()),
+                1 => self.chaos.t_h_hold = sign * (0.06 + 0.08 * self.next()),
+                2 => self.chaos.t_tint_deg = sign * (24.0 + 32.0 * self.next()),
+                3 => self.chaos.t_color_drop = 0.65 + 0.35 * self.next(),
+                4 => self.chaos.t_noise = 0.05 + 0.09 * self.next(),
+                5 => self.chaos.t_v_size_sag = 0.09 + 0.14 * self.next(),
+                6 => {
+                    self.chaos.t_hum = 0.25 + 0.35 * self.next();
+                    self.chaos.t_ripple = 0.35 + 0.45 * self.next();
+                }
+                _ => {
+                    self.chaos.t_conv_r = [sign * (0.8 + 0.7 * self.next()), -sign * (0.4 + 0.5 * self.next())];
+                    self.chaos.t_focus = 0.35 + 0.35 * self.next();
+                }
+            }
+        }
+    }
+
     /// Advances simulated time; returns true when a new field (1/59.94 s) is due.
     pub fn advance(&mut self, dt: f64) -> bool {
         let dt = dt.clamp(0.0, 0.25);
@@ -114,6 +290,8 @@ impl Sim {
         }
         self.degauss_t += real_dt.max(fdt);
         self.channel_switch_t += real_dt.max(fdt);
+        self.whack_t += real_dt.max(fdt);
+        self.step_chaos(s.chaos && self.power_on, s.chaos_rate, real_dt.max(fdt));
 
         // Brief ~0.25s RF static burst + tuner sync hiccup when changing cable channels
         let ch_env = if self.channel_switch_t >= 0.0 && self.channel_switch_t < 0.26 {
@@ -122,10 +300,26 @@ impl Sim {
         } else {
             0.0
         };
+        // Mechanical cabinet jolt + tiny contact static pop when whacking the TV
+        let whack_env = if self.whack_t >= 0.0 && self.whack_t < 0.32 {
+            (-self.whack_t * 12.0).exp()
+        } else {
+            0.0
+        };
+        let whack_x = whack_env * 0.036 * (self.whack_t * 92.0).sin();
+        let whack_y = whack_env * 0.024 * (self.whack_t * 78.0 + 1.1).sin();
+        let whack_pop = if self.whack_t >= 0.0 && self.whack_t < 0.07 {
+            (1.0 - self.whack_t / 0.07) * 0.22
+        } else {
+            0.0
+        };
 
         // ---- noise budget
-        let rf_sigma = if s.input == Input::Rf { 10f32.powf(-s.signal_db / 20.0) } else { 0.0 } + 0.85 * ch_env;
-        let extra_noise_eff = s.extra_noise + 0.65 * ch_env;
+        let rf_sigma = if s.input == Input::Rf { 10f32.powf(-s.signal_db / 20.0) } else { 0.0 }
+            + 0.85 * ch_env
+            + self.chaos.noise * 1.4
+            + whack_pop;
+        let extra_noise_eff = s.extra_noise + 0.65 * ch_env + self.chaos.noise + whack_pop;
         let (tape_sigma, speed_bw) = if s.vcr {
             let k = match s.tape_speed {
                 TapeSpeed::Sp => (1.0, 3.0),
@@ -168,7 +362,7 @@ impl Sim {
 
         // ---- horizontal: AFC loop per line
         // free-running error of the line oscillator (a real one is never exactly on frequency)
-        let detune = s.h_hold * 14.0 + 0.35;
+        let detune = (s.h_hold + self.chaos.h_hold) * 14.0 + 0.35;
         let k_afc = s.afc_speed.clamp(0.02, 1.0);
         let max_corr = 9.0;
         let mut err_acc = 0.0;
@@ -235,7 +429,7 @@ impl Sim {
         let half = NL as f32 * 0.5;
         // the field oscillator free-runs slightly slow; a sync pulse inside the
         // pull-in window triggers the retrace early and locks the picture
-        self.v_phase += s.v_hold * 25.0 + 0.4;
+        self.v_phase += (s.v_hold + self.chaos.v_hold) * 25.0 + 0.4;
         if self.next() < p_v {
             let w = (self.v_phase + half).rem_euclid(NL as f32) - half;
             if w.abs() < 10.0 {
@@ -296,7 +490,7 @@ impl Sim {
         ];
         let cd = s.cutoff_drift;
         let cutoff = [0.035 * cd, -0.015 * cd, 0.05 * cd];
-        let focus = 1.0 + s.focus_loss * 1.4;
+        let focus = 1.0 + (s.focus_loss + self.chaos.focus) * 1.4;
         let focus3 = [focus * 1.03, focus, focus * 1.06];
 
         let decay_t = (s.persistence_ms.max(0.1)) / 1000.0;
@@ -354,31 +548,34 @@ impl Sim {
             ghost_delay: s.ghost_delay_us * fs,
             interf_amp: s.interference,
             interf_freq: s.interference_freq,
-            hum: s.hum,
+            hum: (s.hum + self.chaos.hum).min(1.0),
             impulse: s.impulse,
             fine_tune: s.fine_tune,
             comb: s.comb_filter as i32,
             contrast: s.contrast,
             brightness: s.brightness * 0.3,
-            color: s.color,
-            tint: s.tint.to_radians(),
+            color: (s.color * (1.0 - self.chaos.color_drop)).max(0.0),
+            tint: (s.tint + self.chaos.tint_deg).to_radians(),
             sharp: s.sharpness,
             killer: if self.color_on { 0.0 } else { 1.0 },
             rx_chroma_sigma: gs(1.1),
             view,
             curv: s.curvature,
             corner: s.corner,
-            hsize: s.h_size,
-            vsize: s.v_size,
-            hpos: s.h_pos * 0.1 + shake,
-            vpos: s.v_pos * 0.1 + shake * 0.6,
+            hsize: (s.h_size - self.chaos.v_size_sag * 0.25).max(0.5),
+            vsize: (s.v_size - self.chaos.v_size_sag).max(0.5),
+            hpos: s.h_pos * 0.1 + shake + whack_x,
+            vpos: s.v_pos * 0.1 + shake * 0.6 + whack_y,
             pin: s.pincushion,
             breath: s.breathing,
             vphase,
             field_shift: if interlaced { 0.5 * field as f32 } else { 0.0 },
             overscan: s.overscan,
-            ripple: s.ripple,
-            conv_r: [s.conv_r[0] * mm / 0.004, s.conv_r[1] * mm / 0.004],
+            ripple: s.ripple + self.chaos.ripple,
+            conv_r: [
+                (s.conv_r[0] + self.chaos.conv_r[0]) * mm / 0.004,
+                (s.conv_r[1] + self.chaos.conv_r[1]) * mm / 0.004,
+            ],
             conv_b: [s.conv_b[0] * mm / 0.004, s.conv_b[1] * mm / 0.004],
             conv_dyn: s.conv_dyn * mm / 0.004 / 1.77,
             spot: s.spot,
@@ -469,4 +666,37 @@ pub fn colour_temp_gains(k: f32) -> [f32; 3] {
     let g = [a[0] / n[0].max(1e-3), a[1] / n[1].max(1e-3), a[2] / n[2].max(1e-3)];
     let m = g[0].max(g[1]).max(g[2]);
     [g[0] / m, g[1] / m, g[2] / m]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chaos_drifts_and_whack_knocks_back_into_gear() {
+        let mut sim = Sim::new();
+        let mut s = Settings::default();
+        s.chaos = true;
+        s.chaos_rate = 2.0;
+
+        // Advance simulated time until at least one fault drifts in
+        for _ in 0..600 {
+            sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 30.0);
+        }
+        assert!(!sim.chaos_active_faults().is_empty(), "chaos engine should introduce at least one drift fault");
+
+        // Two whacks always guarantee 100% clean lock
+        sim.whack();
+        sim.whack();
+        assert!(sim.chaos_active_faults().is_empty(), "whacking should knock faults back into gear");
+        assert!(sim.whack_t < 0.05);
+
+        // Turning chaos off clears all drift immediately
+        for _ in 0..600 {
+            sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 30.0);
+        }
+        s.chaos = false;
+        sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        assert!(sim.chaos_active_faults().is_empty());
+    }
 }

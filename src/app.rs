@@ -426,7 +426,7 @@ impl CrtApp {
         if old.pattern == Pattern::Image || old.pattern == Pattern::Video {
             self.s.pattern = old.pattern;
         }
-        // keep the user's sound and display HDR preferences when switching built-in presets
+        // keep the user's sound, HDR, and chaos novelty preferences when switching built-in presets
         if matches!(sel, PresetSel::BuiltIn(_)) {
             self.s.sound = old.sound;
             self.s.volume = old.volume;
@@ -438,6 +438,8 @@ impl CrtApp {
             self.s.hdr_paper_white = old.hdr_paper_white;
             self.s.hdr_peak_nits = old.hdr_peak_nits;
             self.s.hdr_ui_nits = old.hdr_ui_nits;
+            self.s.chaos = old.chaos;
+            self.s.chaos_rate = old.chaos_rate;
         } else if let Some(p) = &self.player {
             p.volume((self.s.volume * 100.0) as f64);
         }
@@ -1167,6 +1169,7 @@ impl CrtApp {
         p.warm = self.sim.warm;
         p.degauss_t = self.sim.degauss_t;
         p.channel_switch_t = self.sim.channel_switch_t;
+        p.whack_t = self.sim.whack_t;
         p.test_tone = s.test_tone && s.pattern == Pattern::ColorBars;
         p.rf = s.input == Input::Rf;
         p.snr_db = s.signal_db;
@@ -1520,6 +1523,36 @@ impl CrtApp {
                     if ui.button("New phosphor (clear)").clicked() {
                         self.clear_burn = true;
                     }
+                });
+                ui.separator();
+                let faults = self.sim.chaos_active_faults();
+                ui.checkbox(&mut s.chaos, "Chaos engine (chassis drift)")
+                    .on_hover_text("Novelty mode: cold solder joints & aging oscillators occasionally drift (V-hold roll, tint slip, hum, sag). Hit Whack! (or K) to knock it back into gear.");
+                ui.add_enabled_ui(s.chaos, |ui| {
+                    sl(ui, &mut s.chaos_rate, 0.1..=2.0, "Drift frequency", "How often the old chassis acts up.");
+                    ui.horizontal(|ui| {
+                        let whack_lbl = if faults.is_empty() {
+                            RichText::new("Whack cabinet! (K)")
+                        } else {
+                            RichText::new("Whack cabinet! (K)").color(Color32::from_rgb(255, 210, 96)).strong()
+                        };
+                        if ui
+                            .button(whack_lbl)
+                            .on_hover_text("Percussive maintenance: slap the side of the CRT to knock drifting circuits back into lock (shortcut: K).")
+                            .clicked()
+                        {
+                            self.sim.whack();
+                        }
+                        if faults.is_empty() {
+                            ui.label(RichText::new("Chassis steady").weak().small());
+                        } else {
+                            ui.label(
+                                RichText::new(format!("Drifting: {}", faults.join(", ")))
+                                    .small()
+                                    .color(Color32::from_rgb(245, 168, 86)),
+                            );
+                        }
+                    });
                 });
             });
 
@@ -2014,6 +2047,10 @@ impl CrtApp {
                 self.toggle_mute();
                 remote_consumed = true;
             }
+            if self.s.chaos && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::K)) {
+                self.sim.whack();
+                remote_consumed = true;
+            }
 
             if self.jellyfin.connected {
                 if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::G)) {
@@ -2316,6 +2353,21 @@ impl CrtApp {
                                     self.sim.degauss();
                                     if self.s.magnetization > 0.0 {
                                         self.degauss_mag_start = Some(self.s.magnetization);
+                                    }
+                                }
+                                if self.s.chaos {
+                                    let drifting = !self.sim.chaos_active_faults().is_empty();
+                                    let lbl = if drifting {
+                                        RichText::new("Whack!").color(Color32::from_rgb(255, 212, 92)).strong()
+                                    } else {
+                                        RichText::new("Whack!")
+                                    };
+                                    if ui
+                                        .add(egui::Button::new(lbl).selected(drifting))
+                                        .on_hover_text("Percussive maintenance: slap the side of the CRT to knock drifting circuits back into gear (shortcut: K).")
+                                        .clicked()
+                                    {
+                                        self.sim.whack();
                                     }
                                 }
                                 ui.separator();

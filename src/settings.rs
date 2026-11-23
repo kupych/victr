@@ -326,6 +326,8 @@ pub struct Settings {
     pub ripple: f32,
     pub burn_speed: f32,
     pub burn_visible: f32,
+    pub chaos: bool,
+    pub chaos_rate: f32,
 
     // ---- room / glass / eye
     pub ambient: f32,
@@ -433,6 +435,8 @@ impl Default for Settings {
             ripple: 0.0,
             burn_speed: 0.0,
             burn_visible: 1.0,
+            chaos: false,
+            chaos_rate: 0.5,
 
             ambient: 0.25,
             reflection: 0.5,
@@ -722,6 +726,8 @@ impl Settings {
         let _ = writeln!(out, "ripple = {}", self.ripple);
         let _ = writeln!(out, "burn_speed = {}", self.burn_speed);
         let _ = writeln!(out, "burn_visible = {}", self.burn_visible);
+        let _ = writeln!(out, "chaos = {}", self.chaos);
+        let _ = writeln!(out, "chaos_rate = {}", self.chaos_rate);
         let _ = writeln!(out, "ambient = {}", self.ambient);
         let _ = writeln!(out, "reflection = {}", self.reflection);
         let _ = writeln!(out, "halation = {}", self.halation);
@@ -834,6 +840,8 @@ impl Settings {
                 "ripple" => if let Ok(x) = v.parse() { s.ripple = x; },
                 "burn_speed" => if let Ok(x) = v.parse() { s.burn_speed = x; },
                 "burn_visible" => if let Ok(x) = v.parse() { s.burn_visible = x; },
+                "chaos" => if let Some(x) = parse_bool(v) { s.chaos = x; },
+                "chaos_rate" => if let Ok(x) = v.parse() { s.chaos_rate = x; },
                 "ambient" => if let Ok(x) = v.parse() { s.ambient = x; },
                 "reflection" => if let Ok(x) = v.parse() { s.reflection = x; },
                 "halation" => if let Ok(x) = v.parse() { s.halation = x; },
