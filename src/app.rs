@@ -272,6 +272,10 @@ impl CrtApp {
             return;
         }
         self.fullscreen = on;
+        if on {
+            // Start fullscreen cleanly tucked closed; handle remains accessible on the right edge.
+            self.sidebar_open = false;
+        }
         self.fs_since = std::time::Instant::now();
         self.last_pointer_move = std::time::Instant::now();
         self.reset_trails = true;
@@ -1023,8 +1027,44 @@ impl CrtApp {
                     {
                         self.sidebar_open = false;
                     }
+                    if self.fullscreen
+                        && ui
+                            .small_button("Exit FS")
+                            .on_hover_text("Leave fullscreen (F11 or Esc)")
+                            .clicked()
+                    {
+                        self.message = "exitfs".into();
+                    }
                 });
             });
+            if self.fullscreen {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let pwr_label = if self.sim.power_on {
+                        RichText::new("Power").color(Color32::WHITE).strong()
+                    } else {
+                        RichText::new("Power off").color(Color32::from_rgb(210, 140, 120))
+                    };
+                    if ui.add(egui::Button::new(pwr_label).selected(self.sim.power_on).small()).clicked() {
+                        let on = !self.sim.power_on;
+                        self.sim.set_power(on);
+                    }
+                    if ui.small_button("Degauss").clicked() {
+                        self.sim.degauss();
+                        if self.s.magnetization > 0.0 {
+                            self.degauss_mag_start = Some(self.s.magnetization);
+                        }
+                    }
+                    if ui.small_button("Save preset…").clicked() {
+                        self.open_save_preset_dialog();
+                    }
+                    if ui.small_button("Reset view").clicked() {
+                        self.zoom = 1.0;
+                        self.pan = [0.0, 0.0];
+                        self.reset_trails = true;
+                    }
+                });
+            }
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.set_width((ui.available_width() - 6.0).max(200.0));
@@ -1311,7 +1351,11 @@ impl eframe::App for CrtApp {
             }
         }
         // the window manager can also take us out of fullscreen
-        if self.fullscreen && self.fs_since.elapsed().as_secs_f32() > 1.0 && ctx.input(|i| i.viewport().fullscreen) == Some(false) {
+        if self.fullscreen
+            && self.screenshot.is_none()
+            && self.fs_since.elapsed().as_secs_f32() > 1.0
+            && ctx.input(|i| i.viewport().fullscreen) == Some(false)
+        {
             self.fullscreen = false;
         }
         // pointer activity: shows the hint, hides the idle pointer in fullscreen
@@ -1336,7 +1380,7 @@ impl eframe::App for CrtApp {
         if self.player.is_some()
             && self.s.pattern == Pattern::Video
             && !ctx.egui_wants_keyboard_input()
-            && (self.tv_hovered || self.fullscreen)
+            && (self.tv_hovered || (self.fullscreen && !self.sidebar_open))
         {
             let keys: Vec<String> = ctx.input(|i| i.events.iter().filter_map(mpv_key_name).collect());
             if let Some(p) = &self.player {
@@ -1509,28 +1553,30 @@ impl eframe::App for CrtApp {
             self.message.clear();
             self.pick_video();
         }
+        if self.message == "exitfs" {
+            self.message.clear();
+            self.set_fullscreen(&ctx, false);
+        }
 
         // Advance drawer & right-edge handle animations BEFORE rendering the CRT,
         // so the TV smoothly glides left to stay completely unobstructed beside the
-        // sliding panel with zero OpenGL FBO reallocations.
+        // sliding panel with zero OpenGL FBO reallocations (in both windowed and fullscreen).
         let dt_ui = real_dt.clamp(0.0, 0.05);
         let prev_anim = self.sidebar_anim;
-        if !self.fullscreen {
-            let target = if self.sidebar_open { 1.0 } else { 0.0 };
-            let step = dt_ui / 0.20;
-            if self.sidebar_anim < target {
-                self.sidebar_anim = (self.sidebar_anim + step).min(target);
-            } else if self.sidebar_anim > target {
-                self.sidebar_anim = (self.sidebar_anim - step).max(target);
-            }
-            if (self.sidebar_anim - prev_anim).abs() > 1e-5 {
-                self.reset_trails = true;
-            }
+        let target = if self.sidebar_open { 1.0 } else { 0.0 };
+        let step = dt_ui / 0.20;
+        if self.sidebar_anim < target {
+            self.sidebar_anim = (self.sidebar_anim + step).min(target);
+        } else if self.sidebar_anim > target {
+            self.sidebar_anim = (self.sidebar_anim - step).max(target);
+        }
+        if (self.sidebar_anim - prev_anim).abs() > 1e-5 {
+            self.reset_trails = true;
         }
 
         let mut central_rect = egui::Rect::NOTHING;
         let ptr_pos = ctx.input(|i| i.pointer.hover_pos());
-        let eased = if self.fullscreen { 0.0 } else { 1.0 - (1.0 - self.sidebar_anim).powi(3) };
+        let eased = 1.0 - (1.0 - self.sidebar_anim).powi(3);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(Color32::BLACK))
@@ -1542,16 +1588,12 @@ impl eframe::App for CrtApp {
                 let drawer_vis_w = drawer_w * eased;
                 let drawer_x = rect.right() - drawer_vis_w;
                 let tab_w = 24.0;
-                let handle_eased = 1.0 - (1.0 - self.handle_anim).powi(3);
-                let over_handle = !self.fullscreen
-                    && handle_eased > 0.05
-                    && ptr_pos.is_some_and(|p| {
-                        let tab_left = drawer_x - tab_w * handle_eased;
-                        let cy = rect.center().y;
-                        p.x >= tab_left - 2.0 && p.x <= drawer_x + 4.0 && (p.y - cy).abs() <= 50.0
-                    });
-                let over_drawer = !self.fullscreen
-                    && self.sidebar_anim > 0.01
+                let over_handle = ptr_pos.is_some_and(|p| {
+                    let tab_left = drawer_x - tab_w;
+                    let cy = rect.center().y;
+                    p.x >= tab_left - 2.0 && p.x <= drawer_x + 4.0 && (p.y - cy).abs() <= 50.0
+                });
+                let over_drawer = self.sidebar_anim > 0.01
                     && ptr_pos.is_some_and(|p| p.x >= drawer_x - 6.0 && p.y >= rect.top());
                 let overlay_active = over_drawer || over_handle || self.sidebar_resizing || self.save_preset_open;
 
@@ -1693,7 +1735,7 @@ impl eframe::App for CrtApp {
                     if show {
                         let a = (1.0 - (idle.min(since) - 1.5).max(0.0) / 1.5).clamp(0.0, 1.0);
                         let text = "F11 or Esc: leave fullscreen   ·   scroll: zoom   ·   double-click: reset";
-                        let pos = rect.center_bottom() + egui::vec2(0.0, -24.0);
+                        let pos = vis_rect.center_bottom() + egui::vec2(0.0, -24.0);
                         let galley = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(14.0), Color32::from_gray(220));
                         let bg = egui::Rect::from_center_size(pos, galley.size() + egui::vec2(24.0, 12.0));
                         ui.painter().rect_filled(bg, 8.0, Color32::from_black_alpha((170.0 * a) as u8));
@@ -1705,7 +1747,7 @@ impl eframe::App for CrtApp {
                             Color32::from_white_alpha((220.0 * a) as u8),
                         );
                     }
-                    if idle > 2.0 && resp.hovered() {
+                    if idle > 2.0 && self.tv_hovered {
                         ctx.set_cursor_icon(egui::CursorIcon::None);
                     }
                 }
@@ -1720,34 +1762,35 @@ impl eframe::App for CrtApp {
                 }
             });
 
-        // Slide-in right service panel & hover-revealed pull handle
-        if !self.fullscreen && central_rect.width() > 0.0 && central_rect.height() > 0.0 {
+        // Slide-in right service panel & translucent pull handle (works in both windowed and fullscreen)
+        if central_rect.width() > 0.0 && central_rect.height() > 0.0 {
             let max_w = (central_rect.width() - 260.0).max(380.0).min(620.0);
             let drawer_w = self.sidebar_width.clamp(380.0, max_w);
             let drawer_x = central_rect.right() - drawer_w * eased;
 
-            // When closed, hovering near the right edge reveals the pull handle;
-            // clicking the handle toggles the service panel open or closed.
-            let near_right_edge = ptr_pos.is_some_and(|p| {
-                p.x >= central_rect.right() - 56.0
-                    && p.x <= central_rect.right() + 4.0
+            let tab_w = 24.0;
+            let tab_h = 92.0;
+            let tab_top = central_rect.center().y - tab_h * 0.5;
+            let tab_bottom = tab_top + tab_h;
+
+            // Handle stays subtly visible at low opacity at rest and brightens smoothly
+            // when moused over, near the right edge, or while the service panel is open.
+            let near_handle = ptr_pos.is_some_and(|p| {
+                p.x >= drawer_x - tab_w - 36.0
+                    && p.x <= drawer_x + 8.0
                     && p.y >= central_rect.top()
                     && p.y <= central_rect.bottom()
             });
-            let show_handle = self.sidebar_open || self.sidebar_anim > 0.01 || (near_right_edge && !self.save_preset_open);
-            let h_target = if show_handle { 1.0 } else { 0.0 };
-            let h_step = dt_ui / if show_handle { 0.14 } else { 0.20 };
+            let highlight_handle = self.sidebar_open || self.sidebar_anim > 0.01 || (near_handle && !self.save_preset_open);
+            let h_target = if highlight_handle { 1.0 } else { 0.0 };
+            let h_step = dt_ui / if highlight_handle { 0.14 } else { 0.24 };
             if self.handle_anim < h_target {
                 self.handle_anim = (self.handle_anim + h_step).min(h_target);
             } else if self.handle_anim > h_target {
                 self.handle_anim = (self.handle_anim - h_step).max(h_target);
             }
             let handle_eased = 1.0 - (1.0 - self.handle_anim).powi(3);
-
-            let tab_w = 24.0;
-            let tab_h = 92.0;
-            let tab_top = central_rect.center().y - tab_h * 0.5;
-            let tab_bottom = tab_top + tab_h;
+            let handle_alpha = 0.20 + 0.80 * handle_eased;
 
             // Animated service panel drawer
             if self.sidebar_anim > 0.005 {
@@ -1807,73 +1850,75 @@ impl eframe::App for CrtApp {
                 self.sidebar_resizing = false;
             }
 
-            // Retro walnut & brushed-metal pull handle (appears on right-edge mouseover when closed,
-            // stays attached to the drawer edge when open; clicking toggles open/closed).
-            if handle_eased > 0.01 {
-                let tab_x = (drawer_x - tab_w * handle_eased).max(central_rect.left());
-                let tab_pos = egui::pos2(tab_x, tab_top);
-                egui::Area::new(egui::Id::unique("controls_pull_tab"))
-                    .order(egui::Order::Foreground)
-                    .fixed_pos(tab_pos)
-                    .interactable(true)
-                    .show(&ctx, |ui| {
-                        ui.set_clip_rect(central_rect);
-                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(tab_w, tab_h), egui::Sense::click());
-                        let hot = resp.hovered();
-                        if hot {
-                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        let rounding = egui::CornerRadius { nw: 7, sw: 7, ne: 0, se: 0 };
-                        let wood_bg = if hot {
-                            Color32::from_rgb(92, 54, 30)
-                        } else {
-                            Color32::from_rgb(66, 39, 21)
-                        };
-                        let stroke = if hot {
-                            Color32::from_rgb(232, 168, 86)
-                        } else {
-                            Color32::from_rgb(142, 128, 106)
-                        };
-                        ui.painter().rect_filled(rect, rounding, wood_bg);
-                        let plate = egui::Rect::from_min_max(
-                            rect.min + egui::vec2(3.0, 4.0),
-                            rect.max - egui::vec2(0.0, 4.0),
-                        );
-                        ui.painter().rect_filled(
-                            plate,
-                            egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 },
-                            if hot { Color32::from_rgb(56, 52, 46) } else { Color32::from_rgb(40, 38, 35) },
-                        );
-                        ui.painter().rect_stroke(rect, rounding, egui::Stroke::new(1.1, stroke), egui::StrokeKind::Inside);
-                        let c = plate.center();
-                        let ridge_col = Color32::from_rgb(112, 104, 90);
-                        for &dy in &[-24.0f32, -19.0, 19.0, 24.0] {
-                            ui.painter().line_segment(
-                                [egui::pos2(plate.left() + 4.0, c.y + dy), egui::pos2(plate.right() - 4.0, c.y + dy)],
-                                egui::Stroke::new(1.0, ridge_col),
-                            );
-                        }
-                        let arrow_col = if hot { Color32::from_rgb(248, 186, 92) } else { Color32::from_rgb(214, 200, 176) };
-                        let arrow_stroke = egui::Stroke::new(2.0, arrow_col);
-                        if self.sidebar_open {
-                            // ">" chevron to close
-                            ui.painter().line_segment([c + egui::vec2(-3.0, -6.0), c + egui::vec2(3.0, 0.0)], arrow_stroke);
-                            ui.painter().line_segment([c + egui::vec2(3.0, 0.0), c + egui::vec2(-3.0, 6.0)], arrow_stroke);
-                        } else {
-                            // "<" chevron to open
-                            ui.painter().line_segment([c + egui::vec2(3.0, -6.0), c + egui::vec2(-3.0, 0.0)], arrow_stroke);
-                            ui.painter().line_segment([c + egui::vec2(-3.0, 0.0), c + egui::vec2(3.0, 6.0)], arrow_stroke);
-                        }
-                        let tip = if self.sidebar_open {
-                            "Close service panel"
-                        } else {
-                            "Open service panel"
-                        };
-                        if resp.on_hover_text(tip).clicked() {
-                            self.sidebar_open = !self.sidebar_open;
-                        }
+            // Retro walnut & brushed-metal pull handle: always gently visible at low opacity,
+            // brightens smoothly on mouseover or when open; clicking toggles open/closed.
+            let tab_x = (drawer_x - tab_w).max(central_rect.left());
+            let tab_pos = egui::pos2(tab_x, tab_top);
+            egui::Area::new(egui::Id::unique("controls_pull_tab"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(tab_pos)
+                .interactable(true)
+                .show(&ctx, |ui| {
+                    ui.set_clip_rect(central_rect);
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(tab_w, tab_h), egui::Sense::click());
+                    let hot = resp.hovered();
+                    if hot {
+                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    let a = if hot { 1.0 } else { handle_alpha };
+                    let fade = |c: Color32| {
+                        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * a) as u8)
+                    };
+                    let rounding = egui::CornerRadius { nw: 7, sw: 7, ne: 0, se: 0 };
+                    let wood_bg = fade(if hot {
+                        Color32::from_rgb(92, 54, 30)
+                    } else {
+                        Color32::from_rgb(66, 39, 21)
                     });
-            }
+                    let stroke = fade(if hot {
+                        Color32::from_rgb(232, 168, 86)
+                    } else {
+                        Color32::from_rgb(142, 128, 106)
+                    });
+                    ui.painter().rect_filled(rect, rounding, wood_bg);
+                    let plate = egui::Rect::from_min_max(
+                        rect.min + egui::vec2(3.0, 4.0),
+                        rect.max - egui::vec2(0.0, 4.0),
+                    );
+                    ui.painter().rect_filled(
+                        plate,
+                        egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 },
+                        fade(if hot { Color32::from_rgb(56, 52, 46) } else { Color32::from_rgb(40, 38, 35) }),
+                    );
+                    ui.painter().rect_stroke(rect, rounding, egui::Stroke::new(1.1, stroke), egui::StrokeKind::Inside);
+                    let c = plate.center();
+                    let ridge_col = fade(Color32::from_rgb(112, 104, 90));
+                    for &dy in &[-24.0f32, -19.0, 19.0, 24.0] {
+                        ui.painter().line_segment(
+                            [egui::pos2(plate.left() + 4.0, c.y + dy), egui::pos2(plate.right() - 4.0, c.y + dy)],
+                            egui::Stroke::new(1.0, ridge_col),
+                        );
+                    }
+                    let arrow_col = fade(if hot { Color32::from_rgb(248, 186, 92) } else { Color32::from_rgb(214, 200, 176) });
+                    let arrow_stroke = egui::Stroke::new(2.0, arrow_col);
+                    if self.sidebar_open {
+                        // ">" chevron to close
+                        ui.painter().line_segment([c + egui::vec2(-3.0, -6.0), c + egui::vec2(3.0, 0.0)], arrow_stroke);
+                        ui.painter().line_segment([c + egui::vec2(3.0, 0.0), c + egui::vec2(-3.0, 6.0)], arrow_stroke);
+                    } else {
+                        // "<" chevron to open
+                        ui.painter().line_segment([c + egui::vec2(3.0, -6.0), c + egui::vec2(-3.0, 0.0)], arrow_stroke);
+                        ui.painter().line_segment([c + egui::vec2(-3.0, 0.0), c + egui::vec2(3.0, 6.0)], arrow_stroke);
+                    }
+                    let tip = if self.sidebar_open {
+                        "Close service panel"
+                    } else {
+                        "Open service panel"
+                    };
+                    if resp.on_hover_text(tip).clicked() {
+                        self.sidebar_open = !self.sidebar_open;
+                    }
+                });
         } else {
             self.sidebar_resizing = false;
         }
