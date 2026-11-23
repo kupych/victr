@@ -49,6 +49,10 @@ ViCTR models the full analog television pipeline — from NTSC baseband encoding
 
 ## Getting Started
 
+### Prebuilt Releases
+
+Prebuilt binaries for **Windows (x86_64)**, **macOS (Apple Silicon & Intel)**, and **Linux (x86_64)** are published on the [GitHub Releases](../../releases) page whenever a version tag (`v*`) is pushed.
+
 ### Prerequisites
 
 - **Rust toolchain** (edition 2024 — Rust 1.85+)

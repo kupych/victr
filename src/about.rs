@@ -15,6 +15,7 @@ pub fn app_dir() -> Option<PathBuf> {
 }
 
 /// The double-clickable launcher in the app folder, if there is one.
+#[allow(dead_code)]
 pub fn launcher_path() -> Option<PathBuf> {
     app_dir().map(|d| d.join("victr.sh"))
 }
@@ -133,6 +134,7 @@ pub fn icon_rgba(size: u32) -> Vec<u8> {
     px
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn desktop_entry(exe: &std::path::Path, icon: &std::path::Path) -> String {
     let q = |p: &std::path::Path| p.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
     format!(
