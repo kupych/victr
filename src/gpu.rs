@@ -18,6 +18,8 @@ pub struct FrameInput {
     pub lines: Vec<f32>, // NL * 2 * 4
     pub u: Uniforms,
     pub image: Option<(u64, std::sync::Arc<(usize, usize, Vec<u8>)>)>,
+    /// Optional 640x480 RGBA8 post-decoder CRT TV OSD (green/white channel & volume overlay).
+    pub osd: Option<(u64, std::sync::Arc<Vec<u8>>)>,
     pub clear_burn: bool,
     pub burn_now: bool,
     pub reset_trails: bool,
@@ -319,6 +321,8 @@ pub struct Gpu {
 
     dummy_view: wgpu::TextureView,
     lines_tex: wgpu::Texture,
+    osd_tex: wgpu::Texture,
+    osd_id: u64,
     img_tex: wgpu::Texture,
     img_view: wgpu::TextureView,
     img_id: u64,
@@ -546,6 +550,22 @@ impl Gpu {
         });
         let lines_view = lines_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let osd_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("osd_tex"),
+            size: wgpu::Extent3d {
+                width: crate::osd::OSD_W as u32,
+                height: crate::osd::OSD_H as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let osd_view = osd_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
         let global_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("crt_global_bgl"),
             entries: &[
@@ -582,6 +602,16 @@ impl Gpu {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -652,6 +682,7 @@ impl Gpu {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&s_nearest) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&s_repeat_x) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&lines_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&osd_view) },
             ],
         });
 
@@ -757,6 +788,8 @@ impl Gpu {
             p_present_sdr_rgba8,
             dummy_view,
             lines_tex,
+            osd_tex,
+            osd_id: 0,
             img_tex,
             img_view,
             img_id: 0,
@@ -1022,7 +1055,7 @@ impl Gpu {
             pers1: [u.frac[0], u.frac[1], u.frac[2], tail_gain],
             scan0: [u.tau_fast[0], u.tau_fast[1], u.tau_fast[2], u.scan_phase],
             scan1: [u.tau_slow[0], u.tau_slow[1], u.tau_slow[2], u.scan_w],
-            scan2: [u.scan_a, eye_k_eff, u.scan as f32, 0.0],
+            scan2: [u.scan_a, eye_k_eff, u.scan as f32, if fi.osd.is_some() { 1.0 } else { 0.0 }],
             phos0: [p[0], p[1], p[2], 0.0],
             phos1: [p[3], p[4], p[5], 0.0],
             phos2: [p[6], p[7], p[8], 0.0],
@@ -1046,6 +1079,27 @@ impl Gpu {
     ) {
         let vw = (crt_rect_px[2].round() as u32).max(4);
         let vh = (crt_rect_px[3].round() as u32).max(4);
+
+        // Upload updated post-decoder TV OSD if active & changed.
+        if let Some((id, rgba)) = &fi.osd {
+            if *id != self.osd_id && rgba.len() == crate::osd::OSD_W * crate::osd::OSD_H * 4 {
+                self.osd_id = *id;
+                queue.write_texture(
+                    self.osd_tex.as_image_copy(),
+                    rgba,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some((crate::osd::OSD_W * 4) as u32),
+                        rows_per_image: Some(crate::osd::OSD_H as u32),
+                    },
+                    wgpu::Extent3d {
+                        width: crate::osd::OSD_W as u32,
+                        height: crate::osd::OSD_H as u32,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
 
         // Upload new user image or video frame if changed.
         if let Some((id, img)) = &fi.image {

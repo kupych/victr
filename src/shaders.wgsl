@@ -101,6 +101,7 @@ struct Uniforms {
 @group(0) @binding(2) var s_nearest: sampler;
 @group(0) @binding(3) var s_repeat_x: sampler;
 @group(0) @binding(4) var t_lines: texture_2d<f32>;
+@group(0) @binding(5) var t_osd: texture_2d<f32>;
 @group(1) @binding(0) var t0: texture_2d<f32>;
 @group(1) @binding(1) var t1: texture_2d<f32>;
 @group(1) @binding(2) var t2: texture_2d<f32>;
@@ -707,6 +708,24 @@ fn gunEnergy(g: i32, f: vec2<f32>, g_abl: f32, g_breath: f32, g_scan_floor: f32)
     let sig0 = U.geom2.z * foc;
     let sh = max(U.geom2.w * foc, 0.3);
     let vphase = U.geom1.y;
+
+    // Post-decoder TV Jungle IC RGB Fast-Blanking OSD injection:
+    // immune to RF snow & NTSC chroma bleed, yet passes through electron guns,
+    // scanlines, convergence, shadow mask, persistence, glass bloom, and HDR.
+    var osd_a = 0.0;
+    var osd_ch = 0.0;
+    if U.scan2.w > 0.5 {
+        let ouv = (f / vec2<f32>(4.0 / 3.0, 1.0)) * 0.5 + 0.5;
+        if ouv.x >= 0.0 && ouv.x <= 1.0 && ouv.y >= 0.0 && ouv.y <= 1.0 {
+            let ov = textureSampleLevel(t_osd, s_linear, ouv, 0.0);
+            osd_a = ov.a;
+            if g == 0 { osd_ch = ov.r; }
+            else if g == 1 { osd_ch = ov.g; }
+            else { osd_ch = ov.b; }
+            osd_ch *= 1.05;
+        }
+    }
+
     var e = 0.0;
     for (var i: i32 = -2; i <= 3; i += 1) {
         let k = k0 + f32(i);
@@ -717,11 +736,16 @@ fn gunEnergy(g: i32, f: vec2<f32>, g_abl: f32, g_breath: f32, g_scan_floor: f32)
         let s = rp.x + hoff;
         let ty = (kk + 0.5) / NL;
         var cur = 0.0;
-        cur += 0.0545 * gun_current(sample_drive_ch(s - 2.0 * sh, ty, g), g, g_abl);
-        cur += 0.2442 * gun_current(sample_drive_ch(s - sh, ty, g), g, g_abl);
-        cur += 0.4026 * gun_current(sample_drive_ch(s, ty, g), g, g_abl);
-        cur += 0.2442 * gun_current(sample_drive_ch(s + sh, ty, g), g, g_abl);
-        cur += 0.0545 * gun_current(sample_drive_ch(s + 2.0 * sh, ty, g), g, g_abl);
+        let d0 = mix(sample_drive_ch(s - 2.0 * sh, ty, g), osd_ch, osd_a);
+        let d1 = mix(sample_drive_ch(s - sh, ty, g), osd_ch, osd_a);
+        let d2 = mix(sample_drive_ch(s, ty, g), osd_ch, osd_a);
+        let d3 = mix(sample_drive_ch(s + sh, ty, g), osd_ch, osd_a);
+        let d4 = mix(sample_drive_ch(s + 2.0 * sh, ty, g), osd_ch, osd_a);
+        cur += 0.0545 * gun_current(d0, g, g_abl);
+        cur += 0.2442 * gun_current(d1, g, g_abl);
+        cur += 0.4026 * gun_current(d2, g, g_abl);
+        cur += 0.2442 * gun_current(d3, g, g_abl);
+        cur += 0.0545 * gun_current(d4, g, g_abl);
         var sg = sig0 * (1.0 + U.tube0.x * sqrt(max(cur, 0.0)));
         sg = sqrt(sg * sg + g_scan_floor * g_scan_floor);
         e += cur * exp(-0.5 * dy * dy / (sg * sg)) / (sg * 2.5066283);

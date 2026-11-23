@@ -21,6 +21,7 @@ pub struct Sim {
     pub off_t: f32,
     pub degauss_t: f32,
     degauss_phase: f32,
+    pub channel_switch_t: f32,
     lines: Vec<f32>,
     pub purity_seed: [f32; 2],
 }
@@ -43,6 +44,7 @@ impl Sim {
             off_t: -1.0,
             degauss_t: 0.0,
             degauss_phase: 0.7,
+            channel_switch_t: 10.0,
             lines: vec![0.0; (NL * 2 * 4) as usize],
             purity_seed: [3.7, 11.2],
         }
@@ -80,6 +82,10 @@ impl Sim {
         self.degauss_phase = self.next() * std::f32::consts::TAU;
     }
 
+    pub fn switch_channel(&mut self) {
+        self.channel_switch_t = 0.0;
+    }
+
     /// Advances simulated time; returns true when a new field (1/59.94 s) is due.
     pub fn advance(&mut self, dt: f64) -> bool {
         let dt = dt.clamp(0.0, 0.25);
@@ -107,9 +113,19 @@ impl Sim {
             self.off_t += fdt;
         }
         self.degauss_t += real_dt.max(fdt);
+        self.channel_switch_t += real_dt.max(fdt);
+
+        // Brief ~0.25s RF static burst + tuner sync hiccup when changing cable channels
+        let ch_env = if self.channel_switch_t >= 0.0 && self.channel_switch_t < 0.26 {
+            let k = 1.0 - self.channel_switch_t / 0.26;
+            k * k
+        } else {
+            0.0
+        };
 
         // ---- noise budget
-        let rf_sigma = if s.input == Input::Rf { 10f32.powf(-s.signal_db / 20.0) } else { 0.0 };
+        let rf_sigma = if s.input == Input::Rf { 10f32.powf(-s.signal_db / 20.0) } else { 0.0 } + 0.85 * ch_env;
+        let extra_noise_eff = s.extra_noise + 0.65 * ch_env;
         let (tape_sigma, speed_bw) = if s.vcr {
             let k = match s.tape_speed {
                 TapeSpeed::Sp => (1.0, 3.0),
@@ -120,7 +136,7 @@ impl Sim {
         } else {
             (0.0, 4.2)
         };
-        let sigma = (rf_sigma * rf_sigma + s.extra_noise * s.extra_noise + tape_sigma * tape_sigma).sqrt();
+        let sigma = (rf_sigma * rf_sigma + extra_noise_eff * extra_noise_eff + tape_sigma * tape_sigma).sqrt();
         self.snr_db = if sigma > 1e-5 { (-20.0 * sigma.log10()).min(60.0) } else { 60.0 };
 
         // probability that the sync separator finds a line's sync pulse
@@ -333,7 +349,7 @@ impl Sim {
             dropout: s.dropouts,
             input: s.input.id(),
             snow: rf_sigma,
-            noise: s.extra_noise,
+            noise: extra_noise_eff,
             ghost_amp: s.ghost_amp,
             ghost_delay: s.ghost_delay_us * fs,
             interf_amp: s.interference,
@@ -419,6 +435,7 @@ impl Sim {
             lines: self.lines.clone(),
             u,
             image: None,
+            osd: None,
             clear_burn: false,
             burn_now: false,
             reset_trails: false,

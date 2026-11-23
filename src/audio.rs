@@ -75,6 +75,7 @@ pub struct AudioParams {
     pub power_on: bool,
     pub warm: f32,
     pub degauss_t: f32,
+    pub channel_switch_t: f32,
     pub test_tone: bool,
     // RF
     pub rf: bool,
@@ -109,6 +110,7 @@ impl Default for AudioParams {
             power_on: true,
             warm: 1.0,
             degauss_t: 10.0,
+            channel_switch_t: 10.0,
             test_tone: false,
             rf: false,
             snr_db: 60.0,
@@ -435,6 +437,16 @@ impl Processor {
                 l += e;
                 r += e;
             }
+            // Brief RF static burst when snapping to a new cable channel
+            if p.channel_switch_t >= 0.0 && p.channel_switch_t < 0.25 {
+                let ct = p.channel_switch_t + i as f32 / RATE;
+                if ct < 0.25 {
+                    let env = (1.0 - ct / 0.25).powi(2);
+                    let burst = self.noise() * 0.30 * env;
+                    l = l * (1.0 - 0.75 * env) + burst;
+                    r = r * (1.0 - 0.75 * env) + burst;
+                }
+            }
 
             // ---- TV amplifier and cabinet speaker
             if p.mono {
@@ -474,6 +486,14 @@ impl Processor {
                 if dg < 0.075 {
                     let k = 1.0 - dg / 0.075;
                     chassis_c += 0.42 * k * k * (std::f32::consts::TAU * 48.0 * dg).sin();
+                }
+            }
+            // Crisp electronic/mechanical tuner click on channel change
+            if p.channel_switch_t >= 0.0 && p.channel_switch_t < 0.020 {
+                let ct = p.channel_switch_t + i as f32 / RATE;
+                if ct < 0.018 {
+                    let k = 1.0 - ct / 0.018;
+                    chassis_c += 0.34 * k * k * (std::f32::consts::TAU * 880.0 * ct).sin();
                 }
             }
             // Subtle high-voltage electrostatic faceplate crackle on power switch / degauss:

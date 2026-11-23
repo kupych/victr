@@ -24,6 +24,11 @@ ViCTR models the full analog television pipeline — from NTSC baseband encoding
   - Routes video audio (or 1 kHz colour-bars test tone) through VCR tape wow/flutter/hiss, RF FM sound hiss/static/clicks/intercarrier buzz, cabinet speaker frequency response (scaled to screen size), 15.7 kHz flyback whine, power crackle, and degauss coil buzz.
 - **Video & Image Playback**
   - Play local video files or URLs (via `mpv` / `yt-dlp`), drag and drop images or videos onto the window, forward your own `mpv` key bindings while hovering the screen, or install the built-in `Ctrl+T` mpv script to hand off playback from mpv directly to ViCTR.
+- **90s Prevue Cable Guide & Jellyfin Integration**
+  - Connect to your **Jellyfin** server (Server URL + API Key + User selector) to unlock a classic 1990s **Prevue Channel** split-screen cable guide rendered straight through the NTSC signal path (live video preview + Jellyfin artwork/synopsis + 30-minute scrolling grid).
+  - Automatically builds virtual channels: **`CH 01`** Program Guide, **`CH 02+`** per-series channels (Continue Watching & Favorites first, resuming your next unwatched episode and auto-advancing), and **`CH 50+`** 24/7 live-clock movie genre channels (`ACTION`, `COMEDY`, `SCI-FI`, etc.).
+  - Syncs playback progress & watched status back to Jellyfin after >20 seconds of viewing (so quick channel-surfing stays clean) and marks items watched at 90% completion.
+  - Injects a classic **phosphor-green/white TV OSD** (`CH 04`, call-sign, episode banner, `VOL |||||||---`, `MUTE`, `STEREO`/`MONO`) post-decoder into the electron guns, paired with a brief RF static burst & tuner click on channel switches.
 - **Slide-in Service Panel & Custom Presets**
   - Retro faux-walnut and brushed-metal slide-in controls drawer accessible in both windowed and fullscreen modes: a subtle low-opacity pull handle rests on the right edge, brightens on hover, and toggles the panel open or closed on click while the CRT glides smoothly alongside it.
   - Includes 9 built-in presets and lets you **save, overwrite, and delete custom presets** stored in your user config directory.
@@ -100,6 +105,7 @@ cargo test
 | Toggle fullscreen | `F11` (press `F11` or `Esc` to exit) |
 | Open image or video | Drag & drop onto the window, or use **Open a picture…** / **Open a video…** |
 | Control `mpv` playback | Hover the TV and use your `mpv` keys (`Space`, arrow keys, etc.) |
+| 90s Cable Guide & TV Remote (Jellyfin) | `G` (Guide), Arrows + `Enter` (browse/tune), `0–9` (dial channel), `PgUp`/`PgDn` or `[`/`]` (Ch+/Ch-), `-`/`+` (Vol), `M` (Mute), `R` (Restart 0:00), `I` (Info OSD) |
 
 ## CLI Options
 
@@ -113,6 +119,7 @@ victr [OPTIONS] [VIDEO_PATH_OR_URL]
 - `--pattern <0..8>` — Start with a specific test pattern
 - `--zoom <1.0..60.0>` — Initial zoom factor
 - `--sidebar` — Start with the service panel locked open
+- `--guide` — Open the 90s Prevue Cable Guide (`CH 01`) on startup when Jellyfin is connected
 - `--fullscreen` — Start in fullscreen mode
 - `--screenshot <path>` — Render and save a screenshot, then exit
 
@@ -136,6 +143,9 @@ src/
 ├── shaders.rs   # WGSL shader loader
 ├── shaders.wgsl # WGSL shaders (source, baseband, RF channel, decode, beam/mask, scan, glass, HDR present)
 ├── audio.rs     # Real-time analog TV/RF/VCR/cabinet audio DSP engine
+├── jellyfin.rs  # Jellyfin REST client, virtual channel builder, hybrid scheduler & watch sync
+├── guide.rs     # 640×480 classic 1990s Prevue Channel split-screen bitmap renderer
+├── osd.rs       # 8×8 pixel font & post-decoder phosphor-green/white TV OSD
 ├── mpv.rs       # Video playback via dynamically loaded libmpv or mpv CLI fallback
 ├── link.rs      # Local IPC socket and mpv Ctrl+T handoff script installer
 └── about.rs     # Procedural retro TV icon and Linux desktop menu entry helper

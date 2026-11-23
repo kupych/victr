@@ -4,8 +4,11 @@ mod about;
 mod app;
 mod audio;
 mod gpu;
+mod guide;
+mod jellyfin;
 mod link;
 mod mpv;
+mod osd;
 mod settings;
 mod shaders;
 mod sim;
@@ -29,6 +32,7 @@ struct CliArgs {
     fullscreen: bool,
     sidebar_open: bool,
     pixel_perfect: bool,
+    open_guide: bool,
     degauss_at: Option<f32>,
 }
 
@@ -43,6 +47,7 @@ fn parse_args() -> CliArgs {
     let fullscreen = args.iter().any(|a| a == "--fullscreen");
     let sidebar_open = args.iter().any(|a| a == "--sidebar");
     let pixel_perfect = args.iter().any(|a| a == "--pixel-perfect");
+    let open_guide = args.iter().any(|a| a == "--guide");
     let degauss_at: Option<f32> = args
         .windows(2)
         .find(|w| w[0] == "--degauss")
@@ -55,7 +60,7 @@ fn parse_args() -> CliArgs {
         } else if args[i] == "--preset" && i + 1 < args.len() {
             preset = args[i + 1].parse().ok();
             i += 1;
-        } else if args[i] == "--fullscreen" || args[i] == "--sidebar" || args[i] == "--pixel-perfect" {
+        } else if args[i] == "--fullscreen" || args[i] == "--sidebar" || args[i] == "--pixel-perfect" || args[i] == "--guide" {
             // handled above
         } else if args[i] == "--degauss" && i + 1 < args.len() {
             i += 1;
@@ -88,6 +93,7 @@ fn parse_args() -> CliArgs {
         fullscreen,
         sidebar_open,
         pixel_perfect,
+        open_guide,
         degauss_at,
     }
 }
@@ -183,6 +189,9 @@ impl Runtime {
         }
         if cli.pixel_perfect {
             app.request_pixel_perfect();
+        }
+        if cli.open_guide {
+            app.request_open_guide();
         }
         if let Some(t) = cli.degauss_at {
             app.set_degauss_time(t);
