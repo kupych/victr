@@ -90,6 +90,7 @@ cargo test
 | Zoom into phosphors | Mouse wheel over the screen |
 | Pan zoomed view | Click and drag on the screen |
 | Reset zoom & pan | Double-click the screen (or click **Reset view**) |
+| Pixel-perfect 1× phosphors | `Ctrl+1` (`Cmd+1` on macOS) or click **1:1** next to **Screen size (in)** |
 | Toggle fullscreen | `F11` (press `F11` or `Esc` to exit) |
 | Open image or video | Drag & drop onto the window, or use **Open a picture…** / **Open a video…** |
 | Control `mpv` playback | Hover the TV and use your `mpv` keys (`Space`, arrow keys, etc.) |

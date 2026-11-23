@@ -44,6 +44,10 @@ pub struct CrtApp {
     handle_anim: f32,
     sidebar_width: f32,
     sidebar_resizing: bool,
+    pixel_perfect_req: bool,
+    last_vis_rect: egui::Rect,
+    last_full_h_px: f32,
+    status_toast: Option<(String, std::time::Instant)>,
     message: String,
     screenshot: Option<PathBuf>,
     frames: u32,
@@ -235,6 +239,10 @@ impl CrtApp {
             handle_anim: 0.0,
             sidebar_width: 440.0,
             sidebar_resizing: false,
+            pixel_perfect_req: false,
+            last_vis_rect: egui::Rect::NOTHING,
+            last_full_h_px: 0.0,
+            status_toast: None,
             message: String::new(),
             screenshot,
             frames: 0,
@@ -709,11 +717,31 @@ impl CrtApp {
         }
     }
 
-    fn view_half(&self, rect: egui::Rect) -> f32 {
+    fn view_half_at_zoom(&self, rect: egui::Rect, zoom: f32) -> f32 {
         let a = rect.width() / rect.height().max(1.0);
         let m: f32 = if self.s.show_bezel { 0.26 } else { 0.03 };
         let base = (1.0 + m).max((4.0 / 3.0 + m) / a);
-        base / self.zoom
+        base / zoom
+    }
+
+    fn view_half(&self, rect: egui::Rect) -> f32 {
+        self.view_half_at_zoom(rect, self.zoom)
+    }
+
+    fn apply_pixel_perfect_screen_size(&mut self) {
+        if self.last_vis_rect.width() <= 0.0 || self.last_full_h_px <= 0.0 {
+            return;
+        }
+        let h_1x = self.view_half_at_zoom(self.last_vis_rect, 1.0);
+        let inches = pixel_perfect_screen_inches(self.s.pitch_mm, self.s.mask, self.last_full_h_px, h_1x);
+        self.s.screen_inches = inches;
+        self.zoom = 1.0;
+        self.pan = [0.0, 0.0];
+        self.reset_trails = true;
+        self.status_toast = Some((
+            format!("Pixel-perfect 1× phosphors: screen size {:.2}\" ({:.2} mm pitch)", inches, self.s.pitch_mm),
+            std::time::Instant::now(),
+        ));
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
@@ -829,7 +857,16 @@ impl CrtApp {
         egui::CollapsingHeader::new(RichText::new("Picture tube").strong())
             .default_open(true)
             .show(ui, |ui| {
-                sl(ui, &mut s.screen_inches, 9.0..=36.0, "Screen size (in)", "Visible diagonal. Sets how big the mask pitch is relative to the picture.");
+                ui.horizontal(|ui| {
+                    sl(ui, &mut s.screen_inches, 4.0..=36.0, "Screen size (in)", "Visible diagonal. Sets how big the mask pitch is relative to the picture.");
+                    if ui
+                        .small_button("1:1")
+                        .on_hover_text("Set screen size so each phosphor is pixel-perfect at 1× zoom (Ctrl+1)")
+                        .clicked()
+                    {
+                        self.pixel_perfect_req = true;
+                    }
+                });
                 egui::ComboBox::from_id_salt("mask")
                     .selected_text(s.mask.label())
                     .width(230.0)
@@ -1337,10 +1374,12 @@ impl eframe::App for CrtApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
-        // fullscreen: F11 toggles, Esc leaves (taken before mpv sees the keys)
+        // fullscreen: F11 toggles, Esc leaves; Ctrl+1 snaps screen size to 1:1 pixel-perfect phosphors
         let f11 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11));
         let esc = (self.fullscreen || self.save_preset_open)
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let ctrl_1 = !ctx.egui_wants_keyboard_input()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num1));
         if f11 {
             self.set_fullscreen(&ctx, !self.fullscreen);
         } else if esc {
@@ -1349,6 +1388,9 @@ impl eframe::App for CrtApp {
             } else {
                 self.set_fullscreen(&ctx, false);
             }
+        }
+        if ctrl_1 {
+            self.pixel_perfect_req = true;
         }
         // the window manager can also take us out of fullscreen
         if self.fullscreen
@@ -1606,6 +1648,13 @@ impl eframe::App for CrtApp {
                     rect.min,
                     egui::pos2((rect.right() - drawer_vis_w).max(rect.left() + 120.0), rect.bottom()),
                 );
+                let ppp = ctx.pixels_per_point();
+                self.last_vis_rect = vis_rect;
+                self.last_full_h_px = rect.height() * ppp;
+                if self.pixel_perfect_req {
+                    self.pixel_perfect_req = false;
+                    self.apply_pixel_perfect_screen_size();
+                }
 
                 // zoom & pan
                 let h = self.view_half(vis_rect);
@@ -1675,7 +1724,6 @@ impl eframe::App for CrtApp {
                     f
                 };
                 // glass blur radii in quarter-resolution pixels
-                let ppp = ctx.pixels_per_point();
                 let px_per_face = rect.height() * ppp / (2.0 * h);
                 let mm = 2.0 / (self.s.screen_inches * 25.4 * 0.6);
                 fi.u.diffuse_sigma_px = (0.9 * mm * px_per_face / 4.0).clamp(0.3, 30.0);
@@ -1749,6 +1797,31 @@ impl eframe::App for CrtApp {
                     }
                     if idle > 2.0 && self.tv_hovered {
                         ctx.set_cursor_icon(egui::CursorIcon::None);
+                    }
+                }
+                if let Some((ref msg, when)) = self.status_toast {
+                    let age = when.elapsed().as_secs_f32();
+                    if age < 2.6 {
+                        let a = (1.0 - (age - 1.8).max(0.0) / 0.8).clamp(0.0, 1.0);
+                        let pos = vis_rect.center_top() + egui::vec2(0.0, 26.0);
+                        let galley = ui.painter().layout_no_wrap(msg.clone(), egui::FontId::proportional(13.5), Color32::from_rgb(245, 210, 145));
+                        let bg = egui::Rect::from_center_size(pos, galley.size() + egui::vec2(22.0, 10.0));
+                        ui.painter().rect_filled(bg, 6.0, Color32::from_rgba_unmultiplied(24, 22, 19, (215.0 * a) as u8));
+                        ui.painter().rect_stroke(
+                            bg,
+                            6.0,
+                            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(186, 142, 82, (200.0 * a) as u8)),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.painter().text(
+                            pos,
+                            egui::Align2::CENTER_CENTER,
+                            msg,
+                            egui::FontId::proportional(13.5),
+                            Color32::from_rgba_unmultiplied(245, 220, 170, (245.0 * a) as u8),
+                        );
+                    } else {
+                        self.status_toast = None;
                     }
                 }
                 if !self.sim.power_on {
@@ -2015,6 +2088,17 @@ fn hms(t: f64) -> String {
     if t >= 3600 { format!("{}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60) } else { format!("{}:{:02}", t / 60, t % 60) }
 }
 
+/// Computes the CRT diagonal (in inches) where each phosphor maps 1:1 onto
+/// physical display pixels at 1× zoom.
+pub fn pixel_perfect_screen_inches(pitch_mm: f32, mask: Mask, view_h_px: f32, view_half_1x: f32) -> f32 {
+    let target_px_per_pitch = match mask {
+        Mask::ApertureGrille | Mask::SlotMask => 3.0,
+        Mask::ShadowMask => 3.0 * 3.0f32.sqrt(),
+    };
+    let inches = (pitch_mm * view_h_px) / (15.24 * view_half_1x.max(1e-3) * target_px_per_pitch);
+    inches.clamp(4.0, 36.0)
+}
+
 /// Beam clock for the rolling scan, locked to the display refresh.
 ///
 /// Raw frame times measured by the app are noisy (compositor and vsync jitter),
@@ -2131,5 +2215,24 @@ mod scan_clock_tests {
         let wmax = widths.iter().cloned().fold(0.0f32, f32::max);
         assert!(wmax - wmin < 1e-3, "slice sizes vary: {wmin}..{wmax}");
         assert!((total_w - fields as f64).abs() < 1.5);
+    }
+
+    #[test]
+    fn pixel_perfect_screen_size_matches_exact_triad_pitch() {
+        use super::pixel_perfect_screen_inches;
+        use crate::settings::Mask;
+        let view_h_px = 1080.0f32;
+        let view_half_1x = 1.26f32;
+        let pitch_mm = 0.62f32;
+        let inches = pixel_perfect_screen_inches(pitch_mm, Mask::SlotMask, view_h_px, view_half_1x);
+        let pitch_face = pitch_mm * (2.0 / (inches * 25.4 * 0.6));
+        let pxw = 2.0 * view_half_1x / view_h_px;
+        let px_per_triad = pitch_face / pxw;
+        assert!((px_per_triad - 3.0).abs() < 1e-4, "expected 3.0 px/triad, got {px_per_triad}");
+
+        let inches_sm = pixel_perfect_screen_inches(pitch_mm, Mask::ShadowMask, view_h_px, view_half_1x);
+        let pitch_face_sm = pitch_mm * (2.0 / (inches_sm * 25.4 * 0.6));
+        let d_px = (pitch_face_sm / 3.0f32.sqrt()) / pxw;
+        assert!((d_px - 3.0).abs() < 1e-4, "expected 3.0 px/dot spacing, got {d_px}");
     }
 }
