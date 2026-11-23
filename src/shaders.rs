@@ -979,27 +979,46 @@ void main() {
     vec3 col = tonemap(lin * u_exposure);
     vec3 room = vec3(0.0);   // pure black around the TV
     if (u_bezel == 1 && sdf > 0.07 - pxw) {
-        // moulded plastic bezel: inner bevel lit from above, flat face, rounded outer edge
+        // Retro woodgrain television cabinet: moulded dark charcoal inner mask,
+        // thin brushed-aluminum pinstripe trim, and warm walnut woodgrain surround.
         float d = sdf - 0.07;
-        float bw = 0.17;
+        float bw = 0.21;
         float e = 0.002;
         vec2 grad = vec2(tubeSDF(f + vec2(e, 0.0), u_corner) - tubeSDF(f - vec2(e, 0.0), u_corner),
                          tubeSDF(f + vec2(0.0, e), u_corner) - tubeSDF(f - vec2(0.0, e), u_corner));
         vec2 n2 = normalize(grad + 1e-6);
         float up = dot(n2, vec2(0.0, -1.0));             // +1 on the top edge
         float bevel = 1.0 - smoothstep(0.0, 0.045, d);   // 1 at the inner lip
-        float outer = smoothstep(bw - 0.03, bw, d);      // rounding of the outer edge
-        // inner bevel faces the viewer and slightly inward: lower edge catches the room light
+        float outer = smoothstep(bw - 0.032, bw, d);     // rounding of the outer edge
         float lightBevel = 0.5 - 0.5 * up;
         float lightOuter = 0.5 + 0.5 * up;
-        float shade = mix(0.55, 1.0 + 0.9 * lightBevel, bevel);
-        shade = mix(shade, 0.4 + 1.1 * lightOuter, outer);
-        vec3 plastic = vec3(0.018, 0.017, 0.016) * shade;
-        plastic *= 0.92 + 0.16 * hash12(floor(loc * 0.8));
-        plastic *= 0.5 + u_ambient * 2.0;
-        // a little picture light spills onto the lip
-        plastic += lin * 0.03 * bevel;
-        vec3 bz = tonemap(plastic * u_exposure);
+        float shade = mix(0.58, 1.0 + 0.85 * lightBevel, bevel);
+        shade = mix(shade, 0.35 + 1.05 * lightOuter, outer);
+
+        // Moulded charcoal inner surround (d = 0..0.092)
+        vec3 plastic = vec3(0.017, 0.016, 0.015) * shade;
+        plastic *= 0.93 + 0.14 * hash12(floor(loc * 0.8));
+
+        // Brushed-aluminum pinstripe trim (d = 0.092..0.105)
+        float chromeMask = smoothstep(0.088, 0.094, d) * (1.0 - smoothstep(0.102, 0.108, d));
+        float brush = 0.90 + 0.10 * sin(f.y * 260.0 + f.x * 12.0);
+        vec3 chrome = vec3(0.14, 0.132, 0.118) * brush * (0.65 + 0.65 * lightOuter);
+
+        // Faux walnut woodgrain outer cabinet (d > 0.105)
+        float woodMask = smoothstep(0.102, 0.110, d);
+        float warp = 3.2 * vnoise(vec2(f.x * 2.4, f.y * 8.0)) + 1.4 * vnoise(vec2(f.x * 7.0, f.y * 20.0));
+        float g1 = 0.5 + 0.5 * sin(f.y * 42.0 + warp);
+        float g2 = 0.5 + 0.5 * sin(f.y * 115.0 + warp * 2.3 + f.x * 2.0);
+        float grain = g1 * 0.68 + g2 * 0.32;
+        vec3 walnut = mix(vec3(0.022, 0.010, 0.0045), vec3(0.068, 0.031, 0.012), grain);
+        walnut *= shade * (0.94 + 0.12 * vnoise(f * 36.0));
+
+        vec3 cab = mix(plastic, walnut, woodMask);
+        cab = mix(cab, chrome, chromeMask);
+        cab *= 0.55 + u_ambient * 1.9;
+        // subtle picture light spill onto the inner bevel lip
+        cab += lin * 0.032 * bevel;
+        vec3 bz = tonemap(cab * u_exposure);
         float a = smoothstep(0.07 - pxw, 0.07 + pxw, sdf);
         float outside = smoothstep(bw - pxw, bw + pxw, d);
         col = mix(col, bz, a);

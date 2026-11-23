@@ -703,7 +703,7 @@ fn spawn_audio(route: Route, src: &str, start: f64, volume: f64, user_config: bo
         .arg(format!("--start={start}"))
         .stdin(Stdio::null())
         .stderr(Stdio::null());
-    if audio.ring.is_some() {
+    if cfg!(unix) && audio.ring.is_some() {
         c.args([
             "--ao=pcm",
             "--ao-pcm-file=/dev/stdout",

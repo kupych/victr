@@ -501,7 +501,7 @@ impl Drop for AudioEngine {
 
 fn sinks() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
-        ("pacat", vec!["--playback", "--raw", "--format=s16le", "--rate=48000", "--channels=2", "--latency-msec=60", "--client-name=Phosphor Lab"]),
+        ("pacat", vec!["--playback", "--raw", "--format=s16le", "--rate=48000", "--channels=2", "--latency-msec=60", "--client-name=ViCTR"]),
         ("pw-cat", vec!["--playback", "--format", "s16", "--rate", "48000", "--channels", "2", "--latency", "60ms", "-"]),
         ("aplay", vec!["-q", "-f", "S16_LE", "-r", "48000", "-c", "2", "-t", "raw", "--buffer-time=80000"]),
         (
@@ -520,6 +520,23 @@ fn sinks() -> Vec<(&'static str, Vec<&'static str>)> {
                 "--stream-buffer-size=4k",
                 "--demuxer-readahead-secs=0",
                 "-",
+            ],
+        ),
+        (
+            "ffplay",
+            vec![
+                "-nodisp",
+                "-autoexit",
+                "-loglevel",
+                "quiet",
+                "-f",
+                "s16le",
+                "-ar",
+                "48000",
+                "-ch_layout",
+                "stereo",
+                "-i",
+                "pipe:0",
             ],
         ),
     ]

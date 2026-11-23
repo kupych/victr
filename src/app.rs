@@ -164,15 +164,28 @@ fn mpv_key_name(ev: &egui::Event) -> Option<String> {
 impl CrtApp {
     pub fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<PathBuf>, preset: Option<usize>, zoom: Option<f32>, pattern: Option<usize>, mpv_src: Option<(String, f64)>) -> Self {
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = Color32::from_rgb(24, 24, 27);
-        visuals.window_fill = Color32::from_rgb(30, 30, 34);
-        visuals.extreme_bg_color = Color32::from_rgb(14, 14, 16);
-        visuals.selection.bg_fill = Color32::from_rgb(196, 112, 40);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(60, 56, 52);
+        visuals.panel_fill = Color32::from_rgb(35, 33, 30);
+        visuals.window_fill = Color32::from_rgb(40, 37, 33);
+        visuals.window_stroke = egui::Stroke::new(1.0, Color32::from_rgb(138, 126, 106));
+        visuals.extreme_bg_color = Color32::from_rgb(18, 17, 15);
+        visuals.faint_bg_color = Color32::from_rgb(46, 43, 39);
+        visuals.override_text_color = Some(Color32::from_rgb(232, 224, 206));
+        visuals.selection.bg_fill = Color32::from_rgb(198, 108, 34);
+        visuals.selection.stroke = egui::Stroke::new(1.0, Color32::from_rgb(245, 205, 145));
+        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(36, 34, 31);
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(82, 76, 68));
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(48, 45, 41);
+        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(44, 41, 37);
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(106, 98, 86));
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(76, 60, 44);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(70, 56, 42);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(218, 158, 84));
+        visuals.widgets.active.bg_fill = Color32::from_rgb(182, 98, 32);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(246, 204, 138));
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         cc.egui_ctx.set_visuals_of(egui::Theme::Dark, visuals);
         cc.egui_ctx.all_styles_mut(|style| {
-            style.spacing.slider_width = 150.0;
+            style.spacing.slider_width = 148.0;
             style.spacing.item_spacing = egui::vec2(8.0, 5.0);
         });
 
@@ -577,7 +590,7 @@ impl CrtApp {
                 }
                 ui.label(
                     RichText::new(
-                        "Needs mpv installed. You can also drop a video onto the window, or run: crt_sim --mpv <file or URL> [--start seconds].",
+                        "Needs mpv installed. You can also drop a video onto the window, or run: victr --mpv <file or URL> [--start seconds].",
                     )
                     .weak()
                     .small(),
@@ -702,7 +715,7 @@ impl CrtApp {
 
     fn view_half(&self, rect: egui::Rect) -> f32 {
         let a = rect.width() / rect.height().max(1.0);
-        let m: f32 = if self.s.show_bezel { 0.2 } else { 0.03 };
+        let m: f32 = if self.s.show_bezel { 0.26 } else { 0.03 };
         let base = (1.0 + m).max((4.0 / 3.0 + m) / a);
         base / self.zoom
     }
@@ -950,12 +963,12 @@ impl CrtApp {
     }
 
     fn about_controls(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new(RichText::new("About Phosphor Lab").strong())
+        egui::CollapsingHeader::new(RichText::new("About ViCTR").strong())
             .default_open(false)
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(
-                        "Phosphor Lab is an open-source, physics-based CRT television simulator modeling the analog NTSC signal chain, electron optics, phosphor persistence, rolling scan, and audio path.",
+                        "ViCTR (Virtual CRT Television Receiver) is an open-source, physics-based CRT simulator modeling the analog NTSC signal chain, electron optics, phosphor persistence, rolling scan, and audio path.",
                     )
                     .small(),
                 );
@@ -971,7 +984,7 @@ impl CrtApp {
                         ui.ctx().copy_text(path.clone());
                         self.about_msg = "Copied.".into();
                     }
-                    if ui.button("Add to my apps menu").on_hover_text("Adds a \"Phosphor Lab\" entry with its own icon to your desktop's apps menu.").clicked() {
+                    if ui.button("Add to my apps menu").on_hover_text("Adds a \"ViCTR\" entry with its own icon to your desktop's apps menu.").clicked() {
                         self.about_msg = match crate::about::install_menu_entry() {
                             Ok(m) => m,
                             Err(e) => e,
@@ -985,52 +998,270 @@ impl CrtApp {
     }
 
     fn sidebar_contents(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("CONTROLS").strong().size(13.0).color(Color32::from_rgb(235, 170, 90)));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !self.sidebar_locked
-                    && ui.small_button("×").on_hover_text("Slide controls away").clicked()
-                {
-                    self.sidebar_open = false;
-                    self.sidebar_dismissed = true;
-                    self.sidebar_hover_left = None;
-                }
-                let lock_text = if self.sidebar_locked {
-                    RichText::new("Locked open").color(Color32::WHITE).strong()
-                } else {
-                    RichText::new("Lock open")
-                };
-                let lock_btn = egui::Button::new(lock_text).selected(self.sidebar_locked).small();
-                if ui
-                    .add(lock_btn)
-                    .on_hover_text(if self.sidebar_locked {
-                        "Unlock so the sidebar auto-hides and slides in from the right edge."
+        let full_rect = ui.max_rect();
+        // Faux walnut woodgrain side rails + brushed dark-metal faceplate
+        paint_wood_panel(ui.painter(), full_rect, false);
+        let metal_rect = full_rect.shrink2(egui::vec2(7.0, 4.0));
+        paint_brushed_metal(ui.painter(), metal_rect);
+        ui.painter().rect_stroke(
+            metal_rect,
+            2.0,
+            egui::Stroke::new(1.0, Color32::from_rgb(138, 126, 106)),
+            egui::StrokeKind::Inside,
+        );
+        paint_screw(ui.painter(), metal_rect.left_top() + egui::vec2(7.0, 7.0), 2.5);
+        paint_screw(ui.painter(), metal_rect.right_top() + egui::vec2(-7.0, 7.0), 2.5);
+        paint_screw(ui.painter(), metal_rect.left_bottom() + egui::vec2(7.0, -7.0), 2.5);
+        paint_screw(ui.painter(), metal_rect.right_bottom() + egui::vec2(-7.0, -7.0), 2.5);
+
+        let inner_frame = egui::Frame::NONE.inner_margin(egui::Margin { left: 14, right: 14, top: 8, bottom: 8 });
+        inner_frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("SERVICE PANEL")
+                        .strong()
+                        .size(12.5)
+                        .color(Color32::from_rgb(242, 184, 96)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !self.sidebar_locked
+                        && ui.small_button("×").on_hover_text("Slide controls away").clicked()
+                    {
+                        self.sidebar_open = false;
+                        self.sidebar_dismissed = true;
+                        self.sidebar_hover_left = None;
+                    }
+                    let lock_text = if self.sidebar_locked {
+                        RichText::new("Locked open").color(Color32::WHITE).strong()
                     } else {
-                        "Lock the sidebar open beside the TV."
-                    })
-                    .clicked()
-                {
-                    self.set_sidebar_locked(!self.sidebar_locked);
+                        RichText::new("Lock open")
+                    };
+                    let lock_btn = egui::Button::new(lock_text).selected(self.sidebar_locked).small();
+                    if ui
+                        .add(lock_btn)
+                        .on_hover_text(if self.sidebar_locked {
+                            "Unlock so the sidebar auto-hides and slides in from the right edge."
+                        } else {
+                            "Lock the sidebar open beside the TV."
+                        })
+                        .clicked()
+                    {
+                        self.set_sidebar_locked(!self.sidebar_locked);
+                    }
+                });
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.add_space(2.0);
+                self.preset_controls(ui);
+                self.video_controls(ui);
+                self.controls(ui);
+                self.sound_controls(ui);
+                self.about_controls(ui);
+                if !self.message.is_empty() && self.message != "pick" && self.message != "pickvideo" {
+                    ui.colored_label(Color32::from_rgb(230, 120, 90), &self.message);
                 }
+                ui.add_space(8.0);
+                ui.label(RichText::new("Scroll on the screen to zoom into the phosphors, drag to pan, double-click to reset.").weak().small());
+                ui.add_space(12.0);
             });
         });
-        ui.separator();
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.add_space(2.0);
-            self.preset_controls(ui);
-            self.video_controls(ui);
-            self.controls(ui);
-            self.sound_controls(ui);
-            self.about_controls(ui);
-            if !self.message.is_empty() && self.message != "pick" && self.message != "pickvideo" {
-                ui.colored_label(Color32::from_rgb(230, 120, 90), &self.message);
-            }
-            ui.add_space(8.0);
-            ui.label(RichText::new("Scroll on the screen to zoom into the phosphors, drag to pan, double-click to reset.").weak().small());
-            ui.add_space(12.0);
-        });
     }
+}
+
+/// Paints a procedural 1970s faux walnut woodgrain finish inside `rect`.
+fn paint_wood_panel(painter: &egui::Painter, rect: egui::Rect, horizontal: bool) {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    painter.rect_filled(rect, 0.0, Color32::from_rgb(64, 38, 21));
+    let step = 2.0f32;
+    if horizontal {
+        let mut y = rect.top();
+        while y < rect.bottom() {
+            let h = step.min(rect.bottom() - y);
+            let t = y - rect.top();
+            let g = 0.5
+                + 0.30 * (t * 0.27 + (t * 0.07).sin() * 1.4).sin()
+                + 0.14 * (t * 0.71).cos()
+                + 0.06 * (t * 1.53).sin();
+            let v = (y - rect.top()) / rect.height().max(1.0);
+            let sheen = 1.08 - 0.24 * v;
+            let r = ((44.0 + 50.0 * g) * sheen).clamp(0.0, 255.0) as u8;
+            let gr = ((24.0 + 30.0 * g) * sheen).clamp(0.0, 255.0) as u8;
+            let b = ((12.0 + 16.0 * g) * sheen).clamp(0.0, 255.0) as u8;
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(rect.width(), h)),
+                0.0,
+                Color32::from_rgb(r, gr, b),
+            );
+            y += step;
+        }
+    } else {
+        let mut x = rect.left();
+        while x < rect.right() {
+            let w = step.min(rect.right() - x);
+            let t = x - rect.left();
+            let g = 0.5
+                + 0.32 * (t * 0.31 + (t * 0.09).sin() * 1.3).sin()
+                + 0.12 * (t * 0.79).cos()
+                + 0.06 * (t * 1.61).sin();
+            let r = (42.0 + 48.0 * g).clamp(0.0, 255.0) as u8;
+            let gr = (23.0 + 29.0 * g).clamp(0.0, 255.0) as u8;
+            let b = (11.0 + 15.0 * g).clamp(0.0, 255.0) as u8;
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height())),
+                0.0,
+                Color32::from_rgb(r, gr, b),
+            );
+            x += step;
+        }
+    }
+    // Lacquer top highlight and recessed bottom edge
+    painter.line_segment(
+        [rect.left_top() + egui::vec2(0.0, 0.5), rect.right_top() + egui::vec2(0.0, 0.5)],
+        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(245, 200, 145, 38)),
+    );
+    painter.line_segment(
+        [rect.left_bottom() - egui::vec2(0.0, 0.5), rect.right_bottom() - egui::vec2(0.0, 0.5)],
+        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 140)),
+    );
+}
+
+/// Paints a brushed dark gunmetal / anodized aluminum receiver faceplate inside `rect`.
+fn paint_brushed_metal(painter: &egui::Painter, rect: egui::Rect) {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    painter.rect_filled(rect, 2.0, Color32::from_rgb(38, 36, 33));
+    let bands = 10usize;
+    let bh = rect.height() / bands as f32;
+    for i in 0..bands {
+        let t = i as f32 / (bands - 1).max(1) as f32;
+        // Subtle metallic satin reflection across the faceplate height
+        let luma = 47.0 - 15.0 * t + 5.0 * (t * std::f32::consts::PI * 2.0).sin();
+        let col = Color32::from_rgb(luma as u8, (luma * 0.96) as u8, (luma * 0.90) as u8);
+        let y0 = rect.top() + i as f32 * bh;
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(rect.left(), y0), egui::vec2(rect.width(), bh + 0.5)),
+            0.0,
+            col,
+        );
+    }
+    // Fine horizontal hairline brush striations
+    let mut y = rect.top() + 1.0;
+    let mut idx = 0u32;
+    while y < rect.bottom() - 1.0 {
+        let col = if idx % 3 == 0 {
+            Color32::from_rgba_unmultiplied(255, 246, 228, 7)
+        } else {
+            Color32::from_rgba_unmultiplied(0, 0, 0, 12)
+        };
+        painter.line_segment([egui::pos2(rect.left() + 1.0, y), egui::pos2(rect.right() - 1.0, y)], egui::Stroke::new(1.0, col));
+        y += 2.0;
+        idx += 1;
+    }
+    // Top specular metal bevel and bottom shadow
+    painter.line_segment(
+        [rect.left_top() + egui::vec2(1.0, 1.0), rect.right_top() + egui::vec2(-1.0, 1.0)],
+        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 245, 224, 34)),
+    );
+    painter.line_segment(
+        [rect.left_bottom() + egui::vec2(1.0, -1.0), rect.right_bottom() + egui::vec2(-1.0, -1.0)],
+        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 120)),
+    );
+}
+
+/// Paints a small vintage slotted brushed-steel faceplate screw.
+fn paint_screw(painter: &egui::Painter, center: egui::Pos2, r: f32) {
+    painter.circle_filled(center, r + 0.8, Color32::from_rgba_unmultiplied(0, 0, 0, 150));
+    painter.circle_filled(center, r, Color32::from_rgb(112, 106, 96));
+    painter.circle_stroke(center, r, egui::Stroke::new(0.7, Color32::from_rgb(168, 158, 140)));
+    let d = r * 0.65;
+    painter.line_segment(
+        [center + egui::vec2(-d, -d * 0.6), center + egui::vec2(d, d * 0.6)],
+        egui::Stroke::new(1.0, Color32::from_rgb(28, 26, 24)),
+    );
+}
+
+/// Draws the retro ViCTR brushed-metal nameplate logo with miniature glowing CRT emblem.
+fn draw_victr_logo(ui: &mut egui::Ui) {
+    let badge_size = egui::vec2(182.0, 26.0);
+    let (rect, resp) = ui.allocate_exact_size(badge_size, egui::Sense::hover());
+    let p = ui.painter();
+
+    // Recessed brushed-aluminum badge plate
+    p.rect_filled(rect, 3.0, Color32::from_rgb(26, 25, 23));
+    p.rect_filled(rect.shrink(1.0), 2.0, Color32::from_rgb(34, 32, 29));
+    p.rect_stroke(rect, 3.0, egui::Stroke::new(1.1, Color32::from_rgb(168, 152, 122)), egui::StrokeKind::Inside);
+    // Tiny mounting rivets
+    paint_screw(p, egui::pos2(rect.left() + 5.5, rect.center().y), 1.6);
+    paint_screw(p, egui::pos2(rect.right() - 5.5, rect.center().y), 1.6);
+
+    // Miniature glowing retro CRT emblem
+    let tv_rect = egui::Rect::from_min_size(egui::pos2(rect.left() + 12.0, rect.top() + 4.5), egui::vec2(22.0, 17.0));
+    p.rect_filled(tv_rect, 3.5, Color32::from_rgb(78, 46, 24));
+    p.rect_stroke(tv_rect, 3.5, egui::Stroke::new(0.9, Color32::from_rgb(190, 168, 128)), egui::StrokeKind::Inside);
+    let glass = tv_rect.shrink(2.3);
+    p.rect_filled(glass, 2.5, Color32::from_rgb(14, 24, 22));
+    // Glowing RGB / amber scanlines inside the mini tube
+    for (idx, col) in [
+        Color32::from_rgb(245, 110, 75),
+        Color32::from_rgb(110, 235, 150),
+        Color32::from_rgb(85, 195, 255),
+        Color32::from_rgb(248, 186, 86),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let y = glass.top() + 2.2 + idx as f32 * 2.7;
+        p.line_segment(
+            [egui::pos2(glass.left() + 1.5, y), egui::pos2(glass.right() - 1.5, y)],
+            egui::Stroke::new(1.3, *col),
+        );
+    }
+    // Tiny glass glint
+    p.circle_filled(glass.left_top() + egui::vec2(3.0, 2.5), 1.1, Color32::from_rgba_unmultiplied(255, 255, 255, 160));
+
+    // "ViCTR" metallic + amber-gold retro logotype
+    let vi_pos = egui::pos2(tv_rect.right() + 6.0, rect.center().y - 0.5);
+    let vi_galley = p.layout_no_wrap("Vi".into(), egui::FontId::proportional(15.5), Color32::from_rgb(232, 224, 206));
+    let vi_w = vi_galley.size().x;
+    p.galley(egui::pos2(vi_pos.x, rect.center().y - vi_galley.size().y * 0.5 - 1.0), vi_galley, Color32::WHITE);
+
+    let ctr_galley = p.layout_no_wrap("CTR".into(), egui::FontId::proportional(15.5), Color32::from_rgb(246, 178, 74));
+    let ctr_w = ctr_galley.size().x;
+    p.galley(egui::pos2(vi_pos.x + vi_w - 0.5, rect.center().y - ctr_galley.size().y * 0.5 - 1.0), ctr_galley, Color32::WHITE);
+
+    // Warm copper accent rule beneath logotype
+    let rule_y = rect.bottom() - 4.0;
+    p.line_segment(
+        [egui::pos2(vi_pos.x, rule_y), egui::pos2(vi_pos.x + vi_w + ctr_w, rule_y)],
+        egui::Stroke::new(1.2, Color32::from_rgb(212, 128, 48)),
+    );
+
+    // Vertical divider + stacked "VIRTUAL CRT / TV RECEIVER" engraved caption
+    let div_x = vi_pos.x + vi_w + ctr_w + 6.0;
+    p.line_segment(
+        [egui::pos2(div_x, rect.top() + 5.0), egui::pos2(div_x, rect.bottom() - 5.0)],
+        egui::Stroke::new(0.9, Color32::from_rgb(104, 96, 84)),
+    );
+    p.text(
+        egui::pos2(div_x + 5.0, rect.top() + 8.5),
+        egui::Align2::LEFT_CENTER,
+        "VIRTUAL CRT",
+        egui::FontId::monospace(7.5),
+        Color32::from_rgb(188, 176, 152),
+    );
+    p.text(
+        egui::pos2(div_x + 5.0, rect.bottom() - 8.5),
+        egui::Align2::LEFT_CENTER,
+        "TV RECEIVER",
+        egui::FontId::monospace(7.5),
+        Color32::from_rgb(154, 144, 126),
+    );
+
+    resp.on_hover_text("ViCTR — Virtual CRT Television Receiver");
 }
 
 fn sl(ui: &mut egui::Ui, v: &mut f32, r: std::ops::RangeInclusive<f32>, label: &str, tip: &str) -> egui::Response {
@@ -1039,10 +1270,22 @@ fn sl(ui: &mut egui::Ui, v: &mut f32, r: std::ops::RangeInclusive<f32>, label: &
 }
 
 fn lamp(ui: &mut egui::Ui, on: bool, label: &str, tip: &str) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-    let c = if on { Color32::from_rgb(80, 220, 110) } else { Color32::from_rgb(220, 70, 50) };
-    ui.painter().circle_filled(rect.center(), 4.5, c);
-    ui.label(RichText::new(label).small()).on_hover_text(tip);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    let c = rect.center();
+    let p = ui.painter();
+    // Recessed chrome LED bezel
+    p.circle_filled(c, 5.5, Color32::from_rgb(96, 90, 80));
+    p.circle_filled(c, 4.4, Color32::from_rgb(18, 16, 15));
+    let (core, halo) = if on {
+        (Color32::from_rgb(76, 236, 124), Color32::from_rgba_unmultiplied(76, 236, 124, 58))
+    } else {
+        (Color32::from_rgb(228, 66, 48), Color32::from_rgba_unmultiplied(228, 66, 48, 48))
+    };
+    p.circle_filled(c, 6.2, halo);
+    p.circle_filled(c, 3.6, core);
+    // Tiny jeweled glass highlight
+    p.circle_filled(c + egui::vec2(-1.1, -1.1), 1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 195));
+    ui.label(RichText::new(label).small().color(Color32::from_rgb(218, 208, 188))).on_hover_text(tip);
 }
 
 impl eframe::App for CrtApp {
@@ -1142,102 +1385,155 @@ impl eframe::App for CrtApp {
 
         let mut go_fullscreen = false;
         if !self.fullscreen {
-            egui::Panel::top("top").show(ui, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("PHOSPHOR LAB").strong().size(17.0).color(Color32::from_rgb(235, 170, 90)));
-                    ui.label(RichText::new("physical CRT simulator").weak());
-                    ui.separator();
-                    let label = if self.sim.power_on { "Power off" } else { "Power on" };
-                    if ui.button(label).clicked() {
-                        let on = !self.sim.power_on;
-                        self.sim.set_power(on);
-                    }
-                    if ui
-                        .button("Degauss")
-                        .on_hover_text("Fire the perimeter degaussing coil: clears magnetisation with the classic AC magnetic warp and colour rings.")
-                        .clicked()
-                    {
-                        self.sim.degauss();
-                        if self.s.magnetization > 0.0 {
-                            self.degauss_mag_start = Some(self.s.magnetization);
-                        }
-                    }
-                    ui.separator();
-                    ui.label("Preset");
-                    let mut sel = self.preset_sel;
-                    let selected_label = self.current_preset_label();
-                    egui::ComboBox::from_id_salt("preset")
-                        .selected_text(selected_label)
-                        .width(190.0)
-                        .show_ui(ui, |ui| {
-                            for (i, n) in settings::PRESETS.iter().enumerate() {
-                                ui.selectable_value(&mut sel, PresetSel::BuiltIn(i), *n);
-                            }
-                            if !self.user_presets.is_empty() {
-                                ui.separator();
-                                ui.label(RichText::new("Saved presets").weak().small());
-                                for (i, p) in self.user_presets.iter().enumerate() {
-                                    ui.selectable_value(&mut sel, PresetSel::User(i), &p.name);
-                                }
-                            }
-                        });
-                    if sel != self.preset_sel {
-                        self.apply_preset(sel);
-                    }
-                    if ui
-                        .button("Save…")
-                        .on_hover_text("Save the current CRT settings as a new preset.")
-                        .clicked()
-                    {
-                        self.open_save_preset_dialog();
-                    }
-                    if ui.button("Reset view").clicked() {
-                        self.zoom = 1.0;
-                        self.pan = [0.0, 0.0];
-                        self.reset_trails = true;
-                    }
-                    if ui.button("Fullscreen").on_hover_text("Just the TV, no settings (F11). Press F11 or Esc to come back.").clicked() {
-                        go_fullscreen = true;
-                    }
-                    ui.separator();
-                    lamp(ui, self.sim.h_locked, "H lock", "Line oscillator locked to the incoming sync.");
-                    lamp(ui, self.sim.v_locked, "V lock", "Field oscillator locked (picture not rolling).");
-                    lamp(ui, self.sim.color_on, "Colour", "Colour killer off: colour is being decoded.");
-                    ui.label(RichText::new(format!("SNR {:.0} dB", self.sim.snr_db)).small().monospace());
-                    ui.label(RichText::new(format!("{:.0} fps", self.fps)).small().weak().monospace());
-                    ui.label(RichText::new(format!("zoom {:.1}×", self.zoom)).small().weak().monospace());
+            egui::Panel::top("top")
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(0, 0)))
+                .show(ui, |ui| {
+                    let bar_rect = ui.max_rect();
+                    // Outer faux walnut woodgrain fascia with inset brushed-metal receiver control deck
+                    paint_wood_panel(ui.painter(), bar_rect, true);
+                    let deck_rect = bar_rect.shrink2(egui::vec2(10.0, 4.0));
+                    paint_brushed_metal(ui.painter(), deck_rect);
+                    ui.painter().rect_stroke(
+                        deck_rect,
+                        2.0,
+                        egui::Stroke::new(1.0, Color32::from_rgb(146, 134, 112)),
+                        egui::StrokeKind::Inside,
+                    );
+                    paint_screw(ui.painter(), egui::pos2(deck_rect.left() + 5.5, deck_rect.center().y), 2.0);
+                    paint_screw(ui.painter(), egui::pos2(deck_rect.right() - 5.5, deck_rect.center().y), 2.0);
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let active = self.sidebar_locked || self.sidebar_open;
-                        let btn_label = if self.sidebar_locked {
-                            RichText::new("Controls (locked)").color(Color32::WHITE).strong()
-                        } else if self.sidebar_open {
-                            RichText::new("Controls >").color(Color32::WHITE)
-                        } else {
-                            RichText::new("< Controls")
-                        };
-                        let btn = egui::Button::new(btn_label).selected(active);
-                        if ui
-                            .add(btn)
-                            .on_hover_text("Open or hide the right-side controls drawer (hover the right edge to slide it in, or lock it open inside).")
-                            .clicked()
-                        {
-                            if self.sidebar_locked {
-                                self.set_sidebar_locked(false);
-                            } else {
-                                self.sidebar_open = !self.sidebar_open;
-                                self.sidebar_dismissed = !self.sidebar_open;
-                                self.sidebar_hover_left = None;
-                            }
-                        }
-                    });
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin { left: 20, right: 20, top: 8, bottom: 8 })
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                draw_victr_logo(ui);
+                                ui.separator();
+                                let pwr_label = if self.sim.power_on {
+                                    RichText::new("Power").color(Color32::WHITE).strong()
+                                } else {
+                                    RichText::new("Power off").color(Color32::from_rgb(210, 140, 120))
+                                };
+                                if ui
+                                    .add(egui::Button::new(pwr_label).selected(self.sim.power_on))
+                                    .on_hover_text("Toggle main TV receiver power (with CRT warm-up & collapse)")
+                                    .clicked()
+                                {
+                                    let on = !self.sim.power_on;
+                                    self.sim.set_power(on);
+                                }
+                                if ui
+                                    .button("Degauss")
+                                    .on_hover_text("Fire the perimeter degaussing coil: clears magnetisation with the classic AC magnetic warp and colour rings.")
+                                    .clicked()
+                                {
+                                    self.sim.degauss();
+                                    if self.s.magnetization > 0.0 {
+                                        self.degauss_mag_start = Some(self.s.magnetization);
+                                    }
+                                }
+                                ui.separator();
+                                ui.label(RichText::new("Preset").color(Color32::from_rgb(210, 198, 176)).small());
+                                let mut sel = self.preset_sel;
+                                let selected_label = self.current_preset_label();
+                                egui::ComboBox::from_id_salt("preset")
+                                    .selected_text(selected_label)
+                                    .width(182.0)
+                                    .show_ui(ui, |ui| {
+                                        for (i, n) in settings::PRESETS.iter().enumerate() {
+                                            ui.selectable_value(&mut sel, PresetSel::BuiltIn(i), *n);
+                                        }
+                                        if !self.user_presets.is_empty() {
+                                            ui.separator();
+                                            ui.label(RichText::new("Saved presets").weak().small());
+                                            for (i, p) in self.user_presets.iter().enumerate() {
+                                                ui.selectable_value(&mut sel, PresetSel::User(i), &p.name);
+                                            }
+                                        }
+                                    });
+                                if sel != self.preset_sel {
+                                    self.apply_preset(sel);
+                                }
+                                if ui
+                                    .button("Save…")
+                                    .on_hover_text("Save the current CRT settings as a new preset.")
+                                    .clicked()
+                                {
+                                    self.open_save_preset_dialog();
+                                }
+                                if ui.button("Reset view").clicked() {
+                                    self.zoom = 1.0;
+                                    self.pan = [0.0, 0.0];
+                                    self.reset_trails = true;
+                                }
+                                if ui.button("Fullscreen").on_hover_text("Just the TV, no settings (F11). Press F11 or Esc to come back.").clicked() {
+                                    go_fullscreen = true;
+                                }
+                                ui.separator();
+                                lamp(ui, self.sim.h_locked, "H", "Line oscillator locked to the incoming sync.");
+                                lamp(ui, self.sim.v_locked, "V", "Field oscillator locked (picture not rolling).");
+                                lamp(ui, self.sim.color_on, "CLR", "Colour killer off: colour is being decoded.");
+
+                                // Recessed vacuum-fluorescent telemetry readout window
+                                egui::Frame::new()
+                                    .fill(Color32::from_rgb(13, 17, 15))
+                                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(98, 90, 78)))
+                                    .corner_radius(3.0)
+                                    .inner_margin(egui::Margin::symmetric(7, 2))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 7.0;
+                                            ui.label(
+                                                RichText::new(format!("SNR {:>2.0}dB", self.sim.snr_db))
+                                                    .small()
+                                                    .monospace()
+                                                    .color(Color32::from_rgb(112, 236, 184)),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!("{:>3.0}fps", self.fps))
+                                                    .small()
+                                                    .monospace()
+                                                    .color(Color32::from_rgb(232, 186, 102)),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!("{:.1}×", self.zoom))
+                                                    .small()
+                                                    .monospace()
+                                                    .color(Color32::from_rgb(206, 174, 118)),
+                                            );
+                                        });
+                                    });
+
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let active = self.sidebar_locked || self.sidebar_open;
+                                    let btn_label = if self.sidebar_locked {
+                                        RichText::new("Controls (locked)").color(Color32::WHITE).strong()
+                                    } else if self.sidebar_open {
+                                        RichText::new("Controls >").color(Color32::WHITE)
+                                    } else {
+                                        RichText::new("< Controls")
+                                    };
+                                    let btn = egui::Button::new(btn_label).selected(active);
+                                    if ui
+                                        .add(btn)
+                                        .on_hover_text("Open or hide the right-side controls drawer (hover the right edge to slide it in, or lock it open inside).")
+                                        .clicked()
+                                    {
+                                        if self.sidebar_locked {
+                                            self.set_sidebar_locked(false);
+                                        } else {
+                                            self.sidebar_open = !self.sidebar_open;
+                                            self.sidebar_dismissed = !self.sidebar_open;
+                                            self.sidebar_hover_left = None;
+                                        }
+                                    }
+                                });
+                            });
+                        });
                 });
-                ui.add_space(2.0);
-            });
 
             if self.sidebar_locked {
                 let panel_resp = egui::Panel::right("controls_docked")
+                    .frame(egui::Frame::NONE)
                     .resizable(true)
                     .default_size(self.sidebar_width)
                     .size_range(300.0..=560.0)
@@ -1483,10 +1779,10 @@ impl eframe::App for CrtApp {
             let eased = 1.0 - (1.0 - self.sidebar_anim).powi(3);
             let drawer_x = central_rect.right() - drawer_w * eased;
 
-            // Sleek edge pull-tab when the drawer is tucked away (or sliding)
+            // Tactile retro walnut & brushed-metal pull-tab when the drawer is tucked away
             if self.sidebar_anim < 0.85 {
-                let tab_w = 22.0;
-                let tab_h = 84.0;
+                let tab_w = 24.0;
+                let tab_h = 92.0;
                 let tab_pos = egui::pos2((drawer_x - tab_w).max(central_rect.left()), central_rect.center().y - tab_h * 0.5);
                 egui::Area::new(egui::Id::unique("controls_pull_tab"))
                     .order(egui::Order::Foreground)
@@ -1495,21 +1791,40 @@ impl eframe::App for CrtApp {
                     .show(&ctx, |ui| {
                         let (rect, resp) = ui.allocate_exact_size(egui::vec2(tab_w, tab_h), egui::Sense::click());
                         let hot = resp.hovered();
-                        let bg = if hot {
-                            Color32::from_rgba_unmultiplied(46, 42, 38, 235)
+                        let rounding = egui::CornerRadius { nw: 7, sw: 7, ne: 0, se: 0 };
+                        // Faux walnut outer tab rim
+                        let wood_bg = if hot {
+                            Color32::from_rgb(92, 54, 30)
                         } else {
-                            Color32::from_rgba_unmultiplied(24, 24, 27, 200)
+                            Color32::from_rgb(66, 39, 21)
                         };
                         let stroke = if hot {
-                            Color32::from_rgb(215, 145, 70)
+                            Color32::from_rgb(232, 168, 86)
                         } else {
-                            Color32::from_rgb(68, 66, 64)
+                            Color32::from_rgb(142, 128, 106)
                         };
-                        let rounding = egui::CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 };
-                        ui.painter().rect_filled(rect, rounding, bg);
-                        ui.painter().rect_stroke(rect, rounding, egui::Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
-                        let c = rect.center();
-                        let arrow_col = if hot { Color32::from_rgb(240, 175, 95) } else { Color32::from_gray(195) };
+                        ui.painter().rect_filled(rect, rounding, wood_bg);
+                        // Inset brushed-metal grip plate
+                        let plate = egui::Rect::from_min_max(
+                            rect.min + egui::vec2(3.0, 4.0),
+                            rect.max - egui::vec2(0.0, 4.0),
+                        );
+                        ui.painter().rect_filled(
+                            plate,
+                            egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 },
+                            if hot { Color32::from_rgb(56, 52, 46) } else { Color32::from_rgb(40, 38, 35) },
+                        );
+                        ui.painter().rect_stroke(rect, rounding, egui::Stroke::new(1.1, stroke), egui::StrokeKind::Inside);
+                        let c = plate.center();
+                        // Subtle knurled metal grip ridges above & below chevron
+                        let ridge_col = Color32::from_rgb(112, 104, 90);
+                        for &dy in &[-24.0f32, -19.0, 19.0, 24.0] {
+                            ui.painter().line_segment(
+                                [egui::pos2(plate.left() + 4.0, c.y + dy), egui::pos2(plate.right() - 4.0, c.y + dy)],
+                                egui::Stroke::new(1.0, ridge_col),
+                            );
+                        }
+                        let arrow_col = if hot { Color32::from_rgb(248, 186, 92) } else { Color32::from_rgb(214, 200, 176) };
                         let arrow_stroke = egui::Stroke::new(2.0, arrow_col);
                         ui.painter().line_segment([c + egui::vec2(3.0, -6.0), c + egui::vec2(-3.0, 0.0)], arrow_stroke);
                         ui.painter().line_segment([c + egui::vec2(-3.0, 0.0), c + egui::vec2(3.0, 6.0)], arrow_stroke);
@@ -1517,7 +1832,7 @@ impl eframe::App for CrtApp {
                             self.sidebar_open = true;
                             self.sidebar_hover_left = None;
                         }
-                        if resp.on_hover_text("Slide out controls").clicked() {
+                        if resp.on_hover_text("Slide out service panel").clicked() {
                             self.sidebar_open = true;
                             self.sidebar_dismissed = false;
                             self.sidebar_hover_left = None;
@@ -1533,7 +1848,7 @@ impl eframe::App for CrtApp {
                 for i in 0..6 {
                     let w = 4.0;
                     let x0 = drawer_rect.left() - (i as f32 + 1.0) * w;
-                    let alpha = ((6 - i) as f32 * 14.0 * eased) as u8;
+                    let alpha = ((6 - i) as f32 * 15.0 * eased) as u8;
                     shadow_layer.rect_filled(
                         egui::Rect::from_min_size(egui::pos2(x0, drawer_rect.top()), egui::vec2(w, drawer_rect.height())),
                         0.0,
@@ -1563,13 +1878,9 @@ impl eframe::App for CrtApp {
                     .interactable(true)
                     .show(&ctx, |ui| {
                         ui.set_clip_rect(central_rect);
-                        let frame = egui::Frame::new()
-                            .fill(Color32::from_rgba_unmultiplied(24, 24, 27, 246))
-                            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(56, 54, 52)))
-                            .inner_margin(egui::Margin::symmetric(10, 6));
-                        frame.show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(drawer_w - 20.0, central_rect.height() - 12.0));
-                            ui.set_max_size(egui::vec2(drawer_w - 20.0, central_rect.height() - 12.0));
+                        egui::Frame::NONE.show(ui, |ui| {
+                            ui.set_min_size(egui::vec2(drawer_w, central_rect.height()));
+                            ui.set_max_size(egui::vec2(drawer_w, central_rect.height()));
                             self.sidebar_contents(ui);
                         });
                     });

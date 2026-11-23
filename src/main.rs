@@ -68,10 +68,10 @@ fn main() -> eframe::Result<()> {
     }
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Phosphor Lab — CRT physics simulator")
+        .with_title("ViCTR — Virtual CRT Television Receiver")
         .with_inner_size([1440.0, 900.0])
         .with_min_inner_size([900.0, 600.0])
-        .with_app_id("phosphor-lab")
+        .with_app_id("victr")
         .with_icon(egui::IconData { rgba: about::icon_rgba(64), width: 64, height: 64 });
     if screenshot.is_some() {
         viewport = viewport.with_active(false);
@@ -96,7 +96,7 @@ fn main() -> eframe::Result<()> {
     }
 
     eframe::run_native(
-        "Phosphor Lab",
+        "ViCTR",
         options,
         Box::new(move |cc| {
             let shot = screenshot.is_some();

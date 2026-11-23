@@ -641,7 +641,7 @@ impl Settings {
         let clean_name = name.trim().replace(['\r', '\n'], " ");
         let mut out = String::with_capacity(2048);
         use std::fmt::Write;
-        let _ = writeln!(out, "# Phosphor Lab preset");
+        let _ = writeln!(out, "# ViCTR preset");
         let _ = writeln!(out, "name = {clean_name}");
         let _ = writeln!(out, "pattern = {}", self.pattern.as_key());
         let _ = writeln!(out, "flat_color = {}, {}, {}", self.flat_color[0], self.flat_color[1], self.flat_color[2]);
@@ -846,18 +846,18 @@ impl Settings {
 pub fn presets_dir() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        return std::env::var_os("APPDATA").map(|p| std::path::PathBuf::from(p).join("phosphor-lab").join("presets"));
+        return std::env::var_os("APPDATA").map(|p| std::path::PathBuf::from(p).join("victr").join("presets"));
     }
     #[cfg(target_os = "macos")]
     {
-        return std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join("Library/Application Support/phosphor-lab/presets"));
+        return std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join("Library/Application Support/victr/presets"));
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-            return Some(std::path::PathBuf::from(xdg).join("phosphor-lab").join("presets"));
+            return Some(std::path::PathBuf::from(xdg).join("victr").join("presets"));
         }
-        std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".config/phosphor-lab/presets"))
+        std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".config/victr/presets"))
     }
 }
 

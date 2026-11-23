@@ -1,9 +1,9 @@
 #!/bin/sh
-# Starts Phosphor Lab using the optimized release build, rebuilding if source changed.
-# Any arguments are passed through, e.g.:  ./phosphor-lab.sh --mpv video.mkv
+# Starts ViCTR using the optimized release build, rebuilding if source changed.
+# Any arguments are passed through, e.g.:  ./victr.sh --mpv video.mkv
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
 
-release=target/release/crt_sim
+release=target/release/victr
 stale=""
 if [ -x "$release" ]; then
     stale=$(find src Cargo.toml -newer "$release" 2>/dev/null | head -n 1)
@@ -19,4 +19,4 @@ fi
 if [ -x "$release" ]; then
     exec "$release" "$@"
 fi
-exec target/debug/crt_sim "$@"
+exec target/debug/victr "$@"

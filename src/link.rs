@@ -1,9 +1,9 @@
-//! Linking the person's own mpv to Phosphor Lab.
+//! Linking the user's own mpv to ViCTR.
 //!
 //! * `install_mpv_script` writes a small Lua script into mpv's scripts folder.
 //!   Pressing Ctrl+T in mpv then pauses mpv and sends the current file/URL and
-//!   position to Phosphor Lab (`crt_sim --mpv <path> --start <seconds>`).
-//! * When Phosphor Lab is already open, that second launch hands the request to
+//!   position to ViCTR (`victr --mpv <path> --start <seconds>`).
+//! * When ViCTR is already open, that second launch hands the request to
 //!   the running window over a local socket and exits, so you don't get two TVs.
 
 use std::path::{Path, PathBuf};
@@ -15,10 +15,10 @@ pub type Inbox = Arc<Mutex<Vec<(String, f64)>>>;
 fn socket_path() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-    base.join(format!("phosphor-lab-{user}.sock"))
+    base.join(format!("victr-{user}.sock"))
 }
 
-/// Hands `src` to an already-running Phosphor Lab. Returns true if one took it.
+/// Hands `src` to an already-running ViCTR. Returns true if one took it.
 #[cfg(unix)]
 pub fn forward_to_running(src: &str, start: f64) -> bool {
     forward_at(&socket_path(), src, start)
@@ -119,15 +119,15 @@ pub fn mpv_config_dirs() -> Vec<PathBuf> {
 pub fn script_text(exe: &Path) -> String {
     let exe = exe.to_string_lossy().replace("]]", "] ]");
     format!(
-        r#"-- Phosphor Lab: watch what mpv is playing on the simulated CRT.
--- Press Ctrl+T in mpv (rebind with: <key> script-binding send-to-phosphor-lab).
+        r#"-- ViCTR: watch what mpv is playing on the simulated CRT receiver.
+-- Press Ctrl+T in mpv (rebind with: <key> script-binding send-to-victr).
 local utils = require 'mp.utils'
 local APP = [[{exe}]]
 
 local function send()
     local path = mp.get_property("path")
     if not path then
-        mp.osd_message("Phosphor Lab: nothing is playing")
+        mp.osd_message("ViCTR: nothing is playing")
         return
     end
     if not path:find("://") and path:sub(1, 1) ~= "/" and not path:match("^%a:[\\/]") then
@@ -136,10 +136,10 @@ local function send()
     local pos = mp.get_property_number("time-pos") or 0
     mp.set_property_bool("pause", true)
     mp.commandv("run", APP, "--mpv", path, "--start", string.format("%.2f", pos))
-    mp.osd_message("Sent to Phosphor Lab")
+    mp.osd_message("Sent to ViCTR")
 end
 
-mp.add_key_binding("ctrl+t", "send-to-phosphor-lab", send)
+mp.add_key_binding("ctrl+t", "send-to-victr", send)
 "#
     )
 }
@@ -152,8 +152,8 @@ pub fn install_mpv_script() -> Result<Vec<PathBuf>, String> {
     let mut last_err = String::new();
     for dir in mpv_config_dirs() {
         let scripts = dir.join("scripts");
-        match std::fs::create_dir_all(&scripts).and_then(|_| std::fs::write(scripts.join("phosphor-lab.lua"), &text)) {
-            Ok(()) => written.push(scripts.join("phosphor-lab.lua")),
+        match std::fs::create_dir_all(&scripts).and_then(|_| std::fs::write(scripts.join("victr.lua"), &text)) {
+            Ok(()) => written.push(scripts.join("victr.lua")),
             Err(e) => last_err = format!("{}: {e}", scripts.display()),
         }
     }
@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn second_launch_hands_video_to_running_window() {
         // private socket in the temp folder, so a real running copy is never touched
-        let sock = std::env::temp_dir().join(format!("phosphor-link-test-{}.sock", std::process::id()));
+        let sock = std::env::temp_dir().join(format!("victr-link-test-{}.sock", std::process::id()));
         let inbox = listen_at(sock.clone(), eframe::egui::Context::default());
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(forward_at(&sock, "/videos/my clip.mkv", 83.5));
@@ -181,8 +181,8 @@ mod tests {
 
     #[test]
     fn script_mentions_app_and_binding() {
-        let t = script_text(Path::new("/home/me/Phosphor Lab/crt_sim"));
-        assert!(t.contains("local APP = [[/home/me/Phosphor Lab/crt_sim]]"));
+        let t = script_text(Path::new("/home/me/ViCTR/victr"));
+        assert!(t.contains("local APP = [[/home/me/ViCTR/victr]]"));
         assert!(t.contains("mp.add_key_binding(\"ctrl+t\""));
         assert!(t.contains("\"--start\""));
     }

@@ -1,8 +1,8 @@
 [package]
-name = "crt_sim"
+name = "victr"
 version = "0.1.0"
 edition = "2024"
-description = "Phosphor Lab — a physically based CRT television simulator with full NTSC signal chain, electron optics, phosphor persistence, rolling scan, and analog audio DSP."
+description = "ViCTR (Virtual CRT Television Receiver) — a physically based CRT simulator with full NTSC signal chain, electron optics, phosphor persistence, rolling scan, and analog audio DSP."
 license = "MIT"
 readme = "README.md"
 keywords = ["crt", "retro", "physics", "shader", "simulator"]
