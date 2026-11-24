@@ -201,6 +201,11 @@ impl Runtime {
         }
 
         let size = window.inner_size();
+        let monitor_hz = window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .map(|mh| mh as f32 / 1000.0);
+        app.set_monitor_hz(monitor_hz);
         let gpu = Gpu::new(
             &device,
             &queue,
@@ -258,6 +263,41 @@ impl Runtime {
         if size.width == 0 || size.height == 0 {
             return;
         }
+
+        // Reconfigure swapchain before acquiring if size or HDR mode changed.
+        let (cur_w, cur_h) = self.gpu.surface_size();
+        let want_hdr = self.app.want_hdr();
+        let prefer_pq = self.app.prefer_pq();
+        if self.needs_reconfigure
+            || cur_w != size.width
+            || cur_h != size.height
+            || want_hdr != self.gpu.want_hdr()
+            || prefer_pq != self.gpu.prefer_pq()
+        {
+            self.reconfigure(size.width, size.height, want_hdr, prefer_pq);
+        }
+
+        // Acquire the swapchain image FIRST (paces strictly to VSync) before stepping
+        // the CRT rolling-scan clock, so real_dt is exact VSync-to-VSync and no slice is ever dropped.
+        let surface_tex = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(tex) => tex,
+            wgpu::CurrentSurfaceTexture::Suboptimal(tex) => {
+                self.needs_reconfigure = true;
+                tex
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.needs_reconfigure = true;
+                self.window.request_redraw();
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => {
+                self.window.request_redraw();
+                return;
+            }
+        };
+
         self.app.sync_window_fullscreen(self.window.fullscreen().is_some());
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
@@ -267,6 +307,7 @@ impl Runtime {
         });
         let Some(out) = frame_out else {
             full_output.textures_delta.clear();
+            drop(surface_tex);
             return;
         };
 
@@ -282,18 +323,12 @@ impl Runtime {
         }
         if out.close_cmd {
             full_output.textures_delta.clear();
+            drop(surface_tex);
             event_loop.exit();
             return;
         }
-
-        let (cur_w, cur_h) = self.gpu.surface_size();
-        if self.needs_reconfigure
-            || cur_w != size.width
-            || cur_h != size.height
-            || out.want_hdr != self.gpu.want_hdr()
-            || out.prefer_pq != self.gpu.prefer_pq()
-        {
-            self.reconfigure(size.width, size.height, out.want_hdr, out.prefer_pq);
+        if out.want_hdr != self.gpu.want_hdr() || out.prefer_pq != self.gpu.prefer_pq() {
+            self.needs_reconfigure = true;
         }
 
         let ppp = full_output.pixels_per_point;
@@ -316,29 +351,6 @@ impl Runtime {
             (out.crt_rect.width() * ppp).round().max(4.0),
             (out.crt_rect.height() * ppp).round().max(4.0),
         ];
-
-        let surface_tex = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(tex) => tex,
-            wgpu::CurrentSurfaceTexture::Suboptimal(tex) => {
-                self.needs_reconfigure = true;
-                tex
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.needs_reconfigure = true;
-                for id in full_output.textures_delta.free.drain() {
-                    self.egui_renderer.free_texture(&id);
-                }
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => {
-                for id in full_output.textures_delta.free.drain() {
-                    self.egui_renderer.free_texture(&id);
-                }
-                return;
-            }
-        };
 
         let surface_view = surface_tex.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -384,6 +396,8 @@ impl Runtime {
 
         self.queue
             .submit(extra_cmds.into_iter().chain(std::iter::once(encoder.finish())));
+        // Notify winit right before present so Wayland attaches a vblank wl_surface::frame callback
+        self.window.pre_present_notify();
         self.queue.present(surface_tex);
 
         for id in full_output.textures_delta.free.drain() {
@@ -405,7 +419,11 @@ impl Runtime {
                 Err(e) => eprintln!("screenshot readback failed: {e}"),
             }
             event_loop.exit();
+            return;
         }
+
+        // Schedule exactly one next frame paced to the compositor's vblank
+        self.window.request_redraw();
     }
 }
 
@@ -450,23 +468,29 @@ impl ApplicationHandler for Host {
             WindowEvent::Moved(_) => {
                 rt.gpu.refresh_hdr_info(&rt.surface, &rt.adapter);
                 rt.app.set_hdr_status(rt.gpu.hdr_status());
+                let hz = rt
+                    .window
+                    .current_monitor()
+                    .and_then(|m| m.refresh_rate_millihertz())
+                    .map(|mh| mh as f32 / 1000.0);
+                rt.app.set_monitor_hz(hz);
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 let sz = rt.window.inner_size();
                 if sz.width > 0 && sz.height > 0 {
                     rt.reconfigure(sz.width, sz.height, rt.app.want_hdr(), rt.app.prefer_pq());
                 }
+                let hz = rt
+                    .window
+                    .current_monitor()
+                    .and_then(|m| m.refresh_rate_millihertz())
+                    .map(|mh| mh as f32 / 1000.0);
+                rt.app.set_monitor_hz(hz);
             }
             WindowEvent::RedrawRequested => {
                 rt.render(event_loop);
             }
             _ => {}
-        }
-    }
-
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(rt) = &self.rt {
-            rt.window.request_redraw();
         }
     }
 }
@@ -484,7 +508,7 @@ fn main() {
     }
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
     let mut host = Host { cli: Some(cli), rt: None };
     if let Err(e) = event_loop.run_app(&mut host) {
         eprintln!("event loop error: {e}");

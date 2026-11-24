@@ -347,6 +347,10 @@ impl CrtApp {
         self.fps
     }
 
+    pub fn set_monitor_hz(&mut self, hz: Option<f32>) {
+        self.scan_clock.set_monitor_hz(hz);
+    }
+
     /// Fullscreen = only the TV: the window fills the screen and the settings are hidden.
     fn set_fullscreen(&mut self, on: bool) {
         if on == self.fullscreen {
@@ -3162,9 +3166,14 @@ pub struct ScanClock {
     phase: f64,
     recent: std::collections::VecDeque<f32>,
     locked_hz: Option<f32>,
+    monitor_hz: Option<f32>,
 }
 
 impl ScanClock {
+    pub fn set_monitor_hz(&mut self, hz: Option<f32>) {
+        self.monitor_hz = hz.filter(|h| h.is_finite() && *h >= 24.0 && *h <= 1000.0);
+    }
+
     /// Returns (new field started, beam phase 0..1, slice width in fields, frame time).
     pub fn step(&mut self, real_dt: f32, slow: f32, forced_period: Option<f32>) -> (bool, f32, f32, f32) {
         let period = match forced_period {
@@ -3176,19 +3185,22 @@ impl ScanClock {
                         self.recent.pop_front();
                     }
                 }
-                if self.recent.is_empty() {
-                    1.0 / 60.0
+                if self.recent.len() < 8 {
+                    // Use the OS-reported monitor refresh rate immediately on startup
+                    1.0 / self.monitor_hz.unwrap_or(60.0)
                 } else {
                     // Trimmed mean of recent frame times (ignores dropped frames and
-                    // timing spikes), then snap to a standard refresh rate when close.
+                    // timing spikes), then snap to the monitor rate or a standard refresh rate.
                     let mut v: Vec<f32> = self.recent.iter().copied().collect();
                     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     let cut = v.len() / 10;
                     let keep = &v[cut..v.len() - cut];
                     let mean = keep.iter().sum::<f32>() / keep.len().max(1) as f32;
                     let est_hz = 1.0 / mean.clamp(1.0 / 1000.0, 0.1);
-                    const RATES: [f32; 16] =
-                        [50.0, 59.94, 60.0, 72.0, 75.0, 90.0, 100.0, 119.88, 120.0, 144.0, 165.0, 180.0, 200.0, 240.0, 360.0, 480.0];
+                    const RATES: [f32; 18] = [
+                        50.0, 59.94, 60.0, 72.0, 75.0, 90.0, 100.0, 119.88, 120.0, 138.0, 144.0, 165.0, 175.0, 180.0,
+                        200.0, 240.0, 360.0, 480.0,
+                    ];
                     // stay locked to the current standard rate unless timing clearly moved away
                     if let Some(l) = self.locked_hz {
                         if (est_hz / l - 1.0).abs() < 0.12 {
@@ -3198,6 +3210,14 @@ impl ScanClock {
                     }
                     let mut best = est_hz;
                     let mut best_err = 0.06;
+                    if let Some(mh) = self.monitor_hz {
+                        let e = (est_hz / mh - 1.0).abs();
+                        if e < best_err {
+                            best_err = e;
+                            best = mh;
+                            self.locked_hz = Some(mh);
+                        }
+                    }
                     for r in RATES {
                         let e = (est_hz / r - 1.0).abs();
                         if e < best_err {
@@ -3214,8 +3234,13 @@ impl ScanClock {
     }
 
     fn advance(&mut self, real_dt: f32, period: f32, slow: f32, forced: bool) -> (bool, f32, f32, f32) {
-        // whole refresh periods only (more than one after a dropped frame)
-        let steps = if forced { 1.0 } else { (real_dt / period).round().clamp(1.0, 8.0) };
+        // Whole refresh periods only: hold steady at 1 period across normal compositor
+        // jitter (up to 1.65x period), and catch up cleanly on genuine dropped frames.
+        let steps = if forced || real_dt < period * 1.65 {
+            1.0
+        } else {
+            (real_dt / period).round().clamp(1.0, 8.0)
+        };
         let frame_dt = steps * period;
         let adv = frame_dt as f64 * 59.94 / slow as f64;
         self.phase += adv;
