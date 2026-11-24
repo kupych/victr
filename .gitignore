@@ -3,7 +3,7 @@
 /.linker
 /.cargo/config.toml
 /shots
-/Phosphor Lab.desktop
+/*.desktop
 mpv-shot*.jpg
 mpv-shot*.png
 *.swp
