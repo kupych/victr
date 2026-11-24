@@ -7,98 +7,87 @@ use crate::settings::{Input, Settings, TapeSpeed};
 
 #[derive(Default, Clone, Debug)]
 struct ChaosState {
-    // Current live drift offsets (smoothly slew toward targets, snapped back on whack)
+    // Current live drift offsets (only realistic analog signal / sync / tape / supply faults)
+    signal_drop_db: f32,
+    noise: f32,
+    ghost: f32,
+    tracking: f32,
+    warble: f32,
     h_hold: f32,
     v_hold: f32,
-    tint_deg: f32,
-    color_drop: f32,
-    noise: f32,
     hum: f32,
-    v_size_sag: f32,
     ripple: f32,
-    conv_r: [f32; 2],
-    focus: f32,
     // Target fault offsets
+    t_signal_drop_db: f32,
+    t_noise: f32,
+    t_ghost: f32,
+    t_tracking: f32,
+    t_warble: f32,
     t_h_hold: f32,
     t_v_hold: f32,
-    t_tint_deg: f32,
-    t_color_drop: f32,
-    t_noise: f32,
     t_hum: f32,
-    t_v_size_sag: f32,
     t_ripple: f32,
-    t_conv_r: [f32; 2],
-    t_focus: f32,
-    // Countdown until the next cold-solder glitch
+    // Countdown until the next cold-solder / signal glitch
     next_glitch_s: f32,
     whack_streak: u8,
 }
 
 impl ChaosState {
     fn clear(&mut self) {
+        self.signal_drop_db = 0.0;
+        self.noise = 0.0;
+        self.ghost = 0.0;
+        self.tracking = 0.0;
+        self.warble = 0.0;
         self.h_hold = 0.0;
         self.v_hold = 0.0;
-        self.tint_deg = 0.0;
-        self.color_drop = 0.0;
-        self.noise = 0.0;
         self.hum = 0.0;
-        self.v_size_sag = 0.0;
         self.ripple = 0.0;
-        self.conv_r = [0.0, 0.0];
-        self.focus = 0.0;
         self.clear_targets();
     }
 
     fn clear_targets(&mut self) {
+        self.t_signal_drop_db = 0.0;
+        self.t_noise = 0.0;
+        self.t_ghost = 0.0;
+        self.t_tracking = 0.0;
+        self.t_warble = 0.0;
         self.t_h_hold = 0.0;
         self.t_v_hold = 0.0;
-        self.t_tint_deg = 0.0;
-        self.t_color_drop = 0.0;
-        self.t_noise = 0.0;
         self.t_hum = 0.0;
-        self.t_v_size_sag = 0.0;
         self.t_ripple = 0.0;
-        self.t_conv_r = [0.0, 0.0];
-        self.t_focus = 0.0;
     }
 
     fn scale_all(&mut self, k: f32) {
+        self.signal_drop_db *= k;
+        self.noise *= k;
+        self.ghost *= k;
+        self.tracking *= k;
+        self.warble *= k;
         self.h_hold *= k;
         self.v_hold *= k;
-        self.tint_deg *= k;
-        self.color_drop *= k;
-        self.noise *= k;
         self.hum *= k;
-        self.v_size_sag *= k;
         self.ripple *= k;
-        self.conv_r[0] *= k;
-        self.conv_r[1] *= k;
-        self.focus *= k;
+        self.t_signal_drop_db *= k;
+        self.t_noise *= k;
+        self.t_ghost *= k;
+        self.t_tracking *= k;
+        self.t_warble *= k;
         self.t_h_hold *= k;
         self.t_v_hold *= k;
-        self.t_tint_deg *= k;
-        self.t_color_drop *= k;
-        self.t_noise *= k;
         self.t_hum *= k;
-        self.t_v_size_sag *= k;
         self.t_ripple *= k;
-        self.t_conv_r[0] *= k;
-        self.t_conv_r[1] *= k;
-        self.t_focus *= k;
     }
 
     fn active_faults(&self) -> Vec<&'static str> {
         let mut f = Vec::new();
+        if self.signal_drop_db > 3.0 || self.noise > 0.018 { f.push("weak signal / snow"); }
+        if self.ghost.abs() > 0.06 { f.push("multipath ghost"); }
+        if self.tracking.abs() > 0.06 { f.push("tracking drift"); }
+        if self.warble > 0.08 { f.push("timebase warble"); }
         if self.v_hold.abs() > 0.015 { f.push("V-hold roll"); }
         if self.h_hold.abs() > 0.025 { f.push("H-hold tear"); }
-        if self.tint_deg.abs() > 6.0 { f.push("tint drift"); }
-        if self.color_drop > 0.15 { f.push("colour drop"); }
-        if self.noise > 0.02 { f.push("loose antenna"); }
-        if self.hum > 0.08 { f.push("hum bar"); }
-        if self.v_size_sag > 0.03 { f.push("vertical sag"); }
-        if self.ripple > 0.12 { f.push("cap ripple"); }
-        if self.conv_r[0].abs() + self.conv_r[1].abs() > 0.25 { f.push("convergence slip"); }
-        if self.focus > 0.12 { f.push("focus drift"); }
+        if self.hum > 0.08 || self.ripple > 0.12 { f.push("hum / supply ripple"); }
         f
     }
 }
@@ -212,26 +201,37 @@ impl Sim {
         self.chaos.active_faults()
     }
 
-    fn step_chaos(&mut self, enabled: bool, rate: f32, dt: f32) {
+    /// Live chaos offsets for synchronized audio DSP (signal_drop_db, noise, ghost, tracking, warble, hum, ripple).
+    pub fn chaos_audio_offsets(&self) -> (f32, f32, f32, f32, f32, f32, f32) {
+        (
+            self.chaos.signal_drop_db,
+            self.chaos.noise,
+            self.chaos.ghost,
+            self.chaos.tracking,
+            self.chaos.warble,
+            self.chaos.hum,
+            self.chaos.ripple,
+        )
+    }
+
+    fn step_chaos(&mut self, s: &Settings, enabled: bool, dt: f32) {
         if !enabled {
             self.chaos.clear();
             self.chaos.next_glitch_s = 8.0;
             return;
         }
-        let rate = rate.clamp(0.1, 2.0);
-        // Smoothly drift live values toward their fault targets (like warming cold solder joints)
+        let rate = s.chaos_rate.clamp(0.1, 2.0);
+        // Smoothly drift live values toward their fault targets
         let slew = (dt * 0.65).min(1.0);
+        self.chaos.signal_drop_db += (self.chaos.t_signal_drop_db - self.chaos.signal_drop_db) * slew;
+        self.chaos.noise += (self.chaos.t_noise - self.chaos.noise) * slew;
+        self.chaos.ghost += (self.chaos.t_ghost - self.chaos.ghost) * slew;
+        self.chaos.tracking += (self.chaos.t_tracking - self.chaos.tracking) * slew;
+        self.chaos.warble += (self.chaos.t_warble - self.chaos.warble) * slew;
         self.chaos.h_hold += (self.chaos.t_h_hold - self.chaos.h_hold) * slew;
         self.chaos.v_hold += (self.chaos.t_v_hold - self.chaos.v_hold) * slew;
-        self.chaos.tint_deg += (self.chaos.t_tint_deg - self.chaos.tint_deg) * slew;
-        self.chaos.color_drop += (self.chaos.t_color_drop - self.chaos.color_drop) * slew;
-        self.chaos.noise += (self.chaos.t_noise - self.chaos.noise) * slew;
         self.chaos.hum += (self.chaos.t_hum - self.chaos.hum) * slew;
-        self.chaos.v_size_sag += (self.chaos.t_v_size_sag - self.chaos.v_size_sag) * slew;
         self.chaos.ripple += (self.chaos.t_ripple - self.chaos.ripple) * slew;
-        self.chaos.conv_r[0] += (self.chaos.t_conv_r[0] - self.chaos.conv_r[0]) * slew;
-        self.chaos.conv_r[1] += (self.chaos.t_conv_r[1] - self.chaos.conv_r[1]) * slew;
-        self.chaos.focus += (self.chaos.t_focus - self.chaos.focus) * slew;
 
         self.chaos.next_glitch_s -= dt * rate;
         if self.chaos.next_glitch_s <= 0.0 {
@@ -242,21 +242,40 @@ impl Sim {
                 return;
             }
             let sign = if self.next() > 0.5 { 1.0 } else { -1.0 };
-            let pick = (self.next() * 8.0) as u32;
+            let pick = (self.next() * 6.0) as u32;
             match pick {
-                0 => self.chaos.t_v_hold = sign * (0.045 + 0.055 * self.next()),
-                1 => self.chaos.t_h_hold = sign * (0.06 + 0.08 * self.next()),
-                2 => self.chaos.t_tint_deg = sign * (24.0 + 32.0 * self.next()),
-                3 => self.chaos.t_color_drop = 0.65 + 0.35 * self.next(),
-                4 => self.chaos.t_noise = 0.05 + 0.09 * self.next(),
-                5 => self.chaos.t_v_size_sag = 0.09 + 0.14 * self.next(),
-                6 => {
-                    self.chaos.t_hum = 0.25 + 0.35 * self.next();
-                    self.chaos.t_ripple = 0.35 + 0.45 * self.next();
+                0 => {
+                    // Weak / loose antenna signal strength drop & snow
+                    self.chaos.t_signal_drop_db = 14.0 + 14.0 * self.next();
+                    self.chaos.t_noise = 0.045 + 0.085 * self.next();
+                }
+                1 => {
+                    // VCR tracking slip (when VCR on) or loose cable noise + slight multipath
+                    if s.vcr {
+                        self.chaos.t_tracking = sign * (0.18 + 0.24 * self.next());
+                    } else if s.input == Input::Rf {
+                        self.chaos.t_ghost = sign * (0.18 + 0.22 * self.next());
+                        self.chaos.t_signal_drop_db = 8.0 + 10.0 * self.next();
+                    } else {
+                        self.chaos.t_noise = 0.04 + 0.07 * self.next();
+                    }
+                }
+                2 => {
+                    // Timebase warble (tape wow/flutter or unstable sync lines)
+                    self.chaos.t_warble = 0.45 + 0.65 * self.next();
+                }
+                3 => {
+                    // Classic vertical hold slip (slow picture roll)
+                    self.chaos.t_v_hold = sign * (0.042 + 0.052 * self.next());
+                }
+                4 => {
+                    // Horizontal hold AFC slip (diagonal tearing)
+                    self.chaos.t_h_hold = sign * (0.055 + 0.075 * self.next());
                 }
                 _ => {
-                    self.chaos.t_conv_r = [sign * (0.8 + 0.7 * self.next()), -sign * (0.4 + 0.5 * self.next())];
-                    self.chaos.t_focus = 0.35 + 0.35 * self.next();
+                    // Mains hum bar + dried-out capacitor supply ripple warble
+                    self.chaos.t_hum = 0.22 + 0.34 * self.next();
+                    self.chaos.t_ripple = 0.35 + 0.50 * self.next();
                 }
             }
         }
@@ -291,7 +310,7 @@ impl Sim {
         self.degauss_t += real_dt.max(fdt);
         self.channel_switch_t += real_dt.max(fdt);
         self.whack_t += real_dt.max(fdt);
-        self.step_chaos(s.chaos && self.power_on, s.chaos_rate, real_dt.max(fdt));
+        self.step_chaos(s, s.chaos && self.power_on, real_dt.max(fdt));
 
         // Brief ~0.25s RF static burst + tuner sync hiccup when changing cable channels
         let ch_env = if self.channel_switch_t >= 0.0 && self.channel_switch_t < 0.26 {
@@ -315,7 +334,8 @@ impl Sim {
         };
 
         // ---- noise budget
-        let rf_sigma = if s.input == Input::Rf { 10f32.powf(-s.signal_db / 20.0) } else { 0.0 }
+        let eff_signal_db = (s.signal_db - self.chaos.signal_drop_db).max(-25.0);
+        let rf_sigma = if s.input == Input::Rf { 10f32.powf(-eff_signal_db / 20.0) } else { 0.0 }
             + 0.85 * ch_env
             + self.chaos.noise * 1.4
             + whack_pop;
@@ -351,7 +371,7 @@ impl Sim {
 
         // ---- VCR tracking band
         let track_err = if s.vcr {
-            s.tracking + 0.04 * s.tape_wear * (t * 0.31).sin()
+            s.tracking + self.chaos.tracking + 0.04 * s.tape_wear * (t * 0.31).sin()
         } else {
             0.0
         };
@@ -366,7 +386,7 @@ impl Sim {
         let k_afc = s.afc_speed.clamp(0.02, 1.0);
         let max_corr = 9.0;
         let mut err_acc = 0.0;
-        let jit = if s.vcr { s.timebase_jitter } else { 0.0 };
+        let jit = (if s.vcr { s.timebase_jitter } else { 0.0 }) + self.chaos.warble;
         let hs_line = 256.0;
         let mut v_jit = 0.0;
         for l in 0..NL as usize {
@@ -389,9 +409,11 @@ impl Sim {
             }
             // where the sync (and the picture) actually arrives on this line
             let mut e = 0.0f32;
-            if s.vcr {
+            if jit > 0.0 {
                 e += jit * (2.5 * (lf * 0.071 + t * 2.3).sin() + 1.2 * (lf * 0.29 + t * 6.1).sin());
                 e += jit * 0.6 * self.gauss();
+            }
+            if s.vcr {
                 if lf >= hs_line {
                     e += 16.0 * s.head_switch;
                 }
@@ -490,7 +512,7 @@ impl Sim {
         ];
         let cd = s.cutoff_drift;
         let cutoff = [0.035 * cd, -0.015 * cd, 0.05 * cd];
-        let focus = 1.0 + (s.focus_loss + self.chaos.focus) * 1.4;
+        let focus = 1.0 + s.focus_loss * 1.4;
         let focus3 = [focus * 1.03, focus, focus * 1.06];
 
         let decay_t = (s.persistence_ms.max(0.1)) / 1000.0;
@@ -544,7 +566,7 @@ impl Sim {
             input: s.input.id(),
             snow: rf_sigma,
             noise: extra_noise_eff,
-            ghost_amp: s.ghost_amp,
+            ghost_amp: (s.ghost_amp + self.chaos.ghost).clamp(-0.6, 0.6),
             ghost_delay: s.ghost_delay_us * fs,
             interf_amp: s.interference,
             interf_freq: s.interference_freq,
@@ -554,16 +576,16 @@ impl Sim {
             comb: s.comb_filter as i32,
             contrast: s.contrast,
             brightness: s.brightness * 0.3,
-            color: (s.color * (1.0 - self.chaos.color_drop)).max(0.0),
-            tint: (s.tint + self.chaos.tint_deg).to_radians(),
+            color: s.color,
+            tint: s.tint.to_radians(),
             sharp: s.sharpness,
             killer: if self.color_on { 0.0 } else { 1.0 },
             rx_chroma_sigma: gs(1.1),
             view,
             curv: s.curvature,
             corner: s.corner,
-            hsize: (s.h_size - self.chaos.v_size_sag * 0.25).max(0.5),
-            vsize: (s.v_size - self.chaos.v_size_sag).max(0.5),
+            hsize: s.h_size,
+            vsize: s.v_size,
             hpos: s.h_pos * 0.1 + shake + whack_x,
             vpos: s.v_pos * 0.1 + shake * 0.6 + whack_y,
             pin: s.pincushion,
@@ -572,10 +594,7 @@ impl Sim {
             field_shift: if interlaced { 0.5 * field as f32 } else { 0.0 },
             overscan: s.overscan,
             ripple: s.ripple + self.chaos.ripple,
-            conv_r: [
-                (s.conv_r[0] + self.chaos.conv_r[0]) * mm / 0.004,
-                (s.conv_r[1] + self.chaos.conv_r[1]) * mm / 0.004,
-            ],
+            conv_r: [s.conv_r[0] * mm / 0.004, s.conv_r[1] * mm / 0.004],
             conv_b: [s.conv_b[0] * mm / 0.004, s.conv_b[1] * mm / 0.004],
             conv_dyn: s.conv_dyn * mm / 0.004 / 1.77,
             spot: s.spot,

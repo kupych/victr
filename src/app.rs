@@ -1205,13 +1205,14 @@ impl CrtApp {
         p.channel_switch_t = self.sim.channel_switch_t;
         p.whack_t = self.sim.whack_t;
         p.test_tone = s.test_tone && s.pattern == Pattern::ColorBars;
+        let (c_sig_drop, c_noise, c_ghost, c_track, c_warble, c_hum, c_ripple) = self.sim.chaos_audio_offsets();
         p.rf = s.input == Input::Rf;
-        p.snr_db = s.signal_db;
+        p.snr_db = (s.signal_db - c_sig_drop).max(-25.0);
         p.fine_tune = s.fine_tune;
-        p.ghost = s.ghost_amp;
-        p.hum = s.hum;
+        p.ghost = (s.ghost_amp + c_ghost).clamp(-0.6, 0.6);
+        p.hum = (s.hum + c_hum).min(1.0);
         p.impulse = s.impulse;
-        p.extra_noise = s.extra_noise;
+        p.extra_noise = s.extra_noise + c_noise;
         p.vcr = s.vcr;
         let base_bw = match s.tape_speed {
             TapeSpeed::Sp => 10.0,
@@ -1220,12 +1221,12 @@ impl CrtApp {
         };
         p.tape_bw_khz = base_bw * (1.0 - 0.35 * s.tape_wear);
         p.tape_wear = s.tape_wear;
-        p.tracking = s.tracking;
+        p.tracking = (s.tracking + c_track).clamp(-1.0, 1.0);
         p.dropouts = s.dropouts;
-        p.wow = s.timebase_jitter;
+        p.wow = s.timebase_jitter + c_warble;
         p.head_switch = s.head_switch;
         p.age = (s.age_hours / 40000.0).clamp(0.0, 1.0);
-        p.ripple = s.ripple;
+        p.ripple = s.ripple + c_ripple;
     }
 
     fn sound_controls(&mut self, ui: &mut egui::Ui) {
@@ -1560,8 +1561,8 @@ impl CrtApp {
                 });
                 ui.separator();
                 let faults = self.sim.chaos_active_faults();
-                ui.checkbox(&mut s.chaos, "Chaos engine (chassis drift)")
-                    .on_hover_text("Novelty mode: cold solder joints & aging oscillators occasionally drift (V-hold roll, tint slip, hum, sag). Hit Whack! (or K) to knock it back into gear.");
+                ui.checkbox(&mut s.chaos, "Chaos engine (signal & sync drift)")
+                    .on_hover_text("Novelty mode: occasional weak signal/snow, multipath ghosting, VCR tracking drift, timebase warble, H/V-hold slip, or hum/ripple. Hit Whack! (or K) to knock it back into gear.");
                 ui.add_enabled_ui(s.chaos, |ui| {
                     sl(ui, &mut s.chaos_rate, 0.1..=2.0, "Drift frequency", "How often the old chassis acts up.");
                     ui.horizontal(|ui| {
