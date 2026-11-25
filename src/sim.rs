@@ -239,9 +239,9 @@ impl Sim {
         (ft, tr)
     }
 
-    /// Sets continuous VCR FF/RW picture-search speed (`0.0` = Play, `+4/+8` = FF, `-4/-8` = RW).
+    /// Sets continuous VCR FF/RW picture-search speed (`0.0` = Play, `±4/±8/±16/±32`).
     pub fn set_vcr_shuttle(&mut self, speed: f32) {
-        self.shuttle_target = speed.clamp(-10.0, 10.0);
+        self.shuttle_target = speed.clamp(-32.0, 32.0);
         if speed.abs() > 0.1 {
             self.shuttle_pulse = 0.0;
         }
@@ -276,7 +276,7 @@ impl Sim {
             (0.0, 0.0)
         } else {
             let intensity = ((a - 0.12) / 3.5).clamp(0.0, 1.0);
-            let speed_norm = (a / 8.0).clamp(0.0, 1.0);
+            let speed_norm = ((1.0 + a).ln() / 33.0f32.ln()).clamp(0.0, 1.0);
             (intensity, speed_norm)
         }
     }
@@ -493,14 +493,17 @@ impl Sim {
             self.shuttle_pulse
         };
         let sh_abs = sh_v.abs();
-        let sh_mag = if sh_abs > 0.12 { ((sh_abs - 0.12) / 4.2).clamp(0.0, 1.0) } else { 0.0 };
+        let sh_mag = if sh_abs > 0.12 { ((sh_abs - 0.12) / 5.5).clamp(0.0, 1.0) } else { 0.0 };
         let sh_dir = if sh_v >= 0.0 { 1.0 } else { -1.0 };
         if sh_mag > 0.0 {
-            // FF crawls upward (-phase), RW crawls downward (+phase) across the CRT raster
-            self.shuttle_phase = (self.shuttle_phase - sh_dir * (0.28 + 0.11 * sh_abs) * fdt).rem_euclid(1.0);
+            // FF crawls upward (-phase), RW crawls downward (+phase); scales smoothly up to 32x
+            let crawl = 0.28 + 0.34 * (1.0 + sh_abs).ln();
+            self.shuttle_phase = (self.shuttle_phase - sh_dir * crawl * fdt).rem_euclid(1.0);
         }
-        let sh_bars: usize = if sh_abs > 5.8 { 4 } else if sh_abs > 2.6 { 3 } else { 2 };
-        let sh_bar_half = 8.5 + 11.5 * sh_mag;
+        // Fewer, cleaner helical-scan noise bars so the picture stays readable:
+        // 1 crisp crawling bar for seeks & 4x, 2 bars for 8x-32x high-speed shuttle.
+        let sh_bars: usize = if sh_abs > 6.5 { 2 } else { 1 };
+        let sh_bar_half = 5.5 + 7.5 * sh_mag;
         let vcr_active = s.vcr || sh_mag > 0.01;
 
         // ---- VCR tracking band

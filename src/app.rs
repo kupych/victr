@@ -1579,6 +1579,22 @@ impl CrtApp {
         } else {
             self.osd.show_action("VIDEO INPUT");
         }
+        if let Some(p) = &self.player {
+            let (dur, paused) = {
+                let sh = p.shared.lock().unwrap();
+                (sh.duration, sh.paused)
+            };
+            if dur > 1.0 {
+                let lbl = if self.vcr_shuttle_speed != 0.0 {
+                    Self::vcr_shuttle_label(self.vcr_shuttle_speed)
+                } else if paused {
+                    "PAUSE ||"
+                } else {
+                    "PLAY >"
+                };
+                self.show_video_progress_osd(lbl, None);
+            }
+        }
     }
 
     fn pick_folder(&mut self) {
@@ -3319,26 +3335,68 @@ impl CrtApp {
         }
     }
 
+    fn vcr_shuttle_label(speed: f32) -> &'static str {
+        if speed >= 24.0 {
+            "FF >>>> 32X"
+        } else if speed >= 12.0 {
+            "FF >>> 16X"
+        } else if speed >= 6.0 {
+            "FF >>> 8X"
+        } else if speed > 0.1 {
+            "FF >> 4X"
+        } else if speed <= -24.0 {
+            "REW <<<< 32X"
+        } else if speed <= -12.0 {
+            "REW <<< 16X"
+        } else if speed <= -6.0 {
+            "REW <<< 8X"
+        } else if speed < -0.1 {
+            "REW << 4X"
+        } else {
+            "PLAY >"
+        }
+    }
+
+    fn show_video_progress_osd(&mut self, label: &str, override_pos: Option<f64>) {
+        if let Some(p) = &self.player {
+            let (pos, dur) = {
+                let sh = p.shared.lock().unwrap();
+                (sh.pos, sh.duration)
+            };
+            let p_eff = override_pos.unwrap_or(pos).clamp(0.0, if dur > 0.0 { dur } else { f64::MAX });
+            self.osd.show_progress(label, p_eff, dur);
+        }
+    }
+
     fn set_vcr_shuttle(&mut self, speed: f32) {
         let was_shuttling = self.vcr_shuttle_speed != 0.0;
         self.vcr_shuttle_speed = speed;
         self.sim.set_vcr_shuttle(speed);
+        let lbl = Self::vcr_shuttle_label(speed);
         if let Some(p) = &self.player {
             if speed > 0.1 {
                 p.set_paused(false);
-                p.set_speed(speed as f64);
-                let lbl = if speed >= 7.0 { "FF >>> 8X" } else { "FF >> 4X" };
+                // 4x and 8x use smooth real-time mpv speed; 16x and 32x use snappy stepped visual search
+                // so high-bitrate / network streams zip cleanly without stalling the decoder.
+                if speed <= 8.5 {
+                    p.set_speed(speed as f64);
+                } else {
+                    p.set_speed(1.0);
+                    self.vcr_rw_last_step = std::time::Instant::now() - std::time::Duration::from_millis(200);
+                }
                 self.osd.show_action(lbl);
+                self.show_video_progress_osd(lbl, None);
             } else if speed < -0.1 {
                 p.set_speed(1.0);
                 p.set_paused(false);
                 self.vcr_rw_last_step = std::time::Instant::now() - std::time::Duration::from_millis(200);
-                let lbl = if speed <= -7.0 { "REW <<< 8X" } else { "REW << 4X" };
                 self.osd.show_action(lbl);
+                self.show_video_progress_osd(lbl, None);
             } else {
                 p.set_speed(1.0);
                 if was_shuttling {
                     self.osd.show_action("PLAY >");
+                    self.show_video_progress_osd("PLAY >", None);
                 }
             }
         }
@@ -3348,14 +3406,23 @@ impl CrtApp {
         if self.player.is_none() {
             return;
         }
+        let s = self.vcr_shuttle_speed;
         let next = if dir > 0.0 {
-            if self.vcr_shuttle_speed > 0.1 && self.vcr_shuttle_speed < 6.0 {
+            if s > 0.1 && s < 6.0 {
                 8.0
+            } else if s >= 6.0 && s < 12.0 {
+                16.0
+            } else if s >= 12.0 && s < 24.0 {
+                32.0
             } else {
                 4.0
             }
-        } else if self.vcr_shuttle_speed < -0.1 && self.vcr_shuttle_speed > -6.0 {
+        } else if s < -0.1 && s > -6.0 {
             -8.0
+        } else if s <= -6.0 && s > -12.0 {
+            -16.0
+        } else if s <= -12.0 && s > -24.0 {
+            -32.0
         } else {
             -4.0
         };
@@ -3365,14 +3432,17 @@ impl CrtApp {
     fn seek_video_rel(&mut self, delta: f64) {
         self.stop_vcr_shuttle_silent();
         if let Some(p) = &self.player {
+            let cur_pos = p.shared.lock().unwrap().pos;
             p.seek(delta);
             self.sim.trigger_seek_shuttle(delta as f32);
             let secs = delta.abs().round() as i64;
-            if delta >= 0.0 {
-                self.osd.show_action(&format!("FF >> +{secs}S"));
+            let lbl = if delta >= 0.0 {
+                format!("FF >> +{secs}S")
             } else {
-                self.osd.show_action(&format!("REW << -{secs}S"));
-            }
+                format!("REW << -{secs}S")
+            };
+            self.osd.show_action(&lbl);
+            self.show_video_progress_osd(&lbl, Some((cur_pos + delta).max(0.0)));
         }
     }
 
@@ -3382,12 +3452,9 @@ impl CrtApp {
             let delta = target - prev_pos;
             p.seek_abs(target);
             self.sim.trigger_seek_shuttle(if delta.abs() < 0.25 { 5.0 } else { delta as f32 });
-            let lbl = if delta < 0.0 {
-                format!("REW << {}", hms(target))
-            } else {
-                format!("FF >> {}", hms(target))
-            };
-            self.osd.show_action(&lbl);
+            let lbl = if delta < 0.0 { "REW <<" } else { "FF >>" };
+            self.osd.show_action(lbl);
+            self.show_video_progress_osd(lbl, Some(target));
         }
     }
 
@@ -3454,7 +3521,11 @@ impl CrtApp {
                         let rw_on = self.vcr_shuttle_speed < -0.1;
                         let ff_on = self.vcr_shuttle_speed > 0.1;
                         ui.horizontal_wrapped(|ui| {
-                            let rw_lbl = if self.vcr_shuttle_speed <= -7.0 {
+                            let rw_lbl = if self.vcr_shuttle_speed <= -24.0 {
+                                "<<<< 32×"
+                            } else if self.vcr_shuttle_speed <= -12.0 {
+                                "<<< 16×"
+                            } else if self.vcr_shuttle_speed <= -6.0 {
                                 "<<< 8×"
                             } else if rw_on {
                                 "<< 4×"
@@ -3463,7 +3534,7 @@ impl CrtApp {
                             };
                             if ui
                                 .add(egui::Button::new(rw_lbl).selected(rw_on))
-                                .on_hover_text("VHS Rewind picture search (click again for 8×, Space or Play to resume)")
+                                .on_hover_text("VHS Rewind picture search (click to step 4× → 8× → 16× → 32×, Space or Play to resume)")
                                 .clicked()
                             {
                                 shuttle_cmd = Some(-1.0);
@@ -3476,7 +3547,11 @@ impl CrtApp {
                                     toggle = true;
                                 }
                             }
-                            let ff_lbl = if self.vcr_shuttle_speed >= 7.0 {
+                            let ff_lbl = if self.vcr_shuttle_speed >= 24.0 {
+                                "32× >>>>"
+                            } else if self.vcr_shuttle_speed >= 12.0 {
+                                "16× >>>"
+                            } else if self.vcr_shuttle_speed >= 6.0 {
                                 "8× >>>"
                             } else if ff_on {
                                 "4× >>"
@@ -3485,7 +3560,7 @@ impl CrtApp {
                             };
                             if ui
                                 .add(egui::Button::new(ff_lbl).selected(ff_on))
-                                .on_hover_text("VHS Fast-Forward picture search (click again for 8×, Space or Play to resume)")
+                                .on_hover_text("VHS Fast-Forward picture search (click to step 4× → 8× → 16× → 32×, Space or Play to resume)")
                                 .clicked()
                             {
                                 shuttle_cmd = Some(1.0);
@@ -3509,6 +3584,8 @@ impl CrtApp {
                                 } else if self.seek_drag.is_none() {
                                     self.seek_drag_last = pos;
                                 }
+                                let lbl = if dir < 0.0 { "REW <<" } else { "FF >>" };
+                                self.osd.show_progress(lbl, v, dur);
                                 self.seek_drag = Some(v);
                             } else if r.drag_stopped() || r.clicked() {
                                 seek_abs = Some((v, pos));
@@ -4164,7 +4241,11 @@ impl CrtApp {
                             });
                         });
                         ui.horizontal_wrapped(|ui| {
-                            let rw_lbl = if self.vcr_shuttle_speed <= -7.0 {
+                            let rw_lbl = if self.vcr_shuttle_speed <= -24.0 {
+                                "<<< 32×"
+                            } else if self.vcr_shuttle_speed <= -12.0 {
+                                "<<< 16×"
+                            } else if self.vcr_shuttle_speed <= -6.0 {
                                 "<<< 8×"
                             } else if rw_on {
                                 "<< 4×"
@@ -4173,7 +4254,7 @@ impl CrtApp {
                             };
                             if ui
                                 .add(egui::Button::new(rw_lbl).selected(rw_on).small())
-                                .on_hover_text("VHS Rewind picture search (click again for 8×)")
+                                .on_hover_text("VHS Rewind picture search (click for 4× → 8× → 16× → 32×)")
                                 .clicked()
                             {
                                 q_shuttle = Some(-1.0);
@@ -4186,7 +4267,11 @@ impl CrtApp {
                                     q_toggle = true;
                                 }
                             }
-                            let ff_lbl = if self.vcr_shuttle_speed >= 7.0 {
+                            let ff_lbl = if self.vcr_shuttle_speed >= 24.0 {
+                                "32× >>>"
+                            } else if self.vcr_shuttle_speed >= 12.0 {
+                                "16× >>>"
+                            } else if self.vcr_shuttle_speed >= 6.0 {
                                 "8× >>>"
                             } else if ff_on {
                                 "4× >>"
@@ -4195,7 +4280,7 @@ impl CrtApp {
                             };
                             if ui
                                 .add(egui::Button::new(ff_lbl).selected(ff_on).small())
-                                .on_hover_text("VHS Fast-Forward picture search (click again for 8×)")
+                                .on_hover_text("VHS Fast-Forward picture search (click for 4× → 8× → 16× → 32×)")
                                 .clicked()
                             {
                                 q_shuttle = Some(1.0);
@@ -4221,6 +4306,8 @@ impl CrtApp {
                                 } else if self.seek_drag.is_none() {
                                     self.seek_drag_last = pos;
                                 }
+                                let lbl = if dir < 0.0 { "REW <<" } else { "FF >>" };
+                                self.osd.show_progress(lbl, v, dur);
                                 self.seek_drag = Some(v);
                             } else if r.drag_stopped() || r.clicked() {
                                 q_seek_abs = Some((v, pos));
@@ -5175,37 +5262,54 @@ impl CrtApp {
                     "SPACE" if self.vcr_shuttle_speed != 0.0 => {
                         self.set_vcr_shuttle(0.0);
                     }
+                    "SPACE" => {
+                        let will_pause = self.player.as_ref().is_some_and(|p| !p.shared.lock().unwrap().paused);
+                        if let Some(p) = &self.player {
+                            p.key(&k);
+                        }
+                        let lbl = if will_pause { "PAUSE ||" } else { "PLAY >" };
+                        self.osd.show_action(lbl);
+                        self.show_video_progress_osd(lbl, None);
+                    }
                     "LEFT" => {
                         self.stop_vcr_shuttle_silent();
+                        let cur_pos = self.player.as_ref().map(|p| p.shared.lock().unwrap().pos).unwrap_or(0.0);
                         if let Some(p) = &self.player {
                             p.key(&k);
                         }
                         self.sim.trigger_seek_shuttle(-5.0);
                         self.osd.show_action("REW <<");
+                        self.show_video_progress_osd("REW <<", Some((cur_pos - 5.0).max(0.0)));
                     }
                     "RIGHT" => {
                         self.stop_vcr_shuttle_silent();
+                        let cur_pos = self.player.as_ref().map(|p| p.shared.lock().unwrap().pos).unwrap_or(0.0);
                         if let Some(p) = &self.player {
                             p.key(&k);
                         }
                         self.sim.trigger_seek_shuttle(5.0);
                         self.osd.show_action("FF >>");
+                        self.show_video_progress_osd("FF >>", Some(cur_pos + 5.0));
                     }
                     "DOWN" => {
                         self.stop_vcr_shuttle_silent();
+                        let cur_pos = self.player.as_ref().map(|p| p.shared.lock().unwrap().pos).unwrap_or(0.0);
                         if let Some(p) = &self.player {
                             p.key(&k);
                         }
                         self.sim.trigger_seek_shuttle(-60.0);
                         self.osd.show_action("REW <<<");
+                        self.show_video_progress_osd("REW <<<", Some((cur_pos - 60.0).max(0.0)));
                     }
                     "UP" => {
                         self.stop_vcr_shuttle_silent();
+                        let cur_pos = self.player.as_ref().map(|p| p.shared.lock().unwrap().pos).unwrap_or(0.0);
                         if let Some(p) = &self.player {
                             p.key(&k);
                         }
                         self.sim.trigger_seek_shuttle(60.0);
                         self.osd.show_action("FF >>>");
+                        self.show_video_progress_osd("FF >>>", Some(cur_pos + 60.0));
                     }
                     _ => {
                         if let Some(p) = &self.player {
@@ -5216,36 +5320,52 @@ impl CrtApp {
             }
         }
 
-        // Drive continuous VHS RW stepped picture-search & keep shuttle OSD fresh
+        // Drive continuous VHS RW (and 16x/32x FF) stepped picture-search & keep OSD progress bar live!
         if self.vcr_shuttle_speed != 0.0 {
             let mut cancel_shuttle = false;
+            let spd = self.vcr_shuttle_speed;
+            let lbl = Self::vcr_shuttle_label(spd);
+            let mut live_osd: Option<(f64, f64)> = None;
             if let Some(p) = &self.player {
-                let (pos, ended, running) = {
+                let (pos, dur, ended, running) = {
                     let sh = p.shared.lock().unwrap();
-                    (sh.pos, sh.ended, sh.running)
+                    (sh.pos, sh.duration, sh.ended, sh.running)
                 };
                 if !running || ended {
                     cancel_shuttle = true;
-                } else if self.vcr_shuttle_speed < -0.1 {
+                } else if spd < -0.1 {
                     if pos <= 0.6 {
                         p.seek_abs(0.0);
                         cancel_shuttle = true;
                     } else if self.vcr_rw_last_step.elapsed() >= std::time::Duration::from_millis(95) {
                         self.vcr_rw_last_step = std::time::Instant::now();
-                        let step = self.vcr_shuttle_speed as f64 * 0.115; // ~-0.46s at 4x, ~-0.92s at 8x
+                        let step = spd as f64 * 0.105; // ~-0.42s @4x, -0.84s @8x, -1.68s @16x, -3.36s @32x
                         p.seek(step);
-                        let lbl = if self.vcr_shuttle_speed <= -7.0 { "REW <<< 8X" } else { "REW << 4X" };
                         self.osd.show_action(lbl);
                     }
-                } else if self.vcr_shuttle_speed > 0.1
-                    && self.vcr_rw_last_step.elapsed() >= std::time::Duration::from_millis(650)
-                {
-                    self.vcr_rw_last_step = std::time::Instant::now();
-                    let lbl = if self.vcr_shuttle_speed >= 7.0 { "FF >>> 8X" } else { "FF >> 4X" };
-                    self.osd.show_action(lbl);
+                    live_osd = Some((pos, dur));
+                } else if spd > 8.5 {
+                    if dur > 1.0 && pos >= dur - 1.5 {
+                        cancel_shuttle = true;
+                    } else if self.vcr_rw_last_step.elapsed() >= std::time::Duration::from_millis(95) {
+                        self.vcr_rw_last_step = std::time::Instant::now();
+                        let step = spd as f64 * 0.105; // ~+1.68s @16x, +3.36s @32x
+                        p.seek(step);
+                        self.osd.show_action(lbl);
+                    }
+                    live_osd = Some((pos, dur));
+                } else if spd > 0.1 {
+                    if self.vcr_rw_last_step.elapsed() >= std::time::Duration::from_millis(550) {
+                        self.vcr_rw_last_step = std::time::Instant::now();
+                        self.osd.show_action(lbl);
+                    }
+                    live_osd = Some((pos, dur));
                 }
             } else {
                 cancel_shuttle = true;
+            }
+            if let Some((pos, dur)) = live_osd {
+                self.osd.show_progress(lbl, pos, dur);
             }
             if cancel_shuttle {
                 self.set_vcr_shuttle(0.0);

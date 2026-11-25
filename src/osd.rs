@@ -301,6 +301,11 @@ pub struct TvOsd {
     action_text: String,
     action_until: Option<Instant>,
 
+    progress_label: String,
+    progress_pos: f64,
+    progress_dur: f64,
+    progress_until: Option<Instant>,
+
     canvas: Canvas,
     version: u64,
     cached: Option<(u64, Arc<Vec<u8>>)>,
@@ -329,6 +334,10 @@ impl TvOsd {
             volume_until: None,
             action_text: String::new(),
             action_until: None,
+            progress_label: String::new(),
+            progress_pos: 0.0,
+            progress_dur: 0.0,
+            progress_until: None,
             canvas: Canvas::new(OSD_W, OSD_H),
             version: 0,
             cached: None,
@@ -359,6 +368,23 @@ impl TvOsd {
         self.action_text = text.to_string();
         self.action_until = Some(Instant::now() + std::time::Duration::from_secs_f32(2.4));
         self.dirty = true;
+    }
+
+    /// Shows the classic 90s green VCR/tape transport progress bar & timecode at bottom-center.
+    pub fn show_progress(&mut self, label: &str, pos: f64, dur: f64) {
+        let pos_c = pos.max(0.0);
+        let dur_c = dur.max(0.0);
+        let changed = self.progress_label != label
+            || (self.progress_pos - pos_c).abs() >= 0.25
+            || (self.progress_dur - dur_c).abs() >= 0.5
+            || self.progress_until.is_none();
+        self.progress_label = label.to_string();
+        self.progress_pos = pos_c;
+        self.progress_dur = dur_c;
+        self.progress_until = Some(Instant::now() + std::time::Duration::from_secs_f32(2.6));
+        if changed {
+            self.dirty = true;
+        }
     }
 
     /// Appends a remote digit (`0`..=`9`). Returns `Some(ch)` immediately once 3 digits are entered.
@@ -410,8 +436,9 @@ impl TvOsd {
         let show_ch = self.channel_until.is_some_and(|u| now < u);
         let show_vol = self.volume_until.is_some_and(|u| now < u);
         let show_act = self.action_until.is_some_and(|u| now < u);
+        let show_prog = self.progress_until.is_some_and(|u| now < u);
         let show_mute_persist = self.muted;
-        let visible = show_digits || show_ch || show_vol || show_act || show_mute_persist;
+        let visible = show_digits || show_ch || show_vol || show_act || show_prog || show_mute_persist;
 
         if !visible {
             if self.was_visible {
@@ -437,6 +464,10 @@ impl TvOsd {
         }
         if !show_act && self.action_until.is_some() {
             self.action_until = None;
+            self.dirty = true;
+        }
+        if !show_prog && self.progress_until.is_some() {
+            self.progress_until = None;
             self.dirty = true;
         }
 
@@ -485,7 +516,7 @@ impl TvOsd {
         }
 
         // ---- Bottom-left / bottom-center: 1-line show/episode banner
-        if show_ch && !self.subtitle.is_empty() && !show_vol {
+        if show_ch && !self.subtitle.is_empty() && !show_vol && !show_prog {
             let max_chars = 34usize;
             let txt: String = if self.subtitle.chars().count() > max_chars {
                 let mut s: String = self.subtitle.chars().take(max_chars - 2).collect();
@@ -496,6 +527,63 @@ impl TvOsd {
             };
             self.canvas.fill_rect(36, 404, OSD_W as i32 - 72, 30, [4, 14, 6, 170]);
             self.canvas.draw_text_outlined(48, 412, &txt, 2, 2, white, outline);
+        }
+
+        // ---- Bottom-center: Classic 90s green VCR / tape progress bar & timecode
+        if show_prog && !show_vol {
+            let bx = 56;
+            let by = 382;
+            let bw = OSD_W as i32 - 112; // 528 px
+            self.canvas.fill_rect(bx, by, bw, 58, [4, 14, 6, 192]);
+            self.canvas.stroke_rect(bx, by, bw, 58, 1, [34, 128, 52, 165]);
+
+            // Top line: transport label on left, HH:MM:SS / HH:MM:SS timecode on right
+            let lbl: String = self.progress_label.chars().take(16).collect();
+            self.canvas.draw_text_outlined(bx + 14, by + 8, &lbl, 2, 2, green, outline);
+
+            let fmt_tc = |secs: f64| -> String {
+                let s = secs.max(0.0).round() as u64;
+                let h = s / 3600;
+                let m = (s % 3600) / 60;
+                let sec = s % 60;
+                if h > 0 {
+                    format!("{h}:{m:02}:{sec:02}")
+                } else {
+                    format!("{m:02}:{sec:02}")
+                }
+            };
+            let tc = if self.progress_dur > 0.5 {
+                format!("{}/{}", fmt_tc(self.progress_pos), fmt_tc(self.progress_dur))
+            } else {
+                fmt_tc(self.progress_pos)
+            };
+            let tc_w = tc.len() as i32 * 16;
+            self.canvas.draw_text_outlined(bx + bw - 14 - tc_w, by + 8, &tc, 2, 2, white, outline);
+
+            // Bottom line: 32 crisp segmented green tape-position blocks with bright head cursor
+            let segs = 32;
+            let frac = if self.progress_dur > 0.5 {
+                (self.progress_pos / self.progress_dur).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let filled = (frac * segs as f64).round() as i32;
+            let bar_x0 = bx + 14;
+            let bar_y = by + 32;
+            let step = (bw - 28) / segs; // 500 / 32 = 15 px
+            for s in 0..segs {
+                let sx = bar_x0 + s * step;
+                let is_head = s == filled.clamp(0, segs - 1) && self.progress_dur > 0.5;
+                let col = if is_head {
+                    white
+                } else if s < filled {
+                    green
+                } else {
+                    dim_green
+                };
+                self.canvas.fill_rect(sx - 1, bar_y - 1, step - 3, 18, outline);
+                self.canvas.fill_rect(sx, bar_y, step - 5, 16, col);
+            }
         }
 
         // ---- Bottom-center: Classic 90s green segmented VOLUME bar
@@ -543,5 +631,12 @@ mod tests {
         assert_eq!(osd.push_digit('0'), None);
         assert_eq!(osd.push_digit('5'), None);
         assert_eq!(osd.push_digit('2'), Some(52));
+
+        // Progress bar renders bottom-center timecode & segmented green blocks
+        osd.show_progress("FF >>> 16X", 125.0, 600.0);
+        let (_, pbuf) = osd.render().expect("progress bar OSD should render");
+        // Check white head cursor & green pixels inside the bottom bar region (y=382..440)
+        let bar_slice = &pbuf[(382 * OSD_W * 4)..(440 * OSD_W * 4)];
+        assert!(bar_slice.chunks_exact(4).any(|p| p[1] > 200 && p[3] == 255));
     }
 }
