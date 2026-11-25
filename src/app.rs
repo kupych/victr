@@ -1,8 +1,10 @@
 use crate::audio::AudioEngine;
+use crate::custom_provider::CustomProviderManager;
 use crate::folders::FoldersManager;
 use crate::gpu::{FrameInput, HdrStatus};
 use crate::guide::{GuideState, GuideView};
 use crate::jellyfin::JellyfinManager;
+use crate::m3u::M3uManager;
 use crate::mpv::{Player, StartOpts};
 use crate::osd::TvOsd;
 use crate::plex::PlexManager;
@@ -89,6 +91,8 @@ pub struct CrtApp {
     jellyfin: JellyfinManager,
     plex: PlexManager,
     folders: FoldersManager,
+    m3u: M3uManager,
+    custom: CustomProviderManager,
     lineup: Vec<Channel>,
     active_watch: Option<ActiveWatch>,
     guide: GuideState,
@@ -106,6 +110,15 @@ pub struct CrtApp {
     jf_username: String,
     jf_password: String,
     folder_path_input: String,
+    m3u_ch_name: String,
+    m3u_ch_url: String,
+    m3u_ch_group: String,
+    m3u_ch_logo: String,
+    m3u_pl_url: String,
+    custom_ep_name: String,
+    custom_ep_url: String,
+    custom_ep_auth: String,
+    custom_msg: String,
     panel_season_filter: Option<u32>,
     // sound
     audio: Option<AudioEngine>,
@@ -137,10 +150,14 @@ impl Drop for CrtApp {
                 }
             }
         }
-        // Flush local folder watch progress if active
+        // Flush local folder / custom provider watch progress if active
         if let Some(w) = self.active_watch.take() {
-            if w.provider_id == "folders" && w.dwell_secs >= 10.0 && !w.marked_played {
-                self.folders.save_resume(&w.item_id, w.last_pos, w.duration_secs);
+            if w.dwell_secs >= 10.0 && !w.marked_played {
+                if w.provider_id == "folders" {
+                    self.folders.save_resume(&w.item_id, w.last_pos, w.duration_secs);
+                } else if w.provider_id == "custom" {
+                    self.custom.save_resume(&w.item_id, w.last_pos, w.duration_secs);
+                }
             }
         }
         // Stop mpv first and guarantee Jellyfin & Plex playback progress is flushed before exiting.
@@ -376,6 +393,16 @@ impl CrtApp {
             } else {
                 FoldersManager::new()
             },
+            m3u: if screenshot_mode && !std::env::var_os("VICTR_GUIDE_CONNECT").is_some() {
+                M3uManager::new_offline()
+            } else {
+                M3uManager::new()
+            },
+            custom: if screenshot_mode && !std::env::var_os("VICTR_GUIDE_CONNECT").is_some() {
+                CustomProviderManager::new_offline()
+            } else {
+                CustomProviderManager::new()
+            },
             lineup: Vec::new(),
             active_watch: None,
             guide: GuideState::new(),
@@ -393,6 +420,15 @@ impl CrtApp {
             jf_username: String::new(),
             jf_password: String::new(),
             folder_path_input: String::new(),
+            m3u_ch_name: String::new(),
+            m3u_ch_url: String::new(),
+            m3u_ch_group: String::new(),
+            m3u_ch_logo: String::new(),
+            m3u_pl_url: String::new(),
+            custom_ep_name: String::new(),
+            custom_ep_url: String::new(),
+            custom_ep_auth: String::new(),
+            custom_msg: String::new(),
             panel_season_filter: None,
             audio,
             inbox: if screenshot_mode { None } else { Some(crate::link::listen(egui_ctx.clone())) },
@@ -867,8 +903,12 @@ impl CrtApp {
         self.sidebar_open = false;
         self.save_preset_open = false;
         if let Some(w) = self.active_watch.take() {
-            if w.provider_id == "folders" && w.dwell_secs >= 10.0 && !w.marked_played {
-                self.folders.save_resume(&w.item_id, w.last_pos, w.duration_secs);
+            if w.dwell_secs >= 10.0 && !w.marked_played {
+                if w.provider_id == "folders" {
+                    self.folders.save_resume(&w.item_id, w.last_pos, w.duration_secs);
+                } else if w.provider_id == "custom" {
+                    self.custom.save_resume(&w.item_id, w.last_pos, w.duration_secs);
+                }
             }
         }
         if self.shutdown_flushes.is_empty() {
@@ -892,16 +932,22 @@ impl CrtApp {
     }
 
     fn any_source_busy(&self) -> bool {
-        self.jellyfin.busy || self.plex.busy || self.folders.busy
+        self.jellyfin.busy || self.plex.busy || self.folders.busy || self.m3u.busy || self.custom.busy
     }
 
     fn rebuild_lineup(&mut self) {
         let mut raw = Vec::with_capacity(
-            self.jellyfin.channels.len() + self.plex.channels.len() + self.folders.channels.len(),
+            self.jellyfin.channels.len()
+                + self.plex.channels.len()
+                + self.folders.channels.len()
+                + self.m3u.channels.len()
+                + self.custom.channels.len(),
         );
         raw.extend(self.jellyfin.channels.iter().cloned());
         raw.extend(self.plex.channels.iter().cloned());
         raw.extend(self.folders.channels.iter().cloned());
+        raw.extend(self.m3u.channels.iter().cloned());
+        raw.extend(self.custom.channels.iter().cloned());
         if raw.is_empty() {
             self.lineup.clear();
             return;
@@ -952,6 +998,8 @@ impl CrtApp {
             "jellyfin" => self.jellyfin.request_artwork(art_id),
             "plex" => self.plex.request_artwork(art_id),
             "folders" => self.folders.request_artwork(art_id),
+            "m3u" => self.m3u.request_artwork(art_id),
+            "custom" => self.custom.request_artwork(art_id),
             _ => None,
         }
     }
@@ -965,6 +1013,7 @@ impl CrtApp {
             "jellyfin" => self.jellyfin.set_item_played(item_id, played),
             "plex" => self.plex.set_item_played(item_id, played),
             "folders" => self.folders.set_item_played(item_id, played),
+            "custom" => self.custom.set_item_played(item_id, played),
             _ => {}
         }
         if let Some(w) = &mut self.active_watch {
@@ -986,6 +1035,12 @@ impl CrtApp {
                     self.rebuild_lineup();
                 }
             }
+            "custom" => {
+                if w.dwell_secs >= 15.0 && !w.marked_played {
+                    self.custom.save_resume(&w.item_id, w.last_pos, w.duration_secs);
+                    self.rebuild_lineup();
+                }
+            }
             _ => {}
         }
     }
@@ -1004,6 +1059,14 @@ impl CrtApp {
             self.folders.rescan_async();
             started = true;
         }
+        if self.m3u.cfg.has_enabled_sources() && !self.m3u.busy {
+            self.m3u.refresh_async();
+            started = true;
+        }
+        if !self.custom.busy && (self.custom.has_enabled_sources() || crate::custom_provider::providers_dir().is_some_and(|d| d.is_dir())) {
+            self.custom.refresh_async();
+            started = true;
+        }
         if started {
             self.notify_guide_synced = true;
             self.osd.show_action("SYNCING GUIDE...");
@@ -1016,7 +1079,9 @@ impl CrtApp {
         let dir_loading = self.folders.channels.is_empty()
             && self.folders.cfg.roots.iter().any(|r| r.enabled)
             && self.folders.busy;
-        if !jf_loading && !px_loading && !dir_loading {
+        let m3u_loading = self.m3u.channels.is_empty() && self.m3u.cfg.has_enabled_sources() && self.m3u.busy;
+        let cus_loading = self.custom.channels.is_empty() && self.custom.has_enabled_sources() && self.custom.busy;
+        if !jf_loading && !px_loading && !dir_loading && !m3u_loading && !cus_loading {
             return false;
         }
         if self.open_guide_on_connect {
@@ -1360,12 +1425,23 @@ impl CrtApp {
         }
     }
 
+    fn pick_m3u_playlist(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("M3U / M3U8 Playlists", &["m3u", "m3u8"])
+            .add_filter("All files", &["*"])
+            .pick_file()
+        {
+            let label = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Playlist").to_string();
+            self.m3u.add_playlist(path.to_string_lossy().to_string(), label);
+        }
+    }
+
     fn channels_controls(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new(RichText::new("Channels & Sources").strong())
             .default_open(false)
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new("Combine Jellyfin, Plex, and nested local folders into one 90s Prevue Cable Guide lineup.")
+                    RichText::new("Combine Jellyfin, Plex, nested local folders, M3U8 live streams, and custom integrators into one 90s Prevue Cable Guide.")
                         .weak()
                         .small(),
                 );
@@ -1971,6 +2047,308 @@ impl CrtApp {
                             });
                             if clear_err {
                                 self.plex.last_error.clear();
+                            }
+                        }
+                    });
+
+                // ---- Source 4: M3U / M3U8 Live Streams & Arbitrary Online Channels
+                let m3u_count = self.m3u.channels.len();
+                let m3u_hdr = if m3u_count > 0 {
+                    format!("Live Streams / M3U8 ({m3u_count} ch)")
+                } else {
+                    "Live Streams / M3U8".to_string()
+                };
+                egui::CollapsingHeader::new(RichText::new(m3u_hdr).strong().small())
+                    .id_salt("src_m3u")
+                    .default_open(m3u_count > 0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Add arbitrary online .m3u8 live streams (auto-probing HLS metadata) or .m3u/.m3u8 channel playlists onto CH 80+.")
+                                .weak()
+                                .small(),
+                        );
+                        ui.add_space(3.0);
+                        ui.label(RichText::new("Add a single live channel").small().strong());
+                        ui.horizontal(|ui| {
+                            ui.label("Name");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.m3u_ch_name)
+                                    .hint_text("e.g. NASA TV")
+                                    .desired_width(130.0),
+                            );
+                            ui.label("Group");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.m3u_ch_group)
+                                    .hint_text("Live")
+                                    .desired_width(82.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Stream");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.m3u_ch_url)
+                                    .hint_text("https://.../stream.m3u8")
+                                    .desired_width(248.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Logo");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.m3u_ch_logo)
+                                    .hint_text("Optional logo URL or path")
+                                    .desired_width(188.0),
+                            );
+                            if ui
+                                .add_enabled(!self.m3u_ch_url.trim().is_empty(), egui::Button::new("Add Ch").small())
+                                .clicked()
+                            {
+                                let n = std::mem::take(&mut self.m3u_ch_name);
+                                let u = std::mem::take(&mut self.m3u_ch_url);
+                                let g = std::mem::take(&mut self.m3u_ch_group);
+                                let l = std::mem::take(&mut self.m3u_ch_logo);
+                                self.m3u.add_channel(n, u, g, l);
+                            }
+                        });
+                        let mut ch_toggle = false;
+                        let mut ch_remove: Option<usize> = None;
+                        for (i, ch) in self.m3u.cfg.channels.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.checkbox(&mut ch.enabled, "").changed() {
+                                    ch_toggle = true;
+                                }
+                                let lbl = if ch.name.is_empty() { &ch.url } else { &ch.name };
+                                ui.label(RichText::new(lbl).small()).on_hover_text(&ch.url);
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("×").on_hover_text("Remove channel").clicked() {
+                                        ch_remove = Some(i);
+                                    }
+                                });
+                            });
+                        }
+                        if ch_toggle {
+                            let _ = crate::m3u::save_config(&self.m3u.cfg);
+                            self.m3u.refresh_async();
+                        }
+                        if let Some(i) = ch_remove {
+                            self.m3u.remove_channel(i);
+                        }
+
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("M3U / M3U8 Playlists (URL or file)").small().strong());
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.m3u_pl_url)
+                                    .hint_text("https://.../channels.m3u8 or local path")
+                                    .desired_width(210.0),
+                            );
+                            let add = ui.small_button("Add").clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if add && !self.m3u_pl_url.trim().is_empty() {
+                                let u = std::mem::take(&mut self.m3u_pl_url);
+                                self.m3u.add_playlist(u, String::new());
+                            }
+                            if ui.small_button("File…").on_hover_text("Browse for a local .m3u / .m3u8 file").clicked() {
+                                self.message = "pickm3u".into();
+                            }
+                        });
+                        let mut pl_toggle = false;
+                        let mut pl_remove: Option<usize> = None;
+                        for (i, pl) in self.m3u.cfg.playlists.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.checkbox(&mut pl.enabled, "").changed() {
+                                    pl_toggle = true;
+                                }
+                                let lbl = if pl.label.is_empty() { &pl.url_or_path } else { &pl.label };
+                                ui.label(RichText::new(lbl).small()).on_hover_text(&pl.url_or_path);
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("×").on_hover_text("Remove playlist").clicked() {
+                                        pl_remove = Some(i);
+                                    }
+                                });
+                            });
+                        }
+                        if pl_toggle {
+                            let _ = crate::m3u::save_config(&self.m3u.cfg);
+                            self.m3u.refresh_async();
+                        }
+                        if let Some(i) = pl_remove {
+                            self.m3u.remove_playlist(i);
+                        }
+
+                        if self.m3u.cfg.has_enabled_sources() {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(!self.m3u.busy, egui::Button::new("Refresh Streams").small())
+                                    .clicked()
+                                {
+                                    self.m3u.refresh_async();
+                                }
+                            });
+                        }
+                        if !self.m3u.status.is_empty() {
+                            let col = if self.m3u.busy {
+                                Color32::from_rgb(235, 175, 100)
+                            } else {
+                                Color32::from_rgb(112, 236, 184)
+                            };
+                            ui.label(RichText::new(&self.m3u.status).small().color(col));
+                        }
+                        if !self.m3u.last_error.is_empty() {
+                            let mut clear_err = false;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(&self.m3u.last_error)
+                                        .small()
+                                        .color(Color32::from_rgb(248, 122, 108)),
+                                );
+                                if ui.small_button("×").on_hover_text("Dismiss error").clicked() {
+                                    clear_err = true;
+                                }
+                            });
+                            if clear_err {
+                                self.m3u.last_error.clear();
+                            }
+                        }
+                    });
+
+                // ---- Source 5: Custom Integrators (Drop-in Scripts & HTTP JSON Feeds)
+                let cus_count = self.custom.channels.len();
+                let cus_hdr = if cus_count > 0 {
+                    format!("Custom Integrators ({cus_count} ch)")
+                } else {
+                    "Custom Integrators".to_string()
+                };
+                egui::CollapsingHeader::new(RichText::new(cus_hdr).strong().small())
+                    .id_salt("src_custom")
+                    .default_open(cus_count > 0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Plug in custom scripts/binaries (stdout JSON) or HTTP JSON feed endpoints using the ViCTR provider JSON schema.")
+                                .weak()
+                                .small(),
+                        );
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!self.custom.busy, egui::Button::new("Rescan & Run").small())
+                                .on_hover_text("Discover scripts in the providers folder and refresh all custom endpoints")
+                                .clicked()
+                            {
+                                self.custom.refresh_async();
+                            }
+                            if ui
+                                .small_button("Create Example Plugin")
+                                .on_hover_text("Writes a documented README.md + example-channel.sh.disabled into the providers folder")
+                                .clicked()
+                            {
+                                self.custom_msg = match crate::custom_provider::create_example_plugin() {
+                                    Ok(dir) => format!("Created template in {}", dir.display()),
+                                    Err(e) => e,
+                                };
+                            }
+                        });
+                        if let Some(dir) = crate::custom_provider::providers_dir() {
+                            ui.label(RichText::new(format!("Plugins dir: {}", dir.display())).weak().small());
+                        }
+                        if !self.custom.scripts.is_empty() {
+                            ui.label(RichText::new("Discovered plugin scripts").small().strong());
+                            let scripts: Vec<String> = self.custom.scripts.iter().map(|s| s.file_name.clone()).collect();
+                            let mut script_toggle: Option<(String, bool)> = None;
+                            for fname in scripts {
+                                let mut en = !self.custom.cfg.disabled_scripts.contains(&fname);
+                                ui.horizontal(|ui| {
+                                    if ui.checkbox(&mut en, "").changed() {
+                                        script_toggle = Some((fname.clone(), en));
+                                    }
+                                    ui.label(RichText::new(&fname).monospace().small());
+                                });
+                            }
+                            if let Some((fname, en)) = script_toggle {
+                                self.custom.set_script_enabled(&fname, en);
+                            }
+                        }
+
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("HTTP JSON feed endpoints").small().strong());
+                        ui.horizontal(|ui| {
+                            ui.label("Name");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.custom_ep_name)
+                                    .hint_text("My Feed")
+                                    .desired_width(110.0),
+                            );
+                            ui.label("URL");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.custom_ep_url)
+                                    .hint_text("https://.../channels.json")
+                                    .desired_width(142.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Auth");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.custom_ep_auth)
+                                    .hint_text("Optional Authorization header")
+                                    .desired_width(210.0),
+                            );
+                            if ui
+                                .add_enabled(!self.custom_ep_url.trim().is_empty(), egui::Button::new("Add Feed").small())
+                                .clicked()
+                            {
+                                let n = std::mem::take(&mut self.custom_ep_name);
+                                let u = std::mem::take(&mut self.custom_ep_url);
+                                let a = std::mem::take(&mut self.custom_ep_auth);
+                                self.custom.add_endpoint(n, u, a);
+                            }
+                        });
+                        let mut ep_toggle = false;
+                        let mut ep_remove: Option<usize> = None;
+                        for (i, ep) in self.custom.cfg.endpoints.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.checkbox(&mut ep.enabled, "").changed() {
+                                    ep_toggle = true;
+                                }
+                                ui.label(RichText::new(&ep.name).small()).on_hover_text(&ep.url);
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("×").on_hover_text("Remove endpoint").clicked() {
+                                        ep_remove = Some(i);
+                                    }
+                                });
+                            });
+                        }
+                        if ep_toggle {
+                            let _ = crate::custom_provider::save_config(&self.custom.cfg);
+                            self.custom.refresh_async();
+                        }
+                        if let Some(i) = ep_remove {
+                            self.custom.remove_endpoint(i);
+                        }
+
+                        if !self.custom_msg.is_empty() {
+                            ui.label(RichText::new(&self.custom_msg).small().color(Color32::from_rgb(235, 175, 100)));
+                        }
+                        if !self.custom.status.is_empty() {
+                            let col = if self.custom.busy {
+                                Color32::from_rgb(235, 175, 100)
+                            } else {
+                                Color32::from_rgb(112, 236, 184)
+                            };
+                            ui.label(RichText::new(&self.custom.status).small().color(col));
+                        }
+                        if !self.custom.last_error.is_empty() {
+                            let mut clear_err = false;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(&self.custom.last_error)
+                                        .small()
+                                        .color(Color32::from_rgb(248, 122, 108)),
+                                );
+                                if ui.small_button("×").on_hover_text("Dismiss error").clicked() {
+                                    clear_err = true;
+                                }
+                            });
+                            if clear_err {
+                                self.custom.last_error.clear();
                             }
                         }
                     });
@@ -2712,7 +3090,12 @@ impl CrtApp {
                 self.controls(ui);
                 self.sound_controls(ui);
                 self.about_controls(ui);
-                if !self.message.is_empty() && self.message != "pick" && self.message != "pickvideo" && self.message != "pickfolder" {
+                if !self.message.is_empty()
+                    && self.message != "pick"
+                    && self.message != "pickvideo"
+                    && self.message != "pickfolder"
+                    && self.message != "pickm3u"
+                {
                     ui.colored_label(Color32::from_rgb(230, 120, 90), &self.message);
                 }
                 ui.add_space(8.0);
@@ -2982,7 +3365,10 @@ impl CrtApp {
         let jf_changed = self.jellyfin.poll();
         let px_changed = self.plex.poll();
         let dir_changed = self.folders.poll();
-        if jf_changed || px_changed || dir_changed {
+        let m3u_changed = self.m3u.poll();
+        let cus_changed = self.custom.poll();
+        let any_changed = jf_changed || px_changed || dir_changed || m3u_changed || cus_changed;
+        if any_changed {
             self.rebuild_lineup();
         }
         if !self.jellyfin.last_error.is_empty() && self.jellyfin.last_error != prev_jf_err {
@@ -2991,7 +3377,7 @@ impl CrtApp {
         if !self.plex.last_error.is_empty() && self.plex.last_error != prev_px_err {
             self.osd.show_action("PLEX SYNC ERR");
         }
-        if (jf_changed || px_changed || dir_changed) && self.notify_guide_synced && !self.any_source_busy() {
+        if any_changed && self.notify_guide_synced && !self.any_source_busy() {
             self.notify_guide_synced = false;
             if self.has_channels() {
                 self.osd.show_action("GUIDE SYNCED");
@@ -3356,16 +3742,21 @@ impl CrtApp {
                         w.marked_played = true;
                         rebuild_after_tick = true;
                     }
-                } else if w.provider_id == "folders" && w.dwell_secs >= 20.0 {
+                } else if (w.provider_id == "folders" || w.provider_id == "custom") && w.dwell_secs >= 20.0 {
                     let hit_90 = !w.marked_played && w.duration_secs > 30.0 && pos >= w.duration_secs * 0.90;
                     if hit_90 || w.dwell_secs - w.last_progress_secs >= 15.0 {
                         w.last_progress_secs = w.dwell_secs;
                         let iid = w.item_id.clone();
                         let d = w.duration_secs;
+                        let prov = w.provider_id.clone();
                         if hit_90 {
                             w.marked_played = true;
                         }
-                        self.folders.save_resume(&iid, pos, d);
+                        if prov == "folders" {
+                            self.folders.save_resume(&iid, pos, d);
+                        } else {
+                            self.custom.save_resume(&iid, pos, d);
+                        }
                         if hit_90 {
                             rebuild_after_tick = true;
                         }
@@ -3602,6 +3993,10 @@ impl CrtApp {
         if self.message == "pickfolder" {
             self.message.clear();
             self.pick_folder();
+        }
+        if self.message == "pickm3u" {
+            self.message.clear();
+            self.pick_m3u_playlist();
         }
         if self.message == "exitfs" {
             self.message.clear();

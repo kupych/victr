@@ -3,11 +3,13 @@
 mod about;
 mod app;
 mod audio;
+mod custom_provider;
 mod folders;
 mod gpu;
 mod guide;
 mod jellyfin;
 mod link;
+mod m3u;
 mod mpv;
 mod osd;
 mod plex;

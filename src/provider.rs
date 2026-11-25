@@ -55,7 +55,6 @@ pub enum ChannelKind {
         movies: Vec<MediaItem>,
     },
     /// Continuous online/HLS live stream channel (used by M3U8 & custom integrators).
-    #[allow(dead_code)]
     LiveStream {
         stream_url: String,
         group: String,
