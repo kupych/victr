@@ -505,7 +505,7 @@ fn composite_at(n: f32, l: f32) -> f32 {
     let s = yc_at(n, l);
     var y = s.x;
     var c = s.y;
-    if U.i1.x == 0 {
+    if abs(U.dec0.x) > 0.0001 {
         let ft = U.dec0.x;
         c *= clamp(1.0 - ft * 1.3, 0.0, 1.6);
         if ft > 0.0 { y += ft * 0.9 * (s.x - yc_at(n - 3.0, l).x); }

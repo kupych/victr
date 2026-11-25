@@ -1408,13 +1408,14 @@ impl CrtApp {
         p.whack_t = self.sim.whack_t;
         p.test_tone = s.test_tone && s.pattern == Pattern::ColorBars;
         let (c_sig_drop, c_noise, c_ghost, c_track, c_warble, c_hum, c_ripple) = self.sim.chaos_audio_offsets();
+        let (ch_ft, ch_tr) = self.sim.channel_aft_offsets();
         p.rf = s.input == Input::Rf;
-        p.snr_db = (s.signal_db - c_sig_drop).max(-25.0);
-        p.fine_tune = s.fine_tune;
+        p.snr_db = (s.signal_db - c_sig_drop - ch_ft.abs() * 8.0).max(-25.0);
+        p.fine_tune = (s.fine_tune + ch_ft).clamp(-1.0, 1.0);
         p.ghost = (s.ghost_amp + c_ghost).clamp(-0.6, 0.6);
         p.hum = (s.hum + c_hum).min(1.0);
         p.impulse = s.impulse;
-        p.extra_noise = s.extra_noise + c_noise;
+        p.extra_noise = s.extra_noise + c_noise + ch_ft.abs() * 0.06;
         p.vcr = s.vcr;
         let base_bw = match s.tape_speed {
             TapeSpeed::Sp => 10.0,
@@ -1423,7 +1424,7 @@ impl CrtApp {
         };
         p.tape_bw_khz = base_bw * (1.0 - 0.35 * s.tape_wear);
         p.tape_wear = s.tape_wear;
-        p.tracking = (s.tracking + c_track).clamp(-1.0, 1.0);
+        p.tracking = (s.tracking + c_track + ch_tr).clamp(-1.0, 1.0);
         p.dropouts = s.dropouts;
         p.wow = s.timebase_jitter + c_warble;
         p.head_switch = s.head_switch;

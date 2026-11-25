@@ -109,6 +109,10 @@ pub struct Sim {
     pub degauss_t: f32,
     degauss_phase: f32,
     pub channel_switch_t: f32,
+    ch_fine_tune_init: f32,
+    ch_tracking_init: f32,
+    ch_h_pull_init: f32,
+    ch_v_pull_init: f32,
     pub whack_t: f32,
     chaos: ChaosState,
     lines: Vec<f32>,
@@ -134,6 +138,10 @@ impl Sim {
             degauss_t: 0.0,
             degauss_phase: 0.7,
             channel_switch_t: 10.0,
+            ch_fine_tune_init: 0.0,
+            ch_tracking_init: 0.0,
+            ch_h_pull_init: 0.0,
+            ch_v_pull_init: 0.0,
             whack_t: 10.0,
             chaos: ChaosState { next_glitch_s: 8.0, ..Default::default() },
             lines: vec![0.0; (NL * 2 * 4) as usize],
@@ -175,6 +183,41 @@ impl Sim {
 
     pub fn switch_channel(&mut self) {
         self.channel_switch_t = 0.0;
+        // Classic analog tuner AFT (Automatic Fine Tuning) & sync pull-in:
+        // start slightly off-frequency/off-tracking and smoothly drift to zero.
+        let sign_ft = if self.next() > 0.5 { 1.0 } else { -1.0 };
+        let sign_tr = if self.next() > 0.5 { 1.0 } else { -1.0 };
+        let sign_h = if self.next() > 0.5 { 1.0 } else { -1.0 };
+        let sign_v = if self.next() > 0.5 { 1.0 } else { -1.0 };
+        self.ch_fine_tune_init = sign_ft * (0.48 + 0.36 * self.next());
+        self.ch_tracking_init = sign_tr * (0.24 + 0.20 * self.next());
+        self.ch_h_pull_init = sign_h * (0.028 + 0.028 * self.next());
+        self.ch_v_pull_init = sign_v * (0.012 + 0.016 * self.next());
+    }
+
+    /// Live channel-switch AFT / tracking pull-in offsets: (fine_tune, tracking, h_pull, v_pull).
+    fn channel_pull_in(&self) -> (f32, f32, f32, f32) {
+        let ct = self.channel_switch_t;
+        if !(0.0..2.2).contains(&ct) {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        // Damped AFT varactor servo curve: pulls smoothly through zero with a subtle ~6% overshoot then locks.
+        let ft = self.ch_fine_tune_init * (-ct / 0.48).exp() * (ct * 2.0).cos();
+        let tr = self.ch_tracking_init * (-ct / 0.46).exp();
+        let hp = self.ch_h_pull_init * (-ct / 0.26).exp();
+        let vp = self.ch_v_pull_init * (-ct / 0.20).exp();
+        (
+            if ft.abs() < 0.004 { 0.0 } else { ft },
+            if tr.abs() < 0.004 { 0.0 } else { tr },
+            if hp.abs() < 0.001 { 0.0 } else { hp },
+            if vp.abs() < 0.001 { 0.0 } else { vp },
+        )
+    }
+
+    /// Live channel-switch AFT fine-tune and tracking offsets for synchronized audio DSP.
+    pub fn channel_aft_offsets(&self) -> (f32, f32) {
+        let (ft, tr, _, _) = self.channel_pull_in();
+        (ft, tr)
     }
 
     /// Percussive maintenance: slaps the side of the CRT cabinet to knock loose
@@ -312,13 +355,15 @@ impl Sim {
         self.whack_t += real_dt.max(fdt);
         self.step_chaos(s, s.chaos && self.power_on, real_dt.max(fdt));
 
-        // Brief ~0.25s RF static burst + tuner sync hiccup when changing cable channels
+        // Brief ~0.25s RF static burst + ~1.8s AFT fine-tuning & tracking pull-in when changing channels
         let ch_env = if self.channel_switch_t >= 0.0 && self.channel_switch_t < 0.26 {
             let k = 1.0 - self.channel_switch_t / 0.26;
             k * k
         } else {
             0.0
         };
+        let (ch_ft, ch_tr, ch_h_pull, ch_v_pull) = self.channel_pull_in();
+        let ch_aft_noise = ch_ft.abs() * 0.085;
         // Mechanical cabinet jolt + tiny contact static pop when whacking the TV
         let whack_env = if self.whack_t >= 0.0 && self.whack_t < 0.32 {
             (-self.whack_t * 12.0).exp()
@@ -334,12 +379,13 @@ impl Sim {
         };
 
         // ---- noise budget
-        let eff_signal_db = (s.signal_db - self.chaos.signal_drop_db).max(-25.0);
+        let eff_signal_db = (s.signal_db - self.chaos.signal_drop_db - ch_ft.abs() * 8.0).max(-25.0);
         let rf_sigma = if s.input == Input::Rf { 10f32.powf(-eff_signal_db / 20.0) } else { 0.0 }
             + 0.85 * ch_env
+            + ch_aft_noise
             + self.chaos.noise * 1.4
             + whack_pop;
-        let extra_noise_eff = s.extra_noise + 0.65 * ch_env + self.chaos.noise + whack_pop;
+        let extra_noise_eff = s.extra_noise + 0.65 * ch_env + ch_aft_noise * 0.75 + self.chaos.noise + whack_pop;
         let (tape_sigma, speed_bw) = if s.vcr {
             let k = match s.tape_speed {
                 TapeSpeed::Sp => (1.0, 3.0),
@@ -371,7 +417,7 @@ impl Sim {
 
         // ---- VCR tracking band
         let track_err = if s.vcr {
-            s.tracking + self.chaos.tracking + 0.04 * s.tape_wear * (t * 0.31).sin()
+            s.tracking + self.chaos.tracking + ch_tr + 0.04 * s.tape_wear * (t * 0.31).sin()
         } else {
             0.0
         };
@@ -382,7 +428,7 @@ impl Sim {
 
         // ---- horizontal: AFC loop per line
         // free-running error of the line oscillator (a real one is never exactly on frequency)
-        let detune = (s.h_hold + self.chaos.h_hold) * 14.0 + 0.35;
+        let detune = (s.h_hold + self.chaos.h_hold + ch_h_pull) * 14.0 + 0.35;
         let k_afc = s.afc_speed.clamp(0.02, 1.0);
         let max_corr = 9.0;
         let mut err_acc = 0.0;
@@ -451,7 +497,7 @@ impl Sim {
         let half = NL as f32 * 0.5;
         // the field oscillator free-runs slightly slow; a sync pulse inside the
         // pull-in window triggers the retrace early and locks the picture
-        self.v_phase += (s.v_hold + self.chaos.v_hold) * 25.0 + 0.4;
+        self.v_phase += (s.v_hold + self.chaos.v_hold + ch_v_pull) * 25.0 + 0.4;
         if self.next() < p_v {
             let w = (self.v_phase + half).rem_euclid(NL as f32) - half;
             if w.abs() < 10.0 {
@@ -587,7 +633,7 @@ impl Sim {
             interf_freq: s.interference_freq,
             hum: (s.hum + self.chaos.hum).min(1.0),
             impulse: s.impulse,
-            fine_tune: s.fine_tune,
+            fine_tune: ((if s.input == Input::Rf { s.fine_tune } else { 0.0 }) + ch_ft).clamp(-1.0, 1.0),
             comb: s.comb_filter as i32,
             contrast: s.contrast,
             brightness: s.brightness * 0.3,
@@ -760,5 +806,38 @@ mod tests {
         assert!((sim.warm - 1.0).abs() < 1e-5);
         assert!((hot.u.hsize - s.h_size).abs() < 1e-5);
         assert!(hot.u.emission[0] > 0.95 && hot.u.emission[1] > 0.95 && hot.u.emission[2] > 0.95);
+    }
+
+    #[test]
+    fn channel_switch_drifts_fine_tuning_and_tracking_to_zero() {
+        let mut sim = Sim::new();
+        sim.warm = 1.0;
+        let s = Settings::default();
+
+        sim.switch_channel();
+        let (ft0, tr0) = sim.channel_aft_offsets();
+        assert!(ft0.abs() > 0.4, "channel switch should start fine tuning off-center: {ft0}");
+        assert!(tr0.abs() > 0.2, "channel switch should start tracking off-center: {tr0}");
+
+        let f0 = sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        assert!(f0.u.fine_tune.abs() > 0.4);
+
+        // Midway (~0.45s): pulled noticeably closer to zero
+        for _ in 0..27 {
+            sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        }
+        let (ft_mid, tr_mid) = sim.channel_aft_offsets();
+        assert!(ft_mid.abs() < ft0.abs() * 0.6);
+        assert!(tr_mid.abs() < tr0.abs() * 0.6);
+
+        // After ~2.4s: cleanly locked at exact 0.0
+        for _ in 0..120 {
+            sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        }
+        let (ft_end, tr_end) = sim.channel_aft_offsets();
+        assert_eq!(ft_end, 0.0);
+        assert_eq!(tr_end, 0.0);
+        let f_end = sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        assert_eq!(f_end.u.fine_tune, 0.0);
     }
 }
