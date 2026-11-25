@@ -445,11 +445,11 @@ fn pick_next_episode_index(episodes: &[MediaItem], next_up_id: Option<&str>) -> 
         return None;
     }
     if let Some(id) = next_up_id {
-        if let Some(pos) = episodes.iter().position(|e| e.id == id) {
+        if let Some(pos) = episodes.iter().position(|e| e.id == id && (!e.played || e.resume_secs > 10.0)) {
             return Some(pos);
         }
     }
-    if let Some(pos) = episodes.iter().position(|e| e.resume_secs > 10.0) {
+    if let Some(pos) = episodes.iter().position(|e| e.resume_secs > 10.0 && !e.played) {
         return Some(pos);
     }
     episodes.iter().position(|e| !e.played).or(Some(0))
@@ -632,13 +632,26 @@ pub fn fetch_users(server_url: &str, api_key: &str) -> Result<Vec<JellyfinUser>,
 }
 
 fn merge_and_sort_episodes(series_id: &str, primary: Vec<RawItem>, secondary: Vec<RawItem>) -> Vec<MediaItem> {
-    let mut seen = std::collections::HashSet::new();
+    let mut index_by_id: HashMap<String, usize> = HashMap::new();
     let mut raw: Vec<RawItem> = Vec::with_capacity(primary.len() + secondary.len());
     for item in primary.into_iter().chain(secondary.into_iter()) {
         if item.is_folder || item.location_type.as_deref() == Some("Virtual") {
             continue;
         }
-        if seen.insert(item.id.clone()) {
+        if let Some(&idx) = index_by_id.get(&item.id) {
+            // Merge UserData if the second endpoint carried watched/resume info missing from the first.
+            if let Some(ud_new) = item.user_data {
+                match &mut raw[idx].user_data {
+                    Some(ud_cur) => {
+                        ud_cur.played |= ud_new.played;
+                        ud_cur.is_favorite |= ud_new.is_favorite;
+                        ud_cur.playback_position_ticks = ud_cur.playback_position_ticks.max(ud_new.playback_position_ticks);
+                    }
+                    None => raw[idx].user_data = Some(ud_new),
+                }
+            }
+        } else {
+            index_by_id.insert(item.id.clone(), raw.len());
             raw.push(item);
         }
     }
@@ -666,16 +679,20 @@ fn merge_and_sort_episodes(series_id: &str, primary: Vec<RawItem>, secondary: Ve
 pub fn fetch_series_episodes(server_url: &str, api_key: &str, user_id: &str, series_id: &str) -> Result<Vec<MediaItem>, String> {
     let base = server_url.trim().trim_end_matches('/');
     let agent = make_agent();
-    // Query both `/Shows/{id}/Episodes` AND `/Users/{uid}/Items?ParentId={id}&IncludeItemTypes=Episode,Video&Recursive=true`
-    // and merge by ID so every real episode file (all seasons, merged folders, specials, and un-parsed videos) shows up.
+    // Query both `/Shows/{id}/Episodes` AND `/Items?userId={uid}&ParentId={id}` (with legacy `/Users/{uid}/Items` fallback)
+    // and merge by ID so every real episode file and its exact UserData (watched/resume state) shows up across Jellyfin 10.8–10.11+.
     let shows_url = format!(
-        "{base}/Shows/{series_id}/Episodes?UserId={user_id}&IsMissing=false&Fields=Overview,RunTimeTicks,UserData&EnableUserData=true"
+        "{base}/Shows/{series_id}/Episodes?userId={user_id}&IsMissing=false&Fields=Overview,RunTimeTicks,UserData&EnableUserData=true"
     );
-    let items_url = format!(
+    let items_v2_url = format!(
+        "{base}/Items?userId={user_id}&ParentId={series_id}&IncludeItemTypes=Episode,Video&Recursive=true&IsMissing=false&Fields=Overview,RunTimeTicks,UserData&EnableUserData=true"
+    );
+    let items_legacy_url = format!(
         "{base}/Users/{user_id}/Items?ParentId={series_id}&IncludeItemTypes=Episode,Video&Recursive=true&IsMissing=false&Fields=Overview,RunTimeTicks,UserData&EnableUserData=true"
     );
     let r_shows = get_json::<RawItemsResp>(&agent, &shows_url, api_key);
-    let r_items = get_json::<RawItemsResp>(&agent, &items_url, api_key);
+    let r_items = get_json::<RawItemsResp>(&agent, &items_v2_url, api_key)
+        .or_else(|_| get_json::<RawItemsResp>(&agent, &items_legacy_url, api_key));
     match (r_shows, r_items) {
         (Ok(a), Ok(b)) => Ok(merge_and_sort_episodes(series_id, a.items, b.items)),
         (Ok(a), Err(_)) => Ok(merge_and_sort_episodes(series_id, a.items, Vec::new())),
@@ -694,7 +711,7 @@ pub fn trigger_library_scan(server_url: &str, api_key: &str) -> Result<(), Strin
         .post(&format!("{base}/Library/Refresh"))
         .set("X-Emby-Token", api_key.trim())
         .set("Authorization", &auth_header(api_key))
-        .call()
+        .send_bytes(&[])
         .map_err(|e| format!("Library scan request failed: {e}"))?;
     Ok(())
 }
@@ -803,11 +820,15 @@ pub fn fetch_lineup(cfg: &JellyfinConfig) -> Result<Vec<Channel>, String> {
         }
     }
 
-    // 2. All TV Series
-    let series_url = format!(
-        "{base}/Users/{uid}/Items?IncludeItemTypes=Series&Recursive=true&Fields=Overview,Genres,UserData&SortBy=SortName&SortOrder=Ascending"
+    // 2. All TV Series (prefer Jellyfin 10.9+ `/Items?userId=`, fallback to legacy `/Users/{uid}/Items`)
+    let series_v2_url = format!(
+        "{base}/Items?userId={uid}&IncludeItemTypes=Series&Recursive=true&Fields=Overview,Genres,UserData&EnableUserData=true&SortBy=SortName&SortOrder=Ascending"
     );
-    let raw_series: RawItemsResp = get_json(&agent, &series_url, key)?;
+    let series_legacy_url = format!(
+        "{base}/Users/{uid}/Items?IncludeItemTypes=Series&Recursive=true&Fields=Overview,Genres,UserData&EnableUserData=true&SortBy=SortName&SortOrder=Ascending"
+    );
+    let raw_series: RawItemsResp = get_json(&agent, &series_v2_url, key)
+        .or_else(|_| get_json(&agent, &series_legacy_url, key))?;
 
     let mut series_entries: Vec<(usize, bool, String, RawItem)> = raw_series
         .items
@@ -822,10 +843,14 @@ pub fn fetch_lineup(cfg: &JellyfinConfig) -> Result<Vec<Channel>, String> {
     series_entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
 
     // 3. All Movies -> grouped by Genre
-    let movies_url = format!(
-        "{base}/Users/{uid}/Items?IncludeItemTypes=Movie&Recursive=true&Fields=Overview,Genres,RunTimeTicks,UserData&SortBy=SortName&SortOrder=Ascending"
+    let movies_v2_url = format!(
+        "{base}/Items?userId={uid}&IncludeItemTypes=Movie&Recursive=true&Fields=Overview,Genres,RunTimeTicks,UserData&EnableUserData=true&SortBy=SortName&SortOrder=Ascending"
     );
-    let raw_movies: RawItemsResp = get_json(&agent, &movies_url, key)?;
+    let movies_legacy_url = format!(
+        "{base}/Users/{uid}/Items?IncludeItemTypes=Movie&Recursive=true&Fields=Overview,Genres,RunTimeTicks,UserData&EnableUserData=true&SortBy=SortName&SortOrder=Ascending"
+    );
+    let raw_movies: RawItemsResp = get_json(&agent, &movies_v2_url, key)
+        .or_else(|_| get_json(&agent, &movies_legacy_url, key))?;
     let mut by_genre: BTreeMap<String, Vec<MediaItem>> = BTreeMap::new();
     for m in raw_movies.items {
         let item = m.to_media_item(&m.id);
@@ -915,6 +940,7 @@ fn report_session_with_agent(
     agent: &ureq::Agent,
     server_url: &str,
     api_key: &str,
+    user_id: &str,
     endpoint: &str,
     item_id: &str,
     pos_secs: f64,
@@ -938,39 +964,104 @@ fn report_session_with_agent(
         .set("X-Emby-Token", api_key.trim())
         .set("Authorization", &auth_header(api_key))
         .send_json(body);
+
+    // Dashboard API keys are not tied to a user session, so also persist PlaybackPositionTicks
+    // directly on the user's UserData record when saving progress / stopping.
+    if !user_id.is_empty() && endpoint != "/Sessions/Playing" {
+        let ud_body = serde_json::json!({ "PlaybackPositionTicks": ticks });
+        let v2 = agent
+            .post(&format!("{base}/UserItems/{item_id}/UserData?userId={user_id}"))
+            .set("X-Emby-Token", api_key.trim())
+            .set("Authorization", &auth_header(api_key))
+            .send_json(ud_body.clone());
+        if v2.is_err() {
+            let _ = agent
+                .post(&format!("{base}/Users/{user_id}/Items/{item_id}/UserData"))
+                .set("X-Emby-Token", api_key.trim())
+                .set("Authorization", &auth_header(api_key))
+                .send_json(ud_body);
+        }
+    }
 }
 
-fn report_session(server_url: &str, api_key: &str, endpoint: &str, item_id: &str, pos_secs: f64, paused: bool) {
-    report_session_with_agent(&make_agent(), server_url, api_key, endpoint, item_id, pos_secs, paused);
+fn report_session(server_url: &str, api_key: &str, user_id: &str, endpoint: &str, item_id: &str, pos_secs: f64, paused: bool) {
+    report_session_with_agent(&make_agent(), server_url, api_key, user_id, endpoint, item_id, pos_secs, paused);
 }
 
-fn mark_played_with_agent(agent: &ureq::Agent, server_url: &str, api_key: &str, user_id: &str, item_id: &str) {
+fn mark_played_with_agent(
+    agent: &ureq::Agent,
+    server_url: &str,
+    api_key: &str,
+    user_id: &str,
+    item_id: &str,
+) -> Result<(), String> {
     let base = server_url.trim().trim_end_matches('/');
     if base.is_empty() || api_key.trim().is_empty() || user_id.is_empty() || item_id.is_empty() {
-        return;
+        return Err("Jellyfin server not configured.".into());
     }
-    let _ = agent
+    // Use `.send_bytes(&[])` so `Content-Length: 0` is always sent (Kestrel rejects POST without Content-Length).
+    // Try Jellyfin 10.9+ `/UserPlayedItems/{id}?userId=`, then legacy `/Users/{uid}/PlayedItems/{id}`,
+    // then direct `UserData` update.
+    let r1 = agent
+        .post(&format!("{base}/UserPlayedItems/{item_id}?userId={user_id}"))
+        .set("X-Emby-Token", api_key.trim())
+        .set("Authorization", &auth_header(api_key))
+        .send_bytes(&[]);
+    if r1.is_ok() {
+        return Ok(());
+    }
+    let r2 = agent
         .post(&format!("{base}/Users/{user_id}/PlayedItems/{item_id}"))
         .set("X-Emby-Token", api_key.trim())
         .set("Authorization", &auth_header(api_key))
-        .call();
+        .send_bytes(&[]);
+    if r2.is_ok() {
+        return Ok(());
+    }
+    let ud = serde_json::json!({ "Played": true, "PlaybackPositionTicks": 0 });
+    agent
+        .post(&format!("{base}/UserItems/{item_id}/UserData?userId={user_id}"))
+        .set("X-Emby-Token", api_key.trim())
+        .set("Authorization", &auth_header(api_key))
+        .send_json(ud)
+        .map(|_| ())
+        .map_err(|e| format!("Mark watched failed: {e}"))
 }
 
-fn mark_played(server_url: &str, api_key: &str, user_id: &str, item_id: &str) {
-    mark_played_with_agent(&make_agent(), server_url, api_key, user_id, item_id);
+fn mark_played(server_url: &str, api_key: &str, user_id: &str, item_id: &str) -> Result<(), String> {
+    mark_played_with_agent(&make_agent(), server_url, api_key, user_id, item_id)
 }
 
-fn mark_unplayed(server_url: &str, api_key: &str, user_id: &str, item_id: &str) {
+fn mark_unplayed(server_url: &str, api_key: &str, user_id: &str, item_id: &str) -> Result<(), String> {
     let base = server_url.trim().trim_end_matches('/');
     if base.is_empty() || api_key.trim().is_empty() || user_id.is_empty() || item_id.is_empty() {
-        return;
+        return Err("Jellyfin server not configured.".into());
     }
     let agent = make_agent();
-    let _ = agent
+    let r1 = agent
+        .delete(&format!("{base}/UserPlayedItems/{item_id}?userId={user_id}"))
+        .set("X-Emby-Token", api_key.trim())
+        .set("Authorization", &auth_header(api_key))
+        .call();
+    if r1.is_ok() {
+        return Ok(());
+    }
+    let r2 = agent
         .delete(&format!("{base}/Users/{user_id}/PlayedItems/{item_id}"))
         .set("X-Emby-Token", api_key.trim())
         .set("Authorization", &auth_header(api_key))
         .call();
+    if r2.is_ok() {
+        return Ok(());
+    }
+    let ud = serde_json::json!({ "Played": false });
+    agent
+        .post(&format!("{base}/UserItems/{item_id}/UserData?userId={user_id}"))
+        .set("X-Emby-Token", api_key.trim())
+        .set("Authorization", &auth_header(api_key))
+        .send_json(ud)
+        .map(|_| ())
+        .map_err(|e| format!("Mark unwatched failed: {e}"))
 }
 
 // ------------------------------------------------------------------ Async Manager
@@ -982,6 +1073,7 @@ pub enum JellyfinEvent {
     EpisodesLoaded(String, Result<Vec<MediaItem>, String>),
     ScanProgress(String),
     LibraryScanTriggered(Result<(), String>),
+    ActionError(String),
     ArtworkLoaded(String, ArtworkImage),
 }
 
@@ -1265,10 +1357,29 @@ impl JellyfinManager {
                         Ok(eps) => {
                             self.episodes_failed_at.remove(&sid);
                             for ch in &mut self.channels {
-                                if let ChannelKind::Series { series_id, episodes, loaded_episodes, .. } = &mut ch.kind {
+                                if let ChannelKind::Series {
+                                    series_id,
+                                    episodes,
+                                    next_up_episode_id,
+                                    loaded_episodes,
+                                    ..
+                                } = &mut ch.kind
+                                {
                                     if series_id == &sid {
                                         *episodes = eps.clone();
                                         *loaded_episodes = true;
+                                        // Refresh Next Up if it was missing or is now marked watched
+                                        let valid_nu = next_up_episode_id.as_deref().is_some_and(|id| {
+                                            episodes.iter().any(|e| e.id == id && (!e.played || e.resume_secs > 10.0))
+                                        });
+                                        if !valid_nu {
+                                            *next_up_episode_id = episodes
+                                                .iter()
+                                                .find(|e| e.resume_secs > 10.0 && !e.played)
+                                                .or_else(|| episodes.iter().find(|e| !e.played))
+                                                .or_else(|| episodes.first())
+                                                .map(|e| e.id.clone());
+                                        }
                                         changed = true;
                                     }
                                 }
@@ -1296,6 +1407,10 @@ impl JellyfinManager {
                             self.status = e;
                         }
                     }
+                    changed = true;
+                }
+                JellyfinEvent::ActionError(msg) => {
+                    self.status = msg;
                     changed = true;
                 }
                 JellyfinEvent::ArtworkLoaded(id, img) => {
@@ -1378,12 +1493,16 @@ impl JellyfinManager {
         let key = self.cfg.api_key.clone();
         let uid = self.cfg.user_id.clone();
         let id = item_id.to_string();
+        let ev = self.events.clone();
         if !url.is_empty() && !key.trim().is_empty() && !uid.is_empty() {
             std::thread::spawn(move || {
-                if played {
-                    mark_played(&url, &key, &uid, &id);
+                let res = if played {
+                    mark_played(&url, &key, &uid, &id)
                 } else {
-                    mark_unplayed(&url, &key, &uid, &id);
+                    mark_unplayed(&url, &key, &uid, &id)
+                };
+                if let Err(e) = res {
+                    ev.lock().unwrap().push(JellyfinEvent::ActionError(e));
                 }
             });
         }
@@ -1432,7 +1551,7 @@ impl JellyfinManager {
             w.reported_start = true;
             w.last_progress_secs = w.dwell_secs;
             std::thread::spawn(move || {
-                report_session(&url, &key, "/Sessions/Playing", &item_id, pos, paused);
+                report_session(&url, &key, &uid, "/Sessions/Playing", &item_id, pos, paused);
             });
             return;
         }
@@ -1442,9 +1561,10 @@ impl JellyfinManager {
             w.last_progress_secs = w.dwell_secs;
             let u2 = url.clone();
             let k2 = key.clone();
+            let uid2 = uid.clone();
             let id2 = item_id.clone();
             std::thread::spawn(move || {
-                report_session(&u2, &k2, "/Sessions/Playing/Progress", &id2, pos, paused);
+                report_session(&u2, &k2, &uid2, "/Sessions/Playing/Progress", &id2, pos, paused);
             });
         }
 
@@ -1466,7 +1586,7 @@ impl JellyfinManager {
                 }
             }
             std::thread::spawn(move || {
-                mark_played(&url, &key, &uid, &item_id);
+                let _ = mark_played(&url, &key, &uid, &item_id);
             });
         }
     }
@@ -1520,10 +1640,10 @@ impl JellyfinManager {
         let flush = move |fast: bool| {
             let agent = if fast { make_fast_agent() } else { make_agent() };
             if finished_90 {
-                mark_played_with_agent(&agent, &url, &key, &uid, &item_id);
+                let _ = mark_played_with_agent(&agent, &url, &key, &uid, &item_id);
             }
             if !w.marked_played || finished_90 {
-                report_session_with_agent(&agent, &url, &key, "/Sessions/Playing/Stopped", &item_id, pos, false);
+                report_session_with_agent(&agent, &url, &key, &uid, "/Sessions/Playing/Stopped", &item_id, pos, false);
             }
         };
 
@@ -1643,8 +1763,8 @@ mod tests {
             {"Id":"neg","Name":"Unmatched Ep","ParentIndexNumber":-1,"IndexNumber":-1}
         ]}"#;
         let json2 = r#"{"Items":[
-            {"Id":"e1","Name":"Simpsons Roasting","ParentIndexNumber":1,"IndexNumber":1},
-            {"Id":"e2","Name":"Bart the Genius","ParentIndexNumber":1,"IndexNumber":2},
+            {"Id":"e1","Name":"Simpsons Roasting","ParentIndexNumber":1,"IndexNumber":1,"UserData":{"Played":true}},
+            {"Id":"e2","Name":"Bart the Genius","ParentIndexNumber":1,"IndexNumber":2,"UserData":{"Played":true}},
             {"Id":"fld","Name":"Season 1","IsFolder":true}
         ]}"#;
         let r1: RawItemsResp = serde_json::from_str(json1).unwrap();
@@ -1652,7 +1772,11 @@ mod tests {
         let merged = merge_and_sort_episodes("simpsons", r1.items, r2.items);
         let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["e1", "e2", "neg"]);
+        assert!(merged[0].played && merged[1].played, "UserData.Played should survive merging");
+        assert!(!merged[2].played);
         assert_eq!(merged[2].season, None);
         assert_eq!(merged[2].episode, None);
+        // Stale next_up_id pointing to an already-watched episode must be skipped in favor of first unwatched
+        assert_eq!(pick_next_episode_index(&merged, Some("e1")), Some(2));
     }
 }
