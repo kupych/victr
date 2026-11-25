@@ -1472,19 +1472,25 @@ impl JellyfinManager {
     }
 
     pub fn finish_watch(&mut self) {
-        self.finish_watch_inner(false);
+        let _ = self.finish_watch_inner(false);
+    }
+
+    /// Starts flushing watch progress on a background thread with a short timeout and returns
+    /// its join handle so graceful shutdown can overlap the HTTP request with the CRT collapse.
+    pub fn finish_watch_async_joinable(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.finish_watch_inner(false)
     }
 
     /// Synchronously flushes the current watch position to Jellyfin (with a short timeout)
     /// so quitting ViCTR never drops the final progress/stopped report.
     pub fn finish_watch_sync(&mut self) {
-        self.finish_watch_inner(true);
+        let _ = self.finish_watch_inner(true);
     }
 
-    fn finish_watch_inner(&mut self, blocking: bool) {
-        let Some(w) = self.active_watch.take() else { return };
+    fn finish_watch_inner(&mut self, blocking: bool) -> Option<std::thread::JoinHandle<()>> {
+        let Some(w) = self.active_watch.take() else { return None };
         if !w.reported_start {
-            return;
+            return None;
         }
         let url = self.cfg.normalized_url();
         let key = self.cfg.api_key.clone();
@@ -1523,8 +1529,9 @@ impl JellyfinManager {
 
         if blocking {
             flush(true);
+            None
         } else {
-            std::thread::spawn(move || flush(false));
+            Some(std::thread::spawn(move || flush(true)))
         }
     }
 }

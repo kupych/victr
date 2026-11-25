@@ -104,14 +104,19 @@ pub struct CrtApp {
     fullscreen: bool,
     pending_fullscreen: Option<bool>,
     pending_close: bool,
+    quitting_since: Option<std::time::Instant>,
+    shutdown_flush: Option<std::thread::JoinHandle<()>>,
     fs_since: std::time::Instant,
     last_pointer_move: std::time::Instant,
 }
 
 impl Drop for CrtApp {
     fn drop(&mut self) {
-        // Stop mpv first and synchronously flush Jellyfin playback progress before exiting.
+        // Stop mpv first and guarantee Jellyfin playback progress is flushed before exiting.
         self.player = None;
+        if let Some(h) = self.shutdown_flush.take() {
+            let _ = h.join();
+        }
         self.jellyfin.finish_watch_sync();
         if self.inbox.is_some() {
             crate::link::cleanup();
@@ -344,6 +349,8 @@ impl CrtApp {
             fullscreen: false,
             pending_fullscreen: None,
             pending_close: false,
+            quitting_since: None,
+            shutdown_flush: None,
             fs_since: std::time::Instant::now(),
             last_pointer_move: std::time::Instant::now(),
         };
@@ -750,6 +757,26 @@ impl CrtApp {
 
     fn start_video(&mut self, src: String) {
         self.start_video_at(src, 0.0);
+    }
+
+    fn begin_quit(&mut self) {
+        // Second Ctrl+Q during power-down collapse exits immediately.
+        if self.quitting_since.is_some() {
+            self.pending_close = true;
+            return;
+        }
+        self.player = None;
+        self.sidebar_open = false;
+        self.save_preset_open = false;
+        if self.shutdown_flush.is_none() {
+            self.shutdown_flush = self.jellyfin.finish_watch_async_joinable();
+        }
+        if self.sim.power_on {
+            self.sim.set_power(false);
+            self.quitting_since = Some(std::time::Instant::now());
+        } else {
+            self.pending_close = true;
+        }
     }
 
     fn toggle_guide(&mut self) {
@@ -1938,10 +1965,10 @@ impl CrtApp {
                     }
                     if ui
                         .add(egui::Button::new(RichText::new("Quit").color(Color32::from_rgb(236, 152, 132))).small())
-                        .on_hover_text("Save watch progress to Jellyfin and quit ViCTR (Ctrl+Q)")
+                        .on_hover_text("Power down the CRT, save watch progress to Jellyfin, and quit (Ctrl+Q)")
                         .clicked()
                     {
-                        self.pending_close = true;
+                        self.begin_quit();
                     }
                     if self.fullscreen
                         && ui
@@ -2290,7 +2317,13 @@ impl CrtApp {
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num1));
         let ctrl_q = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q));
         if ctrl_q {
-            self.pending_close = true;
+            self.begin_quit();
+        }
+        if let Some(t0) = self.quitting_since {
+            // Exit cleanly once the CRT raster dot-collapse & phosphor fade completes (~1.25 s).
+            if t0.elapsed() >= std::time::Duration::from_millis(1250) {
+                self.pending_close = true;
+            }
         }
         if f11 {
             self.set_fullscreen(!self.fullscreen);
@@ -3152,7 +3185,7 @@ impl CrtApp {
                         self.status_toast = None;
                     }
                 }
-                if !self.sim.power_on {
+                if !self.sim.power_on && self.quitting_since.is_none() {
                     ui.painter().text(
                         rect.left_bottom() + egui::vec2(12.0, -12.0),
                         egui::Align2::LEFT_BOTTOM,
