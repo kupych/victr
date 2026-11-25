@@ -904,7 +904,22 @@ pub fn fetch_lineup(cfg: &JellyfinConfig) -> Result<Vec<Channel>, String> {
 
 // ------------------------------------------------------------------ Playback Progress Sync
 
-fn report_session(server_url: &str, api_key: &str, endpoint: &str, item_id: &str, pos_secs: f64, paused: bool) {
+fn make_fast_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_millis(1500))
+        .timeout(std::time::Duration::from_millis(2500))
+        .build()
+}
+
+fn report_session_with_agent(
+    agent: &ureq::Agent,
+    server_url: &str,
+    api_key: &str,
+    endpoint: &str,
+    item_id: &str,
+    pos_secs: f64,
+    paused: bool,
+) {
     let base = server_url.trim().trim_end_matches('/');
     if base.is_empty() || api_key.trim().is_empty() || item_id.is_empty() {
         return;
@@ -918,7 +933,6 @@ fn report_session(server_url: &str, api_key: &str, endpoint: &str, item_id: &str
         "CanSeek": true,
         "PlayMethod": "DirectStream"
     });
-    let agent = make_agent();
     let _ = agent
         .post(&format!("{base}{endpoint}"))
         .set("X-Emby-Token", api_key.trim())
@@ -926,17 +940,24 @@ fn report_session(server_url: &str, api_key: &str, endpoint: &str, item_id: &str
         .send_json(body);
 }
 
-fn mark_played(server_url: &str, api_key: &str, user_id: &str, item_id: &str) {
+fn report_session(server_url: &str, api_key: &str, endpoint: &str, item_id: &str, pos_secs: f64, paused: bool) {
+    report_session_with_agent(&make_agent(), server_url, api_key, endpoint, item_id, pos_secs, paused);
+}
+
+fn mark_played_with_agent(agent: &ureq::Agent, server_url: &str, api_key: &str, user_id: &str, item_id: &str) {
     let base = server_url.trim().trim_end_matches('/');
     if base.is_empty() || api_key.trim().is_empty() || user_id.is_empty() || item_id.is_empty() {
         return;
     }
-    let agent = make_agent();
     let _ = agent
         .post(&format!("{base}/Users/{user_id}/PlayedItems/{item_id}"))
         .set("X-Emby-Token", api_key.trim())
         .set("Authorization", &auth_header(api_key))
         .call();
+}
+
+fn mark_played(server_url: &str, api_key: &str, user_id: &str, item_id: &str) {
+    mark_played_with_agent(&make_agent(), server_url, api_key, user_id, item_id);
 }
 
 fn mark_unplayed(server_url: &str, api_key: &str, user_id: &str, item_id: &str) {
@@ -1451,25 +1472,59 @@ impl JellyfinManager {
     }
 
     pub fn finish_watch(&mut self) {
+        self.finish_watch_inner(false);
+    }
+
+    /// Synchronously flushes the current watch position to Jellyfin (with a short timeout)
+    /// so quitting ViCTR never drops the final progress/stopped report.
+    pub fn finish_watch_sync(&mut self) {
+        self.finish_watch_inner(true);
+    }
+
+    fn finish_watch_inner(&mut self, blocking: bool) {
         let Some(w) = self.active_watch.take() else { return };
-        // Update local resume position if watched >20s and not yet finished
-        if w.reported_start && !w.marked_played {
+        if !w.reported_start {
+            return;
+        }
+        let url = self.cfg.normalized_url();
+        let key = self.cfg.api_key.clone();
+        let uid = self.cfg.user_id.clone();
+        let item_id = w.item_id;
+        let pos = w.last_pos;
+        let finished_90 = !w.marked_played && w.duration_secs > 30.0 && (pos / w.duration_secs) >= 0.90;
+
+        // Update local resume/played state immediately
+        if !w.marked_played {
             for ch in &mut self.channels {
                 if ch.number == w.channel_number {
                     if let ChannelKind::Series { episodes, .. } = &mut ch.kind {
-                        if let Some(ep) = episodes.iter_mut().find(|e| e.id == w.item_id) {
-                            ep.resume_secs = w.last_pos;
+                        if let Some(ep) = episodes.iter_mut().find(|e| e.id == item_id) {
+                            if finished_90 {
+                                ep.played = true;
+                                ep.resume_secs = 0.0;
+                            } else {
+                                ep.resume_secs = pos;
+                            }
                         }
                     }
                 }
             }
-            let url = self.cfg.normalized_url();
-            let key = self.cfg.api_key.clone();
-            let item_id = w.item_id;
-            let pos = w.last_pos;
-            std::thread::spawn(move || {
-                report_session(&url, &key, "/Sessions/Playing/Stopped", &item_id, pos, false);
-            });
+        }
+
+        let flush = move |fast: bool| {
+            let agent = if fast { make_fast_agent() } else { make_agent() };
+            if finished_90 {
+                mark_played_with_agent(&agent, &url, &key, &uid, &item_id);
+            }
+            if !w.marked_played || finished_90 {
+                report_session_with_agent(&agent, &url, &key, "/Sessions/Playing/Stopped", &item_id, pos, false);
+            }
+        };
+
+        if blocking {
+            flush(true);
+        } else {
+            std::thread::spawn(move || flush(false));
         }
     }
 }

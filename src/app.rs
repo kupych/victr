@@ -103,13 +103,16 @@ pub struct CrtApp {
     tv_hovered: bool,
     fullscreen: bool,
     pending_fullscreen: Option<bool>,
+    pending_close: bool,
     fs_since: std::time::Instant,
     last_pointer_move: std::time::Instant,
 }
 
 impl Drop for CrtApp {
     fn drop(&mut self) {
-        self.jellyfin.finish_watch();
+        // Stop mpv first and synchronously flush Jellyfin playback progress before exiting.
+        self.player = None;
+        self.jellyfin.finish_watch_sync();
         if self.inbox.is_some() {
             crate::link::cleanup();
         }
@@ -340,6 +343,7 @@ impl CrtApp {
             tv_hovered: false,
             fullscreen: false,
             pending_fullscreen: None,
+            pending_close: false,
             fs_since: std::time::Instant::now(),
             last_pointer_move: std::time::Instant::now(),
         };
@@ -1932,6 +1936,13 @@ impl CrtApp {
                     {
                         self.sidebar_open = false;
                     }
+                    if ui
+                        .add(egui::Button::new(RichText::new("Quit").color(Color32::from_rgb(236, 152, 132))).small())
+                        .on_hover_text("Save watch progress to Jellyfin and quit ViCTR (Ctrl+Q)")
+                        .clicked()
+                    {
+                        self.pending_close = true;
+                    }
                     if self.fullscreen
                         && ui
                             .small_button("Exit FS")
@@ -2271,12 +2282,16 @@ impl CrtApp {
             }
         }
 
-        // fullscreen: F11 toggles, Esc leaves; Ctrl+1 snaps screen size to 1:1 pixel-perfect phosphors
+        // fullscreen: F11 toggles, Esc leaves; Ctrl+1 snaps screen size; Ctrl+Q cleanly saves progress & quits
         let f11 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11));
         let esc = (self.fullscreen || self.save_preset_open || self.guide.active)
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let ctrl_1 = !ctx.egui_wants_keyboard_input()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num1));
+        let ctrl_q = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q));
+        if ctrl_q {
+            self.pending_close = true;
+        }
         if f11 {
             self.set_fullscreen(!self.fullscreen);
         } else if esc {
@@ -3394,7 +3409,7 @@ impl CrtApp {
             prefer_pq: self.hdr_prefer_pq,
             fullscreen_cmd: self.pending_fullscreen.take(),
             focus_cmd,
-            close_cmd: false,
+            close_cmd: self.pending_close,
             take_screenshot,
         }
     }

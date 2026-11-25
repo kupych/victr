@@ -104,6 +104,7 @@ cargo test
 | Reset zoom & pan | Double-click the screen (or click **Reset view**) |
 | Pixel-perfect 1× phosphors | `Ctrl+1` (`Cmd+1` on macOS) or click **1:1** next to **Screen size (in)** |
 | Toggle fullscreen | `F11` (press `F11` or `Esc` to exit) |
+| Quit cleanly (saves Jellyfin progress) | `Ctrl+Q` (`Cmd+Q` on macOS), **Quit** in the Service Panel, or close the window |
 | Open image or video | Drag & drop onto the window, or use **Open a picture…** / **Open a video…** |
 | Control `mpv` playback | Hover the TV and use your `mpv` keys (`Space`, arrow keys, etc.) |
 | 90s Cable Guide & TV Remote (Jellyfin) | `G` (Guide), `R` in guide or `F5` (Sync/Refresh library; plus configurable auto-sync interval), `E` or right-click row (Episode/Movie Picker, Left/Right jumps seasons), `W` (Mark Watched/Unwatched), `N`/`P` (Next/Prev Episode), Arrows + `Enter`, `0–9` (dial channel), `PgUp`/`PgDn` or `[`/`]` (Ch+/Ch-), `-`/`+` (Vol), `M` (Mute), `R` during playback (Restart 0:00), `I` (Info OSD) |

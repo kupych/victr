@@ -457,6 +457,8 @@ impl ApplicationHandler for Host {
 
         match event {
             WindowEvent::CloseRequested => {
+                // Drop Runtime (and CrtApp) explicitly so Jellyfin watch progress flushes before exit.
+                self.rt = None;
                 event_loop.exit();
             }
             WindowEvent::Resized(new_size) => {
@@ -492,6 +494,10 @@ impl ApplicationHandler for Host {
             }
             _ => {}
         }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.rt = None;
     }
 }
 
