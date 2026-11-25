@@ -66,14 +66,34 @@ pub enum ChannelKind {
 #[derive(Clone, Debug)]
 pub struct Channel {
     pub number: u16,
-    /// Origin provider identifier: `"jellyfin"`, `"folders"`, `"plex"`, `"m3u"`, `"custom:<id>"`, etc.
+    /// Origin provider identifier: `"jellyfin"`, `"folders"`, `"plex"`, `"m3u"`, `"custom"`, `"channels"`.
     pub provider_id: String,
     /// Stable per-provider channel identity (series ID, folder path, genre, or stream URL).
     pub source_key: String,
     pub callsign: String,
     pub name: String,
     pub artwork_id: String,
+    /// Semantic channel type used to auto-select a TV profile/preset (e.g. `"series"`, `"movies"`, `"live"`, `"web"`, `"vhs"`, `"broadcast"`).
+    pub channel_type: String,
+    /// Optional direct TV profile/preset override on this specific channel.
+    pub profile_override: Option<String>,
     pub kind: ChannelKind,
+}
+
+/// Default semantic channel type derived from a channel's kind.
+pub fn default_channel_type(kind: &ChannelKind) -> &'static str {
+    match kind {
+        ChannelKind::Guide => "guide",
+        ChannelKind::Series { .. } => "series",
+        ChannelKind::MovieGenre { .. } => "movies",
+        ChannelKind::LiveStream { stream_url, .. } => {
+            if stream_url.len() >= 6 && stream_url[..6].eq_ignore_ascii_case("web://") {
+                "web"
+            } else {
+                "live"
+            }
+        }
+    }
 }
 
 /// One program block on the 90s Cable Guide timeline.
@@ -93,6 +113,8 @@ pub struct TuneTarget {
     pub source_key: String,
     pub callsign: String,
     pub channel_name: String,
+    pub channel_type: String,
+    pub profile_override: Option<String>,
     pub item: MediaItem,
     pub stream_url: String,
     pub start_secs: f64,
@@ -105,6 +127,7 @@ pub struct ActiveWatch {
     pub channel_number: u16,
     pub provider_id: String,
     pub source_key: String,
+    pub channel_type: String,
     pub item_id: String,
     pub title: String,
     pub callsign: String,
@@ -127,6 +150,8 @@ pub fn source_badge(provider_id: &str) -> &'static str {
         "PLX"
     } else if provider_id.starts_with("m3u") {
         "LIVE"
+    } else if provider_id == "channels" {
+        "CFG"
     } else if provider_id.starts_with("custom") {
         "EXT"
     } else {
@@ -168,15 +193,32 @@ pub fn make_callsign(name: &str) -> String {
 
 /// Combines channels from all enabled providers into a single classic cable lineup:
 /// - `CH 01`: Program Guide
-/// - `CH 02+`: TV Series (Continue Watching / Favorites first, then alphabetical)
-/// - `CH 50+` (or next round 10s block): 24/7 Movie Genre channels
-/// - `CH 80+` (or next round 10s block): Live Stream / M3U8 channels
+/// - Pinned channels (`ch.number >= 2`) keep their exact requested numbers first.
+/// - Auto-numbered channels fill classic blocks while skipping pinned numbers:
+///   - `CH 02+`: TV Series (Continue Watching / Favorites first, then alphabetical)
+///   - `CH 50+` (or next round 10s block): 24/7 Movie Genre channels
+///   - `CH 80+` (or next round 10s block): Live Stream / Web channels
 pub fn merge_channel_lineup(raw: Vec<Channel>) -> Vec<Channel> {
+    let mut used: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    used.insert(1);
+
+    let mut pinned: Vec<Channel> = Vec::new();
     let mut series: Vec<Channel> = Vec::new();
     let mut movies: Vec<Channel> = Vec::new();
     let mut live: Vec<Channel> = Vec::new();
 
-    for ch in raw {
+    for mut ch in raw {
+        if ch.channel_type.trim().is_empty() {
+            ch.channel_type = default_channel_type(&ch.kind).to_string();
+        }
+        if matches!(ch.kind, ChannelKind::Guide) {
+            continue;
+        }
+        if ch.number >= 2 && used.insert(ch.number) {
+            pinned.push(ch);
+            continue;
+        }
+        ch.number = 0;
         match ch.kind {
             ChannelKind::Guide => {}
             ChannelKind::Series { .. } => series.push(ch),
@@ -203,7 +245,16 @@ pub fn merge_channel_lineup(raw: Vec<Channel>) -> Vec<Channel> {
     });
     movies.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.provider_id.cmp(&b.provider_id)));
 
-    let mut out = Vec::with_capacity(1 + series.len() + movies.len() + live.len());
+    let mut alloc_from = |start: u16| -> u16 {
+        let mut n = start.max(2);
+        while used.contains(&n) && n < u16::MAX {
+            n += 1;
+        }
+        used.insert(n);
+        n
+    };
+
+    let mut out = Vec::with_capacity(1 + pinned.len() + series.len() + movies.len() + live.len());
     out.push(Channel {
         number: 1,
         provider_id: "guide".into(),
@@ -211,31 +262,35 @@ pub fn merge_channel_lineup(raw: Vec<Channel>) -> Vec<Channel> {
         callsign: "GUIDE".into(),
         name: "Program Guide".into(),
         artwork_id: String::new(),
+        channel_type: "guide".into(),
+        profile_override: None,
         kind: ChannelKind::Guide,
     });
+    out.extend(pinned);
 
     let mut ch_num: u16 = 2;
     for mut ch in series {
-        ch.number = ch_num;
-        ch_num = ch_num.saturating_add(1);
+        ch.number = alloc_from(ch_num);
+        ch_num = ch.number.saturating_add(1);
         out.push(ch);
     }
 
     let mut movie_ch = if ch_num <= 50 { 50 } else { ((ch_num + 9) / 10) * 10 };
     for mut ch in movies {
-        ch.number = movie_ch;
-        movie_ch = movie_ch.saturating_add(1);
+        ch.number = alloc_from(movie_ch);
+        movie_ch = ch.number.saturating_add(1);
         out.push(ch);
     }
 
     let next_after_movies = movie_ch.max(ch_num);
     let mut live_ch = if next_after_movies <= 80 { 80 } else { ((next_after_movies + 9) / 10) * 10 };
     for mut ch in live {
-        ch.number = live_ch;
-        live_ch = live_ch.saturating_add(1);
+        ch.number = alloc_from(live_ch);
+        live_ch = ch.number.saturating_add(1);
         out.push(ch);
     }
 
+    out.sort_by_key(|c| c.number);
     out
 }
 
@@ -318,10 +373,20 @@ impl Channel {
             source_key: self.source_key.clone(),
             callsign: self.callsign.clone(),
             channel_name: self.name.clone(),
+            channel_type: self.effective_type().to_string(),
+            profile_override: self.profile_override.clone(),
             stream_url: item.stream_url.clone(),
             start_secs,
             item: item.clone(),
             is_live_clock: false,
+        }
+    }
+
+    pub fn effective_type(&self) -> &str {
+        if self.channel_type.trim().is_empty() {
+            default_channel_type(&self.kind)
+        } else {
+            self.channel_type.trim()
         }
     }
 
@@ -345,6 +410,8 @@ impl Channel {
                     source_key: self.source_key.clone(),
                     callsign: self.callsign.clone(),
                     channel_name: self.name.clone(),
+                    channel_type: self.effective_type().to_string(),
+                    profile_override: self.profile_override.clone(),
                     stream_url: item.stream_url.clone(),
                     start_secs: item.resume_secs.max(0.0),
                     item: item.clone(),
@@ -359,6 +426,8 @@ impl Channel {
                     source_key: self.source_key.clone(),
                     callsign: self.callsign.clone(),
                     channel_name: self.name.clone(),
+                    channel_type: self.effective_type().to_string(),
+                    profile_override: self.profile_override.clone(),
                     stream_url: item.stream_url.clone(),
                     start_secs: offset,
                     item: item.clone(),
@@ -385,6 +454,8 @@ impl Channel {
                     source_key: self.source_key.clone(),
                     callsign: self.callsign.clone(),
                     channel_name: self.name.clone(),
+                    channel_type: self.effective_type().to_string(),
+                    profile_override: self.profile_override.clone(),
                     stream_url: stream_url.clone(),
                     start_secs: 0.0,
                     item,
@@ -406,6 +477,8 @@ impl Channel {
                     source_key: self.source_key.clone(),
                     callsign: self.callsign.clone(),
                     channel_name: self.name.clone(),
+                    channel_type: self.effective_type().to_string(),
+                    profile_override: self.profile_override.clone(),
                     stream_url: next.stream_url.clone(),
                     start_secs: 0.0,
                     item: next.clone(),
@@ -421,6 +494,8 @@ impl Channel {
                     source_key: self.source_key.clone(),
                     callsign: self.callsign.clone(),
                     channel_name: self.name.clone(),
+                    channel_type: self.effective_type().to_string(),
+                    profile_override: self.profile_override.clone(),
                     stream_url: item.stream_url.clone(),
                     start_secs: 0.0,
                     item: item.clone(),
@@ -667,6 +742,8 @@ mod tests {
                 callsign: "BATMN".into(),
                 name: "Batman TAS".into(),
                 artwork_id: String::new(),
+                channel_type: "series".into(),
+                profile_override: None,
                 kind: ChannelKind::Series {
                     series_id: "/tv/batman".into(),
                     overview: String::new(),
@@ -684,6 +761,8 @@ mod tests {
                 callsign: "SIMPS".into(),
                 name: "The Simpsons".into(),
                 artwork_id: String::new(),
+                channel_type: "series".into(),
+                profile_override: None,
                 kind: ChannelKind::Series {
                     series_id: "jf-simpsons".into(),
                     overview: String::new(),
@@ -701,7 +780,25 @@ mod tests {
                 callsign: "ACTIO".into(),
                 name: "Action Movies".into(),
                 artwork_id: String::new(),
+                channel_type: "movies".into(),
+                profile_override: None,
                 kind: ChannelKind::MovieGenre { genre: "Action".into(), movies: vec![mov] },
+            },
+            Channel {
+                number: 36,
+                provider_id: "channels".into(),
+                source_key: "ws4k".into(),
+                callsign: "WS4K".into(),
+                name: "WeatherStar 4000+".into(),
+                artwork_id: String::new(),
+                channel_type: "weather".into(),
+                profile_override: None,
+                kind: ChannelKind::LiveStream {
+                    stream_url: "web://https://4000.weatherstar.dev/?kiosk=true".into(),
+                    group: "Weather".into(),
+                    now_title: "Local Forecast".into(),
+                    overview: String::new(),
+                },
             },
             Channel {
                 number: 0,
@@ -710,6 +807,8 @@ mod tests {
                 callsign: "NEWS".into(),
                 name: "Retro News".into(),
                 artwork_id: String::new(),
+                channel_type: "live".into(),
+                profile_override: None,
                 kind: ChannelKind::LiveStream {
                     stream_url: "http://stream.example/live.m3u8".into(),
                     group: "News".into(),
@@ -720,7 +819,7 @@ mod tests {
         ];
 
         let lineup = merge_channel_lineup(raw);
-        assert_eq!(lineup.len(), 5);
+        assert_eq!(lineup.len(), 6);
         assert_eq!(lineup[0].number, 1);
         assert_eq!(lineup[0].callsign, "GUIDE");
         // Continue Watching series sorted first regardless of provider
@@ -728,11 +827,14 @@ mod tests {
         assert_eq!(lineup[1].name, "The Simpsons");
         assert_eq!(lineup[2].number, 3);
         assert_eq!(lineup[2].name, "Batman TAS");
+        // Pinned channel keeps its exact slot (CH 36)
+        assert_eq!(lineup[3].number, 36);
+        assert_eq!(lineup[3].name, "WeatherStar 4000+");
         // Movies start at CH 50
-        assert_eq!(lineup[3].number, 50);
-        assert_eq!(lineup[3].name, "Action Movies");
+        assert_eq!(lineup[4].number, 50);
+        assert_eq!(lineup[4].name, "Action Movies");
         // Live streams start at CH 80
-        assert_eq!(lineup[4].number, 80);
-        assert_eq!(lineup[4].name, "Retro News");
+        assert_eq!(lineup[5].number, 80);
+        assert_eq!(lineup[5].name, "Retro News");
     }
 }

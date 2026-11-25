@@ -360,6 +360,8 @@ pub fn parse_m3u_channels(content: &str, source_ref: &str, fallback_label: &str)
             callsign: make_callsign(&name),
             name,
             artwork_id: meta.logo_url,
+            channel_type: "live".into(),
+            profile_override: None,
             kind: ChannelKind::LiveStream {
                 stream_url: source_ref.to_string(),
                 group: if meta.group.is_empty() { "Live".into() } else { meta.group },
@@ -437,6 +439,23 @@ pub fn parse_m3u_channels(content: &str, source_ref: &str, fallback_label: &str)
                 .cloned()
                 .unwrap_or_else(|| format!("{group} · Live online stream"));
 
+            let ch_type = pending_attrs
+                .get("channel-type")
+                .or_else(|| pending_attrs.get("tvg-type"))
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    if crate::web_channel::is_web_channel_url(&stream_url) {
+                        "web".into()
+                    } else {
+                        "live".into()
+                    }
+                });
+            let profile_override = pending_attrs
+                .get("profile")
+                .or_else(|| pending_attrs.get("preset"))
+                .filter(|s| !s.trim().is_empty())
+                .cloned();
             channels.push(Channel {
                 number: 0,
                 provider_id: "m3u".into(),
@@ -444,6 +463,8 @@ pub fn parse_m3u_channels(content: &str, source_ref: &str, fallback_label: &str)
                 callsign,
                 name,
                 artwork_id: logo,
+                channel_type: ch_type,
+                profile_override,
                 kind: ChannelKind::LiveStream {
                     stream_url,
                     group,
@@ -553,6 +574,11 @@ pub fn load_all_m3u_channels(cfg: &M3uConfig) -> (Vec<Channel>, Vec<String>) {
                 }
             });
 
+        let ch_type = if crate::web_channel::is_web_channel_url(&url) {
+            "web".into()
+        } else {
+            "live".into()
+        };
         channels.push(Channel {
             number: 0,
             provider_id: "m3u".into(),
@@ -560,6 +586,8 @@ pub fn load_all_m3u_channels(cfg: &M3uConfig) -> (Vec<Channel>, Vec<String>) {
             callsign,
             name,
             artwork_id: logo,
+            channel_type: ch_type,
+            profile_override: None,
             kind: ChannelKind::LiveStream {
                 stream_url: url,
                 group,

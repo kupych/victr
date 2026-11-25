@@ -1,4 +1,5 @@
 use crate::audio::AudioEngine;
+use crate::channels_file::{self, ChannelsFileManager};
 use crate::custom_provider::CustomProviderManager;
 use crate::folders::FoldersManager;
 use crate::gpu::{FrameInput, HdrStatus};
@@ -95,6 +96,7 @@ pub struct CrtApp {
     folders: FoldersManager,
     m3u: M3uManager,
     custom: CustomProviderManager,
+    channels_file: ChannelsFileManager,
     lineup: Vec<Channel>,
     active_watch: Option<ActiveWatch>,
     guide: GuideState,
@@ -122,6 +124,8 @@ pub struct CrtApp {
     custom_ep_url: String,
     custom_ep_auth: String,
     custom_msg: String,
+    new_type_name: String,
+    channels_file_msg: String,
     panel_season_filter: Option<u32>,
     // sound
     audio: Option<AudioEngine>,
@@ -408,6 +412,11 @@ impl CrtApp {
             } else {
                 CustomProviderManager::new()
             },
+            channels_file: if screenshot_mode && !std::env::var_os("VICTR_GUIDE_CONNECT").is_some() {
+                ChannelsFileManager::new_offline()
+            } else {
+                ChannelsFileManager::new()
+            },
             lineup: Vec::new(),
             active_watch: None,
             guide: GuideState::new(),
@@ -435,6 +444,8 @@ impl CrtApp {
             custom_ep_url: String::new(),
             custom_ep_auth: String::new(),
             custom_msg: String::new(),
+            new_type_name: String::new(),
+            channels_file_msg: String::new(),
             panel_season_filter: None,
             audio,
             inbox: if screenshot_mode { None } else { Some(crate::link::listen(egui_ctx.clone())) },
@@ -451,6 +462,7 @@ impl CrtApp {
             last_pointer_move: std::time::Instant::now(),
         };
         // Seed audio parameters immediately so cold power-on crackle & degauss play from frame 0.
+        app.rebuild_lineup();
         app.update_audio();
         if let Some((src, start)) = mpv_src {
             app.start_video_at(src, start);
@@ -561,6 +573,61 @@ impl CrtApp {
             PresetSel::BuiltIn(i) => settings::PRESETS.get(i).copied().unwrap_or("Custom").to_string(),
             PresetSel::User(i) => self.user_presets.get(i).map(|p| p.name.clone()).unwrap_or_else(|| "Custom".into()),
         }
+    }
+
+    fn find_preset_by_name(&self, name: &str) -> Option<PresetSel> {
+        let q = name.trim();
+        if q.is_empty() {
+            return None;
+        }
+        if let Some(pos) = self
+            .user_presets
+            .iter()
+            .position(|p| p.name.eq_ignore_ascii_case(q) || p.file_name.eq_ignore_ascii_case(q))
+        {
+            return Some(PresetSel::User(pos));
+        }
+        if let Some(pos) = settings::PRESETS.iter().position(|n| n.eq_ignore_ascii_case(q)) {
+            return Some(PresetSel::BuiltIn(pos));
+        }
+        None
+    }
+
+    /// Automatically switches to the TV profile mapped for `channel_type` (or `profile_override`),
+    /// preserving active video playback, master sound volume/mute, A/V sync, and HDR display preferences.
+    fn apply_channel_profile(&mut self, channel_type: &str, profile_override: Option<&str>) {
+        let Some(profile_name) = self.channels_file.resolve_profile(channel_type, profile_override) else {
+            return;
+        };
+        let Some(sel) = self.find_preset_by_name(&profile_name) else {
+            return;
+        };
+        if sel == self.preset_sel {
+            return;
+        }
+        let saved_sound = self.s.sound;
+        let saved_vol = self.s.volume;
+        let saved_sync = self.s.audio_sync_ms;
+        let saved_hdr = self.s.hdr_mode;
+        let saved_pw = self.s.hdr_paper_white;
+        let saved_peak = self.s.hdr_peak_nits;
+        let saved_ui = self.s.hdr_ui_nits;
+        self.apply_preset(sel);
+        self.s.sound = saved_sound;
+        self.s.volume = saved_vol;
+        self.s.audio_sync_ms = saved_sync;
+        self.s.hdr_mode = saved_hdr;
+        self.s.hdr_paper_white = saved_pw;
+        self.s.hdr_peak_nits = saved_peak;
+        self.s.hdr_ui_nits = saved_ui;
+        if let Some(p) = &self.player {
+            p.volume(if self.muted { 0.0 } else { (self.s.volume * 100.0) as f64 });
+            p.audio_delay(self.s.audio_sync_ms as f64 / 1000.0);
+        }
+        self.status_toast = Some((
+            format!("TV Profile: {} ({channel_type})", self.current_preset_label()),
+            std::time::Instant::now(),
+        ));
     }
 
     fn apply_preset(&mut self, sel: PresetSel) {
@@ -949,19 +1016,22 @@ impl CrtApp {
                 + self.plex.channels.len()
                 + self.folders.channels.len()
                 + self.m3u.channels.len()
-                + self.custom.channels.len(),
+                + self.custom.channels.len()
+                + self.channels_file.channels.len(),
         );
+        raw.extend(self.channels_file.channels.iter().cloned());
         raw.extend(self.jellyfin.channels.iter().cloned());
         raw.extend(self.plex.channels.iter().cloned());
         raw.extend(self.folders.channels.iter().cloned());
         raw.extend(self.m3u.channels.iter().cloned());
         raw.extend(self.custom.channels.iter().cloned());
+        channels_file::apply_overrides(&mut raw, &self.channels_file.cfg);
         if raw.is_empty() {
             self.lineup.clear();
             return;
         }
         self.lineup = provider::merge_channel_lineup(raw);
-        // Keep active_watch & current_channel synced if channel numbers shifted after adding/removing a source
+        // Keep active_watch & current_channel synced if channel numbers or types shifted
         if let Some(w) = &mut self.active_watch {
             if let Some(ch) = self
                 .lineup
@@ -969,6 +1039,7 @@ impl CrtApp {
                 .find(|c| c.provider_id == w.provider_id && c.source_key == w.source_key)
             {
                 w.channel_number = ch.number;
+                w.channel_type = ch.effective_type().to_string();
                 if self.current_channel.is_some() {
                     self.current_channel = Some(ch.number);
                 }
@@ -1008,6 +1079,7 @@ impl CrtApp {
             "folders" => self.folders.request_artwork(art_id),
             "m3u" => self.m3u.request_artwork(art_id),
             "custom" => self.custom.request_artwork(art_id),
+            "channels" => self.channels_file.request_artwork(art_id),
             _ => None,
         }
     }
@@ -1073,6 +1145,10 @@ impl CrtApp {
         }
         if !self.custom.busy && (self.custom.has_enabled_sources() || crate::custom_provider::providers_dir().is_some_and(|d| d.is_dir())) {
             self.custom.refresh_async();
+            started = true;
+        }
+        if self.channels_file.reload_from_disk() {
+            self.rebuild_lineup();
             started = true;
         }
         if started {
@@ -1251,6 +1327,7 @@ impl CrtApp {
             channel_number: target.channel_number,
             provider_id: target.provider_id.clone(),
             source_key: target.source_key.clone(),
+            channel_type: target.channel_type.clone(),
             item_id: target.item.id.clone(),
             title: target.item.short_label(),
             callsign: target.callsign.clone(),
@@ -1267,6 +1344,8 @@ impl CrtApp {
         } else if target.provider_id == "plex" {
             self.plex.begin_watch(&target);
         }
+        // Automatically switch TV profile / preset if this channel's type (or override) maps to one
+        self.apply_channel_profile(&target.channel_type, target.profile_override.as_deref());
         // Remember this channel as "Last watched" for startup auto-resume
         if !target.provider_id.is_empty() && target.provider_id != "guide" {
             self.app_cfg.last_watched = Some(LastWatched::Channel {
@@ -1510,9 +1589,10 @@ impl CrtApp {
                         let title = w.title.clone();
                         let played = w.marked_played;
                         let badge = provider::source_badge(&w.provider_id);
+                        let ch_type = w.channel_type.clone();
                         ui.separator();
                         ui.label(
-                            RichText::new(format!("On air [{badge}]: CH {:02} · {}", ch_num, title))
+                            RichText::new(format!("On air [{badge} · {ch_type}]: CH {:02} · {}", ch_num, title))
                                 .strong()
                                 .small()
                                 .color(Color32::from_rgb(138, 240, 178)),
@@ -1659,6 +1739,209 @@ impl CrtApp {
                     );
                     ui.separator();
                 }
+
+                // ---- Editable channels.json & Channel Type -> TV Profile Automation
+                let tp_count = self.channels_file.cfg.type_profiles.values().filter(|v| !v.trim().is_empty()).count();
+                let cf_hdr = if tp_count > 0 || self.channels_file.file_exists {
+                    format!("channels.json & TV Profiles ({tp_count} auto)")
+                } else {
+                    "channels.json & TV Profiles".to_string()
+                };
+                egui::CollapsingHeader::new(RichText::new(cf_hdr).strong().small())
+                    .id_salt("src_channels_file")
+                    .default_open(self.channels_file.file_exists || tp_count > 0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Auto-switch TV presets by channel type (e.g. series -> Broadcast, movies -> VHS) and pin/define/override channels in channels.json (auto-reloads on save).")
+                                .weak()
+                                .small(),
+                        );
+                        ui.add_space(3.0);
+
+                        // Build list of available profile names (saved user presets first, then built-in)
+                        let mut preset_names: Vec<String> = self.user_presets.iter().map(|p| p.name.clone()).collect();
+                        for b in settings::PRESETS {
+                            preset_names.push(b.to_string());
+                        }
+
+                        // Always show the 4 standard types plus any custom types defined by the user
+                        let mut display_types: Vec<String> = vec![
+                            "series".into(),
+                            "movies".into(),
+                            "live".into(),
+                            "web".into(),
+                        ];
+                        for k in self.channels_file.cfg.type_profiles.keys() {
+                            if !display_types.iter().any(|d| d.eq_ignore_ascii_case(k)) {
+                                display_types.push(k.clone());
+                            }
+                        }
+
+                        let mut set_mapping: Option<(String, String)> = None;
+                        let mut remove_mapping: Option<String> = None;
+                        for t_key in &display_types {
+                            let cur_val = self
+                                .channels_file
+                                .cfg
+                                .type_profiles
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case(t_key))
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or_default();
+                            let sel_text = if cur_val.is_empty() {
+                                "(No auto-switch)".to_string()
+                            } else {
+                                cur_val.clone()
+                            };
+                            let is_builtin = matches!(t_key.as_str(), "series" | "movies" | "live" | "web");
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("{t_key:<9}")).monospace().small());
+                                egui::ComboBox::from_id_salt(format!("tp_combo_{t_key}"))
+                                    .selected_text(&sel_text)
+                                    .width(176.0)
+                                    .show_ui(ui, |ui| {
+                                        if ui.selectable_label(cur_val.is_empty(), "(No auto-switch)").clicked() {
+                                            set_mapping = Some((t_key.clone(), String::new()));
+                                        }
+                                        if !self.user_presets.is_empty() {
+                                            ui.separator();
+                                            ui.label(RichText::new("Saved presets").weak().small());
+                                            for p in &self.user_presets {
+                                                if ui
+                                                    .selectable_label(cur_val.eq_ignore_ascii_case(&p.name), &p.name)
+                                                    .clicked()
+                                                {
+                                                    set_mapping = Some((t_key.clone(), p.name.clone()));
+                                                }
+                                            }
+                                        }
+                                        ui.separator();
+                                        ui.label(RichText::new("Built-in presets").weak().small());
+                                        for b in settings::PRESETS {
+                                            if ui.selectable_label(cur_val.eq_ignore_ascii_case(b), b).clicked() {
+                                                set_mapping = Some((t_key.clone(), b.to_string()));
+                                            }
+                                        }
+                                    });
+                                if !is_builtin && ui.small_button("×").on_hover_text("Remove custom type").clicked() {
+                                    remove_mapping = Some(t_key.clone());
+                                }
+                            });
+                        }
+
+                        // Fallback default profile
+                        let mut new_default_prof: Option<String> = None;
+                        let def_cur = self.channels_file.cfg.default_profile.clone();
+                        let def_lbl = if def_cur.is_empty() {
+                            "(None)".to_string()
+                        } else {
+                            def_cur.clone()
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("fallback ").monospace().small())
+                                .on_hover_text("Applied to channels whose type has no mapping above");
+                            egui::ComboBox::from_id_salt("tp_combo_fallback")
+                                .selected_text(&def_lbl)
+                                .width(176.0)
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_label(def_cur.is_empty(), "(None)").clicked() {
+                                        new_default_prof = Some(String::new());
+                                    }
+                                    for name in &preset_names {
+                                        if ui.selectable_label(def_cur.eq_ignore_ascii_case(name), name).clicked() {
+                                            new_default_prof = Some(name.clone());
+                                        }
+                                    }
+                                });
+                        });
+
+                        // Add custom channel type (e.g. "broadcast", "vhs", "weather")
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.new_type_name)
+                                    .hint_text("Add custom type (e.g. broadcast, vhs)…")
+                                    .desired_width(214.0),
+                            );
+                            let add_t = ui.small_button("Add").clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if add_t && !self.new_type_name.trim().is_empty() {
+                                let k = std::mem::take(&mut self.new_type_name);
+                                self.channels_file.set_type_profile(k, String::new());
+                            }
+                        });
+
+                        if let Some((k, v)) = set_mapping {
+                            self.channels_file.set_type_profile(k.clone(), v);
+                            if let Some(w) = &self.active_watch {
+                                if w.channel_type.eq_ignore_ascii_case(&k) {
+                                    let ct = w.channel_type.clone();
+                                    self.apply_channel_profile(&ct, None);
+                                }
+                            }
+                        }
+                        if let Some(k) = remove_mapping {
+                            self.channels_file.remove_type_profile(&k);
+                        }
+                        if let Some(dp) = new_default_prof {
+                            self.channels_file.cfg.default_profile = dp;
+                            let _ = self.channels_file.save_to_disk();
+                        }
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if !self.channels_file.file_exists {
+                                if ui
+                                    .small_button("Create channels.json")
+                                    .on_hover_text("Create a starter channels.json with WeatherStar 4000+, type->profile mappings, and override examples")
+                                    .clicked()
+                                {
+                                    match self.channels_file.create_starter_file() {
+                                        Ok(p) => {
+                                            self.rebuild_lineup();
+                                            self.channels_file_msg = format!("Created {}", p.display());
+                                        }
+                                        Err(e) => self.channels_file_msg = e,
+                                    }
+                                }
+                            } else if ui.small_button("Reload").clicked() {
+                                if self.channels_file.reload_from_disk() {
+                                    self.rebuild_lineup();
+                                    self.osd.show_action("CHANNELS.JSON RELOADED");
+                                }
+                            }
+                            if let Some(path) = channels_file::config_path() {
+                                if ui.small_button("Copy path").clicked() {
+                                    ui.ctx().copy_text(path.display().to_string());
+                                    self.channels_file_msg = "Copied channels.json path.".into();
+                                }
+                            }
+                        });
+                        if let Some(path) = channels_file::config_path() {
+                            ui.label(RichText::new(format!("File: {}", path.display())).weak().small());
+                        }
+                        if !self.channels_file_msg.is_empty() {
+                            ui.label(RichText::new(&self.channels_file_msg).small().color(Color32::from_rgb(235, 175, 100)));
+                        }
+                        if !self.channels_file.status.is_empty() {
+                            ui.label(RichText::new(&self.channels_file.status).small().color(Color32::from_rgb(112, 236, 184)));
+                        }
+                        if !self.channels_file.last_error.is_empty() {
+                            let mut clear_err = false;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(&self.channels_file.last_error)
+                                        .small()
+                                        .color(Color32::from_rgb(248, 122, 108)),
+                                );
+                                if ui.small_button("×").on_hover_text("Dismiss error").clicked() {
+                                    clear_err = true;
+                                }
+                            });
+                            if clear_err {
+                                self.channels_file.last_error.clear();
+                            }
+                        }
+                    });
 
                 // ---- Source 1: Local Nested Folders
                 let dir_count = self.folders.channels.len();
@@ -3416,9 +3699,19 @@ impl CrtApp {
         let dir_changed = self.folders.poll();
         let m3u_changed = self.m3u.poll();
         let cus_changed = self.custom.poll();
-        let any_changed = jf_changed || px_changed || dir_changed || m3u_changed || cus_changed;
+        let (cf_changed, cf_hot) = self.channels_file.poll();
+        let any_changed = jf_changed || px_changed || dir_changed || m3u_changed || cus_changed || cf_changed;
         if any_changed {
             self.rebuild_lineup();
+        }
+        if cf_hot {
+            self.osd.show_action("CHANNELS.JSON RELOADED");
+            if let Some((ct, ov)) = self.active_watch.as_ref().and_then(|w| {
+                self.channel_by_number(w.channel_number)
+                    .map(|ch| (ch.effective_type().to_string(), ch.profile_override.clone()))
+            }) {
+                self.apply_channel_profile(&ct, ov.as_deref());
+            }
         }
         if !self.jellyfin.last_error.is_empty() && self.jellyfin.last_error != prev_jf_err {
             self.osd.show_action("JELLYFIN SYNC ERR");

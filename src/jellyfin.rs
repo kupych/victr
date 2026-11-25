@@ -651,6 +651,8 @@ pub fn fetch_lineup(cfg: &JellyfinConfig) -> Result<Vec<Channel>, String> {
             callsign: make_callsign(&s.name),
             name: s.name,
             artwork_id: s.id.clone(),
+            channel_type: "series".into(),
+            profile_override: None,
             kind: ChannelKind::Series {
                 series_id: s.id,
                 overview: s.overview.unwrap_or_default(),
@@ -675,6 +677,8 @@ pub fn fetch_lineup(cfg: &JellyfinConfig) -> Result<Vec<Channel>, String> {
             callsign: make_callsign(&genre),
             name: format!("{genre} Movies"),
             artwork_id: art,
+            channel_type: "movies".into(),
+            profile_override: None,
             kind: ChannelKind::MovieGenre { genre, movies },
         });
     }
@@ -1344,6 +1348,7 @@ impl JellyfinManager {
             channel_number: target.channel_number,
             provider_id: target.provider_id.clone(),
             source_key: target.source_key.clone(),
+            channel_type: target.channel_type.clone(),
             item_id: target.item.id.clone(),
             title: target.item.short_label(),
             callsign: target.callsign.clone(),
@@ -1570,6 +1575,8 @@ mod tests {
             callsign: "SHOW".into(),
             name: "Show".into(),
             artwork_id: "s1".into(),
+            channel_type: "series".into(),
+            profile_override: None,
             kind: ChannelKind::Series {
                 series_id: "s1".into(),
                 overview: String::new(),

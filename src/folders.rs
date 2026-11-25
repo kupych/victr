@@ -403,6 +403,8 @@ fn scan_dir_node(
                 callsign: make_callsign(display_name),
                 name: display_name.to_string(),
                 artwork_id: art,
+                channel_type: "series".into(),
+                profile_override: None,
                 kind: ChannelKind::Series {
                     series_id: key,
                     overview: format!("Local folder · {} episodes", episodes.len()),
@@ -446,6 +448,8 @@ fn scan_dir_node(
                 callsign: make_callsign(display_name),
                 name: display_name.to_string(),
                 artwork_id: art.clone(),
+                channel_type: "series".into(),
+                profile_override: None,
                 kind: ChannelKind::Series {
                     series_id: key,
                     overview: format!("Local folder · {} episodes", episodes.len()),
@@ -500,6 +504,8 @@ fn scan_dir_node(
             callsign: make_callsign(&genre),
             name: ch_name,
             artwork_id: first_art,
+            channel_type: "movies".into(),
+            profile_override: None,
             kind: ChannelKind::MovieGenre {
                 genre,
                 movies: loose_movies,

@@ -143,13 +143,20 @@ enum CustomPayload {
 #[derive(Clone, Debug, Deserialize)]
 struct CustomChannelDto {
     #[serde(default)]
+    number: Option<u16>,
+    #[serde(default)]
     id: String,
     name: String,
     #[serde(default)]
     callsign: String,
-    /// `"live"`, `"series"`, or `"movies"` (inferred automatically if omitted).
+    /// `"live"`, `"web"`, `"series"`, or `"movies"` (inferred automatically if omitted).
     #[serde(default)]
     kind: String,
+    /// Semantic channel type mapped to a TV profile (e.g. `"broadcast"`, `"vhs"`).
+    #[serde(rename = "type", default)]
+    channel_type: String,
+    #[serde(default)]
+    profile: Option<String>,
     #[serde(default)]
     stream_url: String,
     #[serde(default)]
@@ -356,13 +363,20 @@ pub fn parse_custom_provider_json(
             }
         };
 
+        let ch_type = if dto.channel_type.trim().is_empty() {
+            crate::provider::default_channel_type(&ch_kind).to_string()
+        } else {
+            dto.channel_type.trim().to_string()
+        };
         out.push(Channel {
-            number: 0,
+            number: dto.number.filter(|&n| n >= 2).unwrap_or(0),
             provider_id: "custom".into(),
             source_key: ch_id,
             callsign,
             name,
             artwork_id: dto.artwork_url.trim().to_string(),
+            channel_type: ch_type,
+            profile_override: dto.profile.filter(|s| !s.trim().is_empty()),
             kind: ch_kind,
         });
     }

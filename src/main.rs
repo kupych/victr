@@ -3,6 +3,7 @@
 mod about;
 mod app;
 mod audio;
+mod channels_file;
 mod custom_provider;
 mod folders;
 mod gpu;

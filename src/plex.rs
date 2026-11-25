@@ -468,6 +468,8 @@ pub fn fetch_lineup(cfg: &PlexConfig) -> Result<(String, Vec<Channel>), String> 
             callsign: make_callsign(&s.title),
             name: s.title,
             artwork_id: art,
+            channel_type: "series".into(),
+            profile_override: None,
             kind: ChannelKind::Series {
                 series_id: s.rating_key,
                 overview: s.summary,
@@ -501,6 +503,8 @@ pub fn fetch_lineup(cfg: &PlexConfig) -> Result<(String, Vec<Channel>), String> 
             callsign: make_callsign(&genre),
             name: ch_name,
             artwork_id: art,
+            channel_type: "movies".into(),
+            profile_override: None,
             kind: ChannelKind::MovieGenre { genre, movies },
         });
     }
@@ -847,6 +851,7 @@ impl PlexManager {
             channel_number: target.channel_number,
             provider_id: target.provider_id.clone(),
             source_key: target.source_key.clone(),
+            channel_type: target.channel_type.clone(),
             item_id: target.item.id.clone(),
             title: target.item.short_label(),
             callsign: target.callsign.clone(),

@@ -697,6 +697,8 @@ mod tests {
             callsign: "GUIDE".into(),
             name: "Program Guide".into(),
             artwork_id: String::new(),
+            channel_type: "guide".into(),
+            profile_override: None,
             kind: ChannelKind::Guide,
         };
         let ch2 = Channel {
@@ -706,6 +708,8 @@ mod tests {
             callsign: "SEINF".into(),
             name: "Seinfeld".into(),
             artwork_id: String::new(),
+            channel_type: "series".into(),
+            profile_override: None,
             kind: ChannelKind::Series {
                 series_id: "s1".into(),
                 overview: "A show about nothing in New York City.".into(),
