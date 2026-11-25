@@ -559,9 +559,9 @@ struct RawItem {
     #[serde(default)]
     series_id: Option<String>,
     #[serde(default)]
-    parent_index_number: Option<u32>,
+    parent_index_number: Option<i32>,
     #[serde(default)]
-    index_number: Option<u32>,
+    index_number: Option<i32>,
     #[serde(default)]
     overview: Option<String>,
     #[serde(default)]
@@ -570,6 +570,8 @@ struct RawItem {
     run_time_ticks: Option<i64>,
     #[serde(default)]
     location_type: Option<String>,
+    #[serde(default)]
+    is_folder: bool,
     #[serde(default)]
     user_data: Option<RawUserData>,
 }
@@ -585,8 +587,8 @@ impl RawItem {
         MediaItem {
             id: self.id.clone(),
             title: self.name.clone(),
-            season: self.parent_index_number,
-            episode: self.index_number,
+            season: self.parent_index_number.and_then(|n| u32::try_from(n).ok()),
+            episode: self.index_number.and_then(|n| u32::try_from(n).ok()),
             overview: self.overview.clone().unwrap_or_default(),
             runtime_secs: if runtime_secs > 10.0 { runtime_secs } else { 1800.0 },
             played: ud.map(|u| u.played).unwrap_or(false),
@@ -594,6 +596,19 @@ impl RawItem {
             artwork_id: art,
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RawScheduledTask {
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    current_progress_percentage: Option<f64>,
 }
 
 fn get_json<T: for<'de> Deserialize<'de>>(agent: &ureq::Agent, url: &str, api_key: &str) -> Result<T, String> {
@@ -616,41 +631,57 @@ pub fn fetch_users(server_url: &str, api_key: &str) -> Result<Vec<JellyfinUser>,
     Ok(raw.into_iter().map(|u| JellyfinUser { id: u.id, name: u.name }).collect())
 }
 
+fn merge_and_sort_episodes(series_id: &str, primary: Vec<RawItem>, secondary: Vec<RawItem>) -> Vec<MediaItem> {
+    let mut seen = std::collections::HashSet::new();
+    let mut raw: Vec<RawItem> = Vec::with_capacity(primary.len() + secondary.len());
+    for item in primary.into_iter().chain(secondary.into_iter()) {
+        if item.is_folder || item.location_type.as_deref() == Some("Virtual") {
+            continue;
+        }
+        if seen.insert(item.id.clone()) {
+            raw.push(item);
+        }
+    }
+    // Sort cleanly by (season, episode, title), putting Season 0 specials & unnumbered after regular seasons
+    raw.sort_by(|a, b| {
+        let sa = match a.parent_index_number.and_then(|n| u32::try_from(n).ok()) {
+            Some(0) => u32::MAX - 1,
+            Some(n) => n,
+            None => u32::MAX,
+        };
+        let sb = match b.parent_index_number.and_then(|n| u32::try_from(n).ok()) {
+            Some(0) => u32::MAX - 1,
+            Some(n) => n,
+            None => u32::MAX,
+        };
+        let ea = a.index_number.and_then(|n| u32::try_from(n).ok()).unwrap_or(u32::MAX);
+        let eb = b.index_number.and_then(|n| u32::try_from(n).ok()).unwrap_or(u32::MAX);
+        sa.cmp(&sb)
+            .then_with(|| ea.cmp(&eb))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    raw.iter().map(|r| r.to_media_item(series_id)).collect()
+}
+
 pub fn fetch_series_episodes(server_url: &str, api_key: &str, user_id: &str, series_id: &str) -> Result<Vec<MediaItem>, String> {
     let base = server_url.trim().trim_end_matches('/');
     let agent = make_agent();
-    // Query `/Users/{uid}/Items?ParentId={series_id}&IncludeItemTypes=Episode&Recursive=true`
-    // so every real episode file (all seasons, specials, un-numbered episodes) is included.
-    let items_url = format!(
-        "{base}/Users/{user_id}/Items?ParentId={series_id}&IncludeItemTypes=Episode&Recursive=true&IsMissing=false&Fields=Overview,RunTimeTicks,UserData&EnableUserData=true&SortBy=ParentIndexNumber,IndexNumber,SortName&SortOrder=Ascending"
+    // Query both `/Shows/{id}/Episodes` AND `/Users/{uid}/Items?ParentId={id}&IncludeItemTypes=Episode,Video&Recursive=true`
+    // and merge by ID so every real episode file (all seasons, merged folders, specials, and un-parsed videos) shows up.
+    let shows_url = format!(
+        "{base}/Shows/{series_id}/Episodes?UserId={user_id}&IsMissing=false&Fields=Overview,RunTimeTicks,UserData&EnableUserData=true"
     );
-    let mut raw = match get_json::<RawItemsResp>(&agent, &items_url, api_key) {
-        Ok(r) if !r.items.is_empty() => r.items,
-        _ => {
-            let shows_url = format!(
-                "{base}/Shows/{series_id}/Episodes?UserId={user_id}&IsMissing=false&Fields=Overview,RunTimeTicks,UserData&EnableUserData=true"
-            );
-            get_json::<RawItemsResp>(&agent, &shows_url, api_key)?.items
-        }
-    };
-    raw.retain(|r| r.location_type.as_deref() != Some("Virtual"));
-    // Sort cleanly by (season, episode, title), putting Season 0 specials after regular seasons
-    raw.sort_by(|a, b| {
-        let sa = match a.parent_index_number {
-            Some(0) => u32::MAX - 1,
-            Some(n) => n,
-            None => u32::MAX,
-        };
-        let sb = match b.parent_index_number {
-            Some(0) => u32::MAX - 1,
-            Some(n) => n,
-            None => u32::MAX,
-        };
-        sa.cmp(&sb)
-            .then_with(|| a.index_number.unwrap_or(u32::MAX).cmp(&b.index_number.unwrap_or(u32::MAX)))
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    Ok(raw.iter().map(|r| r.to_media_item(series_id)).collect())
+    let items_url = format!(
+        "{base}/Users/{user_id}/Items?ParentId={series_id}&IncludeItemTypes=Episode,Video&Recursive=true&IsMissing=false&Fields=Overview,RunTimeTicks,UserData&EnableUserData=true"
+    );
+    let r_shows = get_json::<RawItemsResp>(&agent, &shows_url, api_key);
+    let r_items = get_json::<RawItemsResp>(&agent, &items_url, api_key);
+    match (r_shows, r_items) {
+        (Ok(a), Ok(b)) => Ok(merge_and_sort_episodes(series_id, a.items, b.items)),
+        (Ok(a), Err(_)) => Ok(merge_and_sort_episodes(series_id, a.items, Vec::new())),
+        (Err(_), Ok(b)) => Ok(merge_and_sort_episodes(series_id, b.items, Vec::new())),
+        (Err(e), Err(_)) => Err(e),
+    }
 }
 
 pub fn trigger_library_scan(server_url: &str, api_key: &str) -> Result<(), String> {
@@ -665,6 +696,58 @@ pub fn trigger_library_scan(server_url: &str, api_key: &str) -> Result<(), Strin
         .set("Authorization", &auth_header(api_key))
         .call()
         .map_err(|e| format!("Library scan request failed: {e}"))?;
+    Ok(())
+}
+
+/// Triggers Jellyfin's asynchronous library scan and waits until the `RefreshLibrary`
+/// scheduled task finishes (reporting progress updates along the way) before returning.
+fn trigger_and_wait_library_scan(
+    server_url: &str,
+    api_key: &str,
+    events: &Arc<Mutex<Vec<JellyfinEvent>>>,
+) -> Result<(), String> {
+    trigger_library_scan(server_url, api_key)?;
+    let base = server_url.trim().trim_end_matches('/');
+    let agent = make_agent();
+    // Give Jellyfin a moment to spin up the scan task before polling `/ScheduledTasks`.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let tasks_url = format!("{base}/ScheduledTasks");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let mut saw_running = false;
+    while std::time::Instant::now() < deadline {
+        match get_json::<Vec<RawScheduledTask>>(&agent, &tasks_url, api_key) {
+            Ok(tasks) => {
+                let scan_task = tasks.iter().find(|t| {
+                    t.key.as_deref() == Some("RefreshLibrary")
+                        || t.name.to_lowercase().contains("scan media library")
+                });
+                match scan_task {
+                    Some(t) if t.state.eq_ignore_ascii_case("Running") => {
+                        saw_running = true;
+                        let msg = match t.current_progress_percentage {
+                            Some(pct) => format!("Jellyfin scanning library ({:.0}%)…", pct.clamp(0.0, 100.0)),
+                            None => "Jellyfin scanning library…".to_string(),
+                        };
+                        events.lock().unwrap().push(JellyfinEvent::ScanProgress(msg));
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                    }
+                    _ => {
+                        if saw_running {
+                            break;
+                        }
+                        // Brief extra settle wait in case scan finished immediately or hadn't marked Running yet.
+                        std::thread::sleep(std::time::Duration::from_millis(1200));
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                // Non-admin API keys may not have access to /ScheduledTasks; wait briefly then reload.
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -876,6 +959,7 @@ pub enum JellyfinEvent {
     UsersLoaded(Result<Vec<JellyfinUser>, String>),
     LineupLoaded(Result<Vec<Channel>, String>),
     EpisodesLoaded(String, Result<Vec<MediaItem>, String>),
+    ScanProgress(String),
     LibraryScanTriggered(Result<(), String>),
     ArtworkLoaded(String, ArtworkImage),
 }
@@ -906,6 +990,7 @@ pub struct JellyfinManager {
     pub last_sync_at: Option<std::time::Instant>,
     background_refresh: bool,
     episodes_loading: HashMap<String, bool>,
+    episodes_failed_at: HashMap<String, std::time::Instant>,
     events: Arc<Mutex<Vec<JellyfinEvent>>>,
 }
 
@@ -923,6 +1008,7 @@ impl JellyfinManager {
             last_sync_at: None,
             background_refresh: false,
             episodes_loading: HashMap::new(),
+            episodes_failed_at: HashMap::new(),
             events: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -956,6 +1042,7 @@ impl JellyfinManager {
         let cfg = self.cfg.clone();
         let ev = self.events.clone();
         self.episodes_loading.clear();
+        self.episodes_failed_at.clear();
         self.background_refresh = false;
         self.busy = true;
         self.last_sync_at = Some(std::time::Instant::now());
@@ -1002,7 +1089,7 @@ impl JellyfinManager {
         self.busy = true;
         self.status = "Requesting Jellyfin server library scan…".into();
         std::thread::spawn(move || {
-            let res = trigger_library_scan(&url, &key);
+            let res = trigger_and_wait_library_scan(&url, &key, &ev);
             ev.lock().unwrap().push(JellyfinEvent::LibraryScanTriggered(res));
         });
     }
@@ -1011,6 +1098,8 @@ impl JellyfinManager {
         self.finish_watch();
         self.channels.clear();
         self.artwork_cache.clear();
+        self.episodes_loading.clear();
+        self.episodes_failed_at.clear();
         self.connected = false;
         self.last_sync_at = None;
         self.background_refresh = false;
@@ -1022,6 +1111,7 @@ impl JellyfinManager {
             return;
         }
         self.episodes_loading.remove(series_id);
+        self.episodes_failed_at.remove(series_id);
         for ch in &mut self.channels {
             if let ChannelKind::Series { series_id: sid, loaded_episodes, .. } = &mut ch.kind {
                 if sid == series_id {
@@ -1034,6 +1124,13 @@ impl JellyfinManager {
 
     pub fn ensure_series_episodes(&mut self, series_id: &str) {
         if series_id.is_empty() || self.episodes_loading.contains_key(series_id) {
+            return;
+        }
+        if self
+            .episodes_failed_at
+            .get(series_id)
+            .is_some_and(|t| t.elapsed().as_secs() < 15)
+        {
             return;
         }
         let needs = self.channels.iter().any(|c| match &c.kind {
@@ -1145,6 +1242,7 @@ impl JellyfinManager {
                     self.episodes_loading.remove(&sid);
                     match res {
                         Ok(eps) => {
+                            self.episodes_failed_at.remove(&sid);
                             for ch in &mut self.channels {
                                 if let ChannelKind::Series { series_id, episodes, loaded_episodes, .. } = &mut ch.kind {
                                     if series_id == &sid {
@@ -1156,16 +1254,21 @@ impl JellyfinManager {
                             }
                         }
                         Err(e) => {
+                            self.episodes_failed_at.insert(sid, std::time::Instant::now());
                             self.status = format!("Episode fetch failed: {e}");
                             changed = true;
                         }
                     }
                 }
+                JellyfinEvent::ScanProgress(msg) => {
+                    self.status = msg;
+                    changed = true;
+                }
                 JellyfinEvent::LibraryScanTriggered(res) => {
                     self.busy = false;
                     match res {
                         Ok(()) => {
-                            self.status = "Jellyfin library scan triggered — reloading guide…".into();
+                            self.status = "Jellyfin scan complete — reloading guide…".into();
                             self.connect_and_load();
                         }
                         Err(e) => {
@@ -1468,5 +1571,26 @@ mod tests {
         let ch = mgr.channel_by_number(2).unwrap();
         let back = ch.resolve_now("http://x", "k", 0).unwrap();
         assert_eq!(back.item.id, "e1");
+    }
+
+    #[test]
+    fn merge_episodes_handles_negative_indices_virtual_and_dedup() {
+        let json1 = r#"{"Items":[
+            {"Id":"e2","Name":"Bart the Genius","ParentIndexNumber":1,"IndexNumber":2},
+            {"Id":"v1","Name":"Missing Ep","ParentIndexNumber":1,"IndexNumber":3,"LocationType":"Virtual"},
+            {"Id":"neg","Name":"Unmatched Ep","ParentIndexNumber":-1,"IndexNumber":-1}
+        ]}"#;
+        let json2 = r#"{"Items":[
+            {"Id":"e1","Name":"Simpsons Roasting","ParentIndexNumber":1,"IndexNumber":1},
+            {"Id":"e2","Name":"Bart the Genius","ParentIndexNumber":1,"IndexNumber":2},
+            {"Id":"fld","Name":"Season 1","IsFolder":true}
+        ]}"#;
+        let r1: RawItemsResp = serde_json::from_str(json1).unwrap();
+        let r2: RawItemsResp = serde_json::from_str(json2).unwrap();
+        let merged = merge_and_sort_episodes("simpsons", r1.items, r2.items);
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["e1", "e2", "neg"]);
+        assert_eq!(merged[2].season, None);
+        assert_eq!(merged[2].episode, None);
     }
 }
