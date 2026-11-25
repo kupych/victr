@@ -152,6 +152,8 @@ pub fn source_badge(provider_id: &str) -> &'static str {
         "LIVE"
     } else if provider_id == "channels" {
         "CFG"
+    } else if provider_id == "retro" {
+        "GAME"
     } else if provider_id.starts_with("custom") {
         "EXT"
     } else {

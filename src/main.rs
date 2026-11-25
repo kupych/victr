@@ -15,6 +15,7 @@ mod mpv;
 mod osd;
 mod plex;
 mod provider;
+mod retro;
 mod settings;
 mod shaders;
 mod sim;

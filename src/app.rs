@@ -10,6 +10,7 @@ use crate::mpv::{Player, StartOpts};
 use crate::osd::TvOsd;
 use crate::plex::PlexManager;
 use crate::provider::{self, ActiveWatch, ArtworkImage, Channel, ChannelKind, MediaItem, TuneTarget};
+use crate::retro::{self, RetroManager, RetroPlayer};
 use crate::settings::{self, AppConfig, Input, LastWatched, Mask, Pattern, PhosphorSet, Settings, StartupDestination, StartupPreset, TapeSpeed, UserPreset};
 use crate::sim::Sim;
 use crate::splash::{SplashEvent, SplashState};
@@ -81,9 +82,10 @@ pub struct CrtApp {
     last_instant: std::time::Instant,
     fps: f32,
     scan_clock: ScanClock,
-    // video through mpv & live web page channels
+    // video through mpv, live web page channels & libretro game console
     player: Option<Player>,
     web_player: Option<WebPlayer>,
+    retro_player: Option<RetroPlayer>,
     video_image: Option<(u64, Arc<(usize, usize, Vec<u8>)>)>,
     video_frame_no: u64,
     video_name: String,
@@ -97,6 +99,7 @@ pub struct CrtApp {
     m3u: M3uManager,
     custom: CustomProviderManager,
     channels_file: ChannelsFileManager,
+    retro: RetroManager,
     lineup: Vec<Channel>,
     active_watch: Option<ActiveWatch>,
     guide: GuideState,
@@ -126,6 +129,7 @@ pub struct CrtApp {
     custom_msg: String,
     new_type_name: String,
     channels_file_msg: String,
+    retro_selected_core: String,
     panel_season_filter: Option<u32>,
     // sound
     audio: Option<AudioEngine>,
@@ -167,9 +171,10 @@ impl Drop for CrtApp {
                 }
             }
         }
-        // Stop mpv / web browser first and guarantee Jellyfin & Plex playback progress is flushed before exiting.
+        // Stop mpv / web browser / retro console first (flushes SRAM saves & Jellyfin/Plex progress).
         self.player = None;
         self.web_player = None;
+        self.retro_player = None;
         for h in self.shutdown_flushes.drain(..) {
             let _ = h.join();
         }
@@ -381,6 +386,7 @@ impl CrtApp {
             scan_clock: ScanClock::default(),
             player: None,
             web_player: None,
+            retro_player: None,
             video_image: None,
             video_frame_no: 0,
             video_name: String::new(),
@@ -417,6 +423,11 @@ impl CrtApp {
             } else {
                 ChannelsFileManager::new()
             },
+            retro: if screenshot_mode && !std::env::var_os("VICTR_GUIDE_CONNECT").is_some() {
+                RetroManager::new_offline()
+            } else {
+                RetroManager::new()
+            },
             lineup: Vec::new(),
             active_watch: None,
             guide: GuideState::new(),
@@ -446,6 +457,7 @@ impl CrtApp {
             custom_msg: String::new(),
             new_type_name: String::new(),
             channels_file_msg: String::new(),
+            retro_selected_core: String::new(),
             panel_season_filter: None,
             audio,
             inbox: if screenshot_mode { None } else { Some(crate::link::listen(egui_ctx.clone())) },
@@ -839,6 +851,7 @@ impl CrtApp {
                         self.guide.active = false;
                         self.player = None;
                         self.web_player = None;
+                        self.retro_player = None;
                         self.splash = SplashState::new(true);
                         self.startup_dest_pending =
                             self.app_cfg.startup_dest != StartupDestination::DefaultPattern;
@@ -975,6 +988,7 @@ impl CrtApp {
         }
         self.player = None;
         self.web_player = None;
+        self.retro_player = None;
         self.sidebar_open = false;
         self.save_preset_open = false;
         if let Some(w) = self.active_watch.take() {
@@ -1017,9 +1031,13 @@ impl CrtApp {
                 + self.folders.channels.len()
                 + self.m3u.channels.len()
                 + self.custom.channels.len()
-                + self.channels_file.channels.len(),
+                + self.channels_file.channels.len()
+                + 1,
         );
         raw.extend(self.channels_file.channels.iter().cloned());
+        if let Some(rc) = &self.retro.channel {
+            raw.push(rc.clone());
+        }
         raw.extend(self.jellyfin.channels.iter().cloned());
         raw.extend(self.plex.channels.iter().cloned());
         raw.extend(self.folders.channels.iter().cloned());
@@ -1151,6 +1169,8 @@ impl CrtApp {
             self.rebuild_lineup();
             started = true;
         }
+        self.retro.rescan();
+        self.rebuild_lineup();
         if started {
             self.notify_guide_synced = true;
             self.osd.show_action("SYNCING GUIDE...");
@@ -1523,6 +1543,47 @@ impl CrtApp {
         }
     }
 
+    fn pick_rom_file(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Game ROMs", retro::ROM_EXTS)
+            .add_filter("All files", &["*"])
+            .pick_file()
+        {
+            let p = path.to_string_lossy().to_string();
+            let core_hint = if self.retro_selected_core.is_empty() {
+                None
+            } else {
+                Some(self.retro_selected_core.clone())
+            };
+            self.launch_rom_on_console_channel(&p, core_hint.as_deref());
+        }
+    }
+
+    fn pick_rom_folder(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            self.retro.add_rom_dir(path.to_string_lossy().to_string());
+            self.rebuild_lineup();
+        }
+    }
+
+    fn launch_rom_on_console_channel(&mut self, rom_path: &str, core_hint: Option<&str>) {
+        let ch_num = self.retro.cfg.channel_number.max(2);
+        let url = retro::make_retro_url(rom_path, core_hint);
+        let title = std::path::Path::new(rom_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Cartridge")
+            .to_string();
+        self.guide.active = false;
+        self.guide.close_picker();
+        self.current_channel = Some(ch_num);
+        self.sim.switch_channel();
+        self.apply_channel_profile("game", None);
+        self.start_video_at(url, 0.0);
+        self.video_name = format!("CH {:02} GAME · {title}", ch_num);
+        self.osd.show_channel(ch_num, "GAME", &title, self.s.mono);
+    }
+
     fn channels_controls(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new(RichText::new("Channels & Sources").strong())
             .default_open(false)
@@ -1764,12 +1825,13 @@ impl CrtApp {
                             preset_names.push(b.to_string());
                         }
 
-                        // Always show the 4 standard types plus any custom types defined by the user
+                        // Always show the 5 standard types plus any custom types defined by the user
                         let mut display_types: Vec<String> = vec![
                             "series".into(),
                             "movies".into(),
                             "live".into(),
                             "web".into(),
+                            "game".into(),
                         ];
                         for k in self.channels_file.cfg.type_profiles.keys() {
                             if !display_types.iter().any(|d| d.eq_ignore_ascii_case(k)) {
@@ -1793,7 +1855,7 @@ impl CrtApp {
                             } else {
                                 cur_val.clone()
                             };
-                            let is_builtin = matches!(t_key.as_str(), "series" | "movies" | "live" | "web");
+                            let is_builtin = matches!(t_key.as_str(), "series" | "movies" | "live" | "web" | "game");
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(format!("{t_key:<9}")).monospace().small());
                                 egui::ComboBox::from_id_salt(format!("tp_combo_{t_key}"))
@@ -1941,6 +2003,150 @@ impl CrtApp {
                                 self.channels_file.last_error.clear();
                             }
                         }
+                    });
+
+                // ---- Source 0: Game Console Input (CH 03 / Native libretro)
+                let game_hdr = format!("Game Console (CH {:02} / libretro)", self.retro.cfg.channel_number.max(2));
+                egui::CollapsingHeader::new(RichText::new(game_hdr).strong().small())
+                    .id_salt("src_retro_console")
+                    .default_open(self.retro_player.is_some())
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Play NES, SNES, Genesis, GB/GBA, PC Engine & Arcade ROMs directly on CH 03 using your installed libretro cores — zero-lag 240p + analog CRT sound.")
+                                .weak()
+                                .small(),
+                        );
+                        ui.add_space(3.0);
+                        let mut retro_cfg_changed = false;
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut self.retro.cfg.enabled, "Enable CH").changed() {
+                                retro_cfg_changed = true;
+                            }
+                            let mut ch_n = self.retro.cfg.channel_number.max(2) as i32;
+                            if ui.add(egui::DragValue::new(&mut ch_n).range(2..=99)).changed() {
+                                self.retro.cfg.channel_number = ch_n as u16;
+                                retro_cfg_changed = true;
+                            }
+                            if ui.small_button("Tune Now").clicked() {
+                                let n = self.retro.cfg.channel_number.max(2);
+                                self.tune_channel(n);
+                            }
+                        });
+                        if retro_cfg_changed {
+                            let _ = retro::save_config(&self.retro.cfg);
+                            self.retro.rescan();
+                            self.rebuild_lineup();
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Load ROM…").clicked() {
+                                self.message = "pickrom".into();
+                            }
+                            if ui.button("Add ROM Folder…").clicked() {
+                                self.message = "pickromdir".into();
+                            }
+                            if ui.small_button("Rescan").clicked() {
+                                self.retro.rescan();
+                                self.rebuild_lineup();
+                            }
+                        });
+                        if !self.retro.cores.is_empty() {
+                            let cur_core_lbl = if self.retro_selected_core.is_empty() {
+                                "Auto-detect by ROM extension".to_string()
+                            } else {
+                                self.retro_selected_core.clone()
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label("Core");
+                                egui::ComboBox::from_id_salt("retro_core_sel")
+                                    .selected_text(cur_core_lbl)
+                                    .width(210.0)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(self.retro_selected_core.is_empty(), "Auto-detect by ROM extension")
+                                            .clicked()
+                                        {
+                                            self.retro_selected_core.clear();
+                                        }
+                                        for c in &self.retro.cores {
+                                            if ui
+                                                .selectable_label(self.retro_selected_core == c.name, &c.name)
+                                                .clicked()
+                                            {
+                                                self.retro_selected_core = c.name.clone();
+                                            }
+                                        }
+                                    });
+                            });
+                        }
+                        if let Some(rp) = &self.retro_player {
+                            let (gname, cname, status, paused, running) = {
+                                let sh = rp.shared.lock().unwrap();
+                                (sh.game_name.clone(), sh.core_name.clone(), sh.status.clone(), sh.paused, sh.running)
+                            };
+                            ui.separator();
+                            let title_line = if cname.is_empty() {
+                                format!("Cartridge: {gname}")
+                            } else {
+                                format!("Cartridge: {gname} ({cname})")
+                            };
+                            ui.label(RichText::new(title_line).strong().small().color(Color32::from_rgb(138, 240, 178)));
+                            ui.label(RichText::new(status).weak().small());
+                            let mut eject = false;
+                            if running {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button(if paused { "Resume" } else { "Pause" }).clicked() {
+                                        rp.toggle_pause();
+                                    }
+                                    if ui.small_button("Reset (F1)").clicked() {
+                                        rp.reset();
+                                        self.osd.show_action("CONSOLE RESET");
+                                    }
+                                    if ui.small_button("Save (F2)").clicked() {
+                                        rp.save_state();
+                                        self.osd.show_action("STATE SAVED");
+                                    }
+                                    if ui.small_button("Load (F4)").clicked() {
+                                        rp.load_state();
+                                        self.osd.show_action("STATE LOADED");
+                                    }
+                                    if ui.small_button("Eject").clicked() {
+                                        eject = true;
+                                    }
+                                });
+                            }
+                            if eject {
+                                self.retro_player = None;
+                            }
+                        }
+                        if !self.retro.cfg.rom_dirs.is_empty() {
+                            let mut rm_dir: Option<usize> = None;
+                            for (i, d) in self.retro.cfg.rom_dirs.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    let lbl = std::path::Path::new(d)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or(d);
+                                    ui.label(RichText::new(lbl).small()).on_hover_text(d);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("×").on_hover_text("Remove ROM folder").clicked() {
+                                            rm_dir = Some(i);
+                                        }
+                                    });
+                                });
+                            }
+                            if let Some(idx) = rm_dir {
+                                self.retro.remove_rom_dir(idx);
+                                self.rebuild_lineup();
+                            }
+                        }
+                        if !self.retro.status.is_empty() {
+                            ui.label(RichText::new(&self.retro.status).small().color(Color32::from_rgb(112, 236, 184)));
+                        }
+                        ui.label(
+                            RichText::new("Controls: Arrows=D-Pad · Z/X=B/A · A/S=Y/X · Q/W=L/R · Enter=Start · Backspace=Select · USB/BT Gamepad auto-detected.")
+                                .weak()
+                                .small(),
+                        );
                     });
 
                 // ---- Source 1: Local Nested Folders
@@ -2677,11 +2883,57 @@ impl CrtApp {
         // Stop any previous player FIRST so teardown cannot race with the new audio/video session.
         self.player = None;
         self.web_player = None;
+        self.retro_player = None;
         let _ = self.splash.skip();
         self.startup_dest_pending = false;
         if self.current_channel.is_none() && self.screenshot.is_none() {
             self.app_cfg.last_watched = Some(LastWatched::LocalVideo { src: src.clone(), pos_secs: start });
             let _ = settings::save_app_config(&self.app_cfg);
+        }
+        if retro::is_retro_url(&src) {
+            let (rom_path, core_hint) = retro::parse_retro_url(&src);
+            let ch_num = self.retro.cfg.channel_number.max(2);
+            if rom_path.is_empty() || rom_path == "standby" || !std::path::Path::new(&rom_path).is_file() {
+                let msg = if rom_path == "standby" || rom_path.is_empty() {
+                    String::new()
+                } else {
+                    format!("ROM not found: {rom_path}")
+                };
+                self.retro_player = Some(RetroPlayer::start_standby(ch_num, &msg));
+            } else {
+                let hint = core_hint.as_deref().or_else(|| {
+                    if self.retro_selected_core.is_empty() {
+                        None
+                    } else {
+                        Some(self.retro_selected_core.as_str())
+                    }
+                });
+                if let Some(core) = retro::select_core_for_rom(
+                    std::path::Path::new(&rom_path),
+                    &self.retro.cores,
+                    hint,
+                    &self.retro.cfg.preferred_cores,
+                )
+                .cloned()
+                {
+                    let ring = self.audio.as_ref().map(|a| a.ring.clone());
+                    self.retro_player = Some(RetroPlayer::start(
+                        core.path,
+                        std::path::PathBuf::from(&rom_path),
+                        ring,
+                    ));
+                    self.retro.set_last_rom(&rom_path);
+                    self.rebuild_lineup();
+                } else {
+                    let msg = format!("No libretro core found for {rom_path}");
+                    self.retro_player = Some(RetroPlayer::start_standby(ch_num, &msg));
+                }
+            }
+            self.video_name = format!("CH {:02} GAME", ch_num);
+            self.video_frame_no = 0;
+            self.s.pattern = Pattern::Video;
+            self.reset_trails = true;
+            return;
         }
         if web_channel::is_web_channel_url(&src) {
             self.web_player = Some(WebPlayer::start(&src, self.muted || !self.s.sound));
@@ -3427,6 +3679,8 @@ impl CrtApp {
                     && self.message != "pickvideo"
                     && self.message != "pickfolder"
                     && self.message != "pickm3u"
+                    && self.message != "pickrom"
+                    && self.message != "pickromdir"
                 {
                     ui.colored_label(Color32::from_rgb(230, 120, 90), &self.message);
                 }
@@ -3667,13 +3921,17 @@ impl CrtApp {
             self.fps = self.fps * 0.95 + (1.0 / real_dt).min(1000.0) * 0.05;
         }
 
-        // dropped pictures
+        // dropped pictures, ROM cartridges, or videos
         let dropped: Vec<_> = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
             let path = f.path().to_path_buf();
             let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if retro::is_rom_file(&path) && !path.as_os_str().is_empty() {
+                self.launch_rom_on_console_channel(&path.to_string_lossy(), None);
+                continue;
+            }
             if !["png", "jpg", "jpeg", "bmp", "gif"].contains(&ext.as_str()) && !path.as_os_str().is_empty() {
-                // anything that isn't a picture goes to mpv
+                // anything that isn't a picture or ROM goes to mpv
                 self.start_video(path.to_string_lossy().to_string());
                 continue;
             }
@@ -3806,6 +4064,43 @@ impl CrtApp {
             self.pixel_perfect_req = true;
         }
 
+        let retro_playing = self.retro_player.as_ref().is_some_and(|rp| rp.shared.lock().unwrap().running);
+        if let Some(rp) = &self.retro_player {
+            if !self.guide.active && !ctx.egui_wants_keyboard_input() && !self.save_preset_open {
+                let mask = ctx.input(|i| {
+                    let mut m: u16 = 0;
+                    if i.key_down(egui::Key::ArrowUp) { m |= retro::BTN_UP; }
+                    if i.key_down(egui::Key::ArrowDown) { m |= retro::BTN_DOWN; }
+                    if i.key_down(egui::Key::ArrowLeft) { m |= retro::BTN_LEFT; }
+                    if i.key_down(egui::Key::ArrowRight) { m |= retro::BTN_RIGHT; }
+                    if i.key_down(egui::Key::Z) { m |= retro::BTN_B; }
+                    if i.key_down(egui::Key::X) { m |= retro::BTN_A; }
+                    if i.key_down(egui::Key::A) { m |= retro::BTN_Y; }
+                    if i.key_down(egui::Key::S) { m |= retro::BTN_X; }
+                    if i.key_down(egui::Key::Q) { m |= retro::BTN_L; }
+                    if i.key_down(egui::Key::W) { m |= retro::BTN_R; }
+                    if i.key_down(egui::Key::Enter) { m |= retro::BTN_START; }
+                    if i.key_down(egui::Key::Backspace) || i.key_down(egui::Key::Tab) { m |= retro::BTN_SELECT; }
+                    m
+                });
+                rp.key_mask.store(mask, std::sync::atomic::Ordering::Relaxed);
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+                    rp.reset();
+                    self.osd.show_action("CONSOLE RESET");
+                }
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2)) {
+                    rp.save_state();
+                    self.osd.show_action("STATE SAVED");
+                }
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F4)) {
+                    rp.load_state();
+                    self.osd.show_action("STATE LOADED");
+                }
+            } else {
+                rp.key_mask.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
         // TV remote & 90s Cable Guide keyboard controls (when not typing in a text field)
         let mut remote_consumed = false;
         if !ctx.egui_wants_keyboard_input() && !self.save_preset_open {
@@ -3872,7 +4167,7 @@ impl CrtApp {
                         self.open_episode_picker(cur);
                     }
                 }
-                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W)) {
+                if (!retro_playing || self.guide.active) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W)) {
                     remote_consumed = true;
                     if let (true, Some((ch_num, idx))) = (self.guide.active, self.guide.picker_selected()) {
                         if let Some((iid, played)) = self
@@ -4129,6 +4424,15 @@ impl CrtApp {
                     self.video_image = Some((self.image_counter, f.clone()));
                 }
             }
+        } else if let Some(rp) = &self.retro_player {
+            let sh = rp.shared.lock().unwrap();
+            if sh.frame_no != self.video_frame_no {
+                self.video_frame_no = sh.frame_no;
+                if let Some(f) = &sh.frame {
+                    self.image_counter += 1;
+                    self.video_image = Some((self.image_counter, f.clone()));
+                }
+            }
         }
         if let Some(next) = auto_next_target {
             self.apply_tune_target(next);
@@ -4348,6 +4652,14 @@ impl CrtApp {
         if self.message == "pickm3u" {
             self.message.clear();
             self.pick_m3u_playlist();
+        }
+        if self.message == "pickrom" {
+            self.message.clear();
+            self.pick_rom_file();
+        }
+        if self.message == "pickromdir" {
+            self.message.clear();
+            self.pick_rom_folder();
         }
         if self.message == "exitfs" {
             self.message.clear();

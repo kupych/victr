@@ -208,9 +208,13 @@ pub fn build_inline_channels(cfg: &ChannelsFileConfig) -> Vec<Channel> {
         } else if !def.stream_url.trim().is_empty() && def.items.is_empty() {
             if crate::web_channel::is_web_channel_url(&def.stream_url) {
                 "web"
+            } else if crate::retro::is_retro_url(&def.stream_url) {
+                "game"
             } else {
                 "live"
             }
+        } else if !def.path.trim().is_empty() && crate::retro::is_rom_file(Path::new(def.path.trim())) {
+            "game"
         } else if def.items.iter().any(|i| i.season.is_some() || i.episode.is_some()) {
             "series"
         } else {
@@ -218,18 +222,33 @@ pub fn build_inline_channels(cfg: &ChannelsFileConfig) -> Vec<Channel> {
         };
 
         let ch_kind = match inferred {
-            "live" | "stream" | "livestream" | "web" => {
-                if def.stream_url.trim().is_empty() {
+            "live" | "stream" | "livestream" | "web" | "game" | "retro" => {
+                let raw_src = if !def.stream_url.trim().is_empty() {
+                    def.stream_url.trim()
+                } else {
+                    def.path.trim()
+                };
+                if raw_src.is_empty() {
                     continue;
                 }
                 let stream_url = if inferred == "web" {
-                    crate::web_channel::ensure_web_prefix(def.stream_url.trim())
+                    crate::web_channel::ensure_web_prefix(raw_src)
+                } else if inferred == "game" || inferred == "retro" {
+                    if crate::retro::is_retro_url(raw_src) {
+                        raw_src.to_string()
+                    } else {
+                        crate::retro::make_retro_url(raw_src, None)
+                    }
                 } else {
-                    def.stream_url.trim().to_string()
+                    raw_src.to_string()
                 };
                 ChannelKind::LiveStream {
                     stream_url,
-                    group: if def.group.trim().is_empty() { "Live".into() } else { def.group.trim().to_string() },
+                    group: if def.group.trim().is_empty() {
+                        if inferred == "game" || inferred == "retro" { "Game".into() } else { "Live".into() }
+                    } else {
+                        def.group.trim().to_string()
+                    },
                     now_title: if def.now_title.trim().is_empty() { name.clone() } else { def.now_title.trim().to_string() },
                     overview: def.overview.trim().to_string(),
                 }

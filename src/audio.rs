@@ -81,6 +81,25 @@ impl AudioRing {
             b.clear();
         }
     }
+    /// Non-blocking real-time push for 60 Hz emulators (drops oldest excess if buffer
+    /// temporarily overflows so gameplay timing stays locked at exact console FPS).
+    pub fn push_f32_session_realtime(&self, session: u64, samples: &[f32]) {
+        if samples.is_empty() || self.session.load(Ordering::Relaxed) != session {
+            return;
+        }
+        let mut b = self.buf.lock().unwrap();
+        if self.session.load(Ordering::Relaxed) != session {
+            return;
+        }
+        let max_len = self.cap + 512;
+        if b.len() + samples.len() > max_len {
+            let drop_n = (b.len() + samples.len() - max_len + 1) & !1;
+            for _ in 0..drop_n.min(b.len()) {
+                b.pop_front();
+            }
+        }
+        b.extend(samples.iter().copied());
+    }
     fn pop_frame(&self, b: &mut std::sync::MutexGuard<'_, VecDeque<f32>>) -> Option<(f32, f32)> {
         if b.len() >= 2 {
             let l = b.pop_front().unwrap();
