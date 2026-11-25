@@ -59,6 +59,7 @@ pub struct CrtApp {
     sidebar_open: bool,
     sidebar_anim: f32,
     handle_anim: f32,
+    handle_vis: f32,
     sidebar_width: f32,
     sidebar_resizing: bool,
     pixel_perfect_req: bool,
@@ -295,6 +296,7 @@ impl CrtApp {
             sidebar_open: false,
             sidebar_anim: 0.0,
             handle_anim: 0.0,
+            handle_vis: 1.0,
             sidebar_width: 440.0,
             sidebar_resizing: false,
             pixel_perfect_req: false,
@@ -428,6 +430,7 @@ impl CrtApp {
         self.sidebar_open = open;
         self.sidebar_anim = if open { 1.0 } else { 0.0 };
         self.handle_anim = if open { 1.0 } else { 0.0 };
+        self.handle_vis = if open { 1.0 } else { 0.0 };
         self.reset_trails = true;
     }
 
@@ -3156,15 +3159,27 @@ impl CrtApp {
             let tab_top = central_rect.center().y - tab_h * 0.5;
             let tab_bottom = tab_top + tab_h;
 
-            // Handle stays subtly visible at low opacity at rest and brightens smoothly
-            // when moused over, near the right edge, or while the service panel is open.
+            // Handle fades in smoothly when the mouse moves (or while the service panel is open)
+            // and slowly fades completely away once the mouse goes idle.
+            let pointer_idle = self.last_pointer_move.elapsed().as_secs_f32();
+            let drawer_visible = self.sidebar_open || self.sidebar_anim > 0.01;
+            let show_handle = drawer_visible || (pointer_idle < 2.0 && !self.save_preset_open);
+            let vis_target = if show_handle { 1.0 } else { 0.0 };
+            let vis_step = dt_ui / if show_handle { 0.18 } else { 1.4 };
+            if self.handle_vis < vis_target {
+                self.handle_vis = (self.handle_vis + vis_step).min(vis_target);
+            } else if self.handle_vis > vis_target {
+                self.handle_vis = (self.handle_vis - vis_step).max(vis_target);
+            }
+            let vis_eased = self.handle_vis * self.handle_vis * (3.0 - 2.0 * self.handle_vis);
+
             let near_handle = ptr_pos.is_some_and(|p| {
                 p.x >= drawer_x - tab_w - 36.0
                     && p.x <= drawer_x + 8.0
                     && p.y >= central_rect.top()
                     && p.y <= central_rect.bottom()
             });
-            let highlight_handle = self.sidebar_open || self.sidebar_anim > 0.01 || (near_handle && !self.save_preset_open);
+            let highlight_handle = drawer_visible || (near_handle && show_handle && !self.save_preset_open);
             let h_target = if highlight_handle { 1.0 } else { 0.0 };
             let h_step = dt_ui / if highlight_handle { 0.14 } else { 0.24 };
             if self.handle_anim < h_target {
@@ -3173,7 +3188,7 @@ impl CrtApp {
                 self.handle_anim = (self.handle_anim - h_step).max(h_target);
             }
             let handle_eased = 1.0 - (1.0 - self.handle_anim).powi(3);
-            let handle_alpha = 0.20 + 0.80 * handle_eased;
+            let handle_alpha = (0.35 + 0.65 * handle_eased) * vis_eased;
 
             // Animated service panel drawer
             if self.sidebar_anim > 0.005 {
@@ -3233,75 +3248,77 @@ impl CrtApp {
                 self.sidebar_resizing = false;
             }
 
-            // Retro walnut & brushed-metal pull handle: always gently visible at low opacity,
-            // brightens smoothly on mouseover or when open; clicking toggles open/closed.
-            let tab_x = (drawer_x - tab_w).max(central_rect.left());
-            let tab_pos = egui::pos2(tab_x, tab_top);
-            egui::Area::new(egui::Id::unique("controls_pull_tab"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(tab_pos)
-                .interactable(true)
-                .show(&ctx, |ui| {
-                    ui.set_clip_rect(central_rect);
-                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(tab_w, tab_h), egui::Sense::click());
-                    let hot = resp.hovered();
-                    if hot {
-                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    let a = if hot { 1.0 } else { handle_alpha };
-                    let fade = |c: Color32| {
-                        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * a) as u8)
-                    };
-                    let rounding = egui::CornerRadius { nw: 7, sw: 7, ne: 0, se: 0 };
-                    let wood_bg = fade(if hot {
-                        Color32::from_rgb(92, 54, 30)
-                    } else {
-                        Color32::from_rgb(66, 39, 21)
-                    });
-                    let stroke = fade(if hot {
-                        Color32::from_rgb(232, 168, 86)
-                    } else {
-                        Color32::from_rgb(142, 128, 106)
-                    });
-                    ui.painter().rect_filled(rect, rounding, wood_bg);
-                    let plate = egui::Rect::from_min_max(
-                        rect.min + egui::vec2(3.0, 4.0),
-                        rect.max - egui::vec2(0.0, 4.0),
-                    );
-                    ui.painter().rect_filled(
-                        plate,
-                        egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 },
-                        fade(if hot { Color32::from_rgb(56, 52, 46) } else { Color32::from_rgb(40, 38, 35) }),
-                    );
-                    ui.painter().rect_stroke(rect, rounding, egui::Stroke::new(1.1, stroke), egui::StrokeKind::Inside);
-                    let c = plate.center();
-                    let ridge_col = fade(Color32::from_rgb(112, 104, 90));
-                    for &dy in &[-24.0f32, -19.0, 19.0, 24.0] {
-                        ui.painter().line_segment(
-                            [egui::pos2(plate.left() + 4.0, c.y + dy), egui::pos2(plate.right() - 4.0, c.y + dy)],
-                            egui::Stroke::new(1.0, ridge_col),
+            // Retro walnut & brushed-metal pull handle: fades in on mouse movement or while open,
+            // and melts completely away once the mouse idles; clicking toggles open/closed.
+            if vis_eased > 0.004 {
+                let tab_x = (drawer_x - tab_w).max(central_rect.left());
+                let tab_pos = egui::pos2(tab_x, tab_top);
+                egui::Area::new(egui::Id::unique("controls_pull_tab"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(tab_pos)
+                    .interactable(true)
+                    .show(&ctx, |ui| {
+                        ui.set_clip_rect(central_rect);
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(tab_w, tab_h), egui::Sense::click());
+                        let hot = resp.hovered() && show_handle;
+                        if hot {
+                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        let a = if hot { vis_eased } else { handle_alpha };
+                        let fade = |c: Color32| {
+                            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * a) as u8)
+                        };
+                        let rounding = egui::CornerRadius { nw: 7, sw: 7, ne: 0, se: 0 };
+                        let wood_bg = fade(if hot {
+                            Color32::from_rgb(92, 54, 30)
+                        } else {
+                            Color32::from_rgb(66, 39, 21)
+                        });
+                        let stroke = fade(if hot {
+                            Color32::from_rgb(232, 168, 86)
+                        } else {
+                            Color32::from_rgb(142, 128, 106)
+                        });
+                        ui.painter().rect_filled(rect, rounding, wood_bg);
+                        let plate = egui::Rect::from_min_max(
+                            rect.min + egui::vec2(3.0, 4.0),
+                            rect.max - egui::vec2(0.0, 4.0),
                         );
-                    }
-                    let arrow_col = fade(if hot { Color32::from_rgb(248, 186, 92) } else { Color32::from_rgb(214, 200, 176) });
-                    let arrow_stroke = egui::Stroke::new(2.0, arrow_col);
-                    if self.sidebar_open {
-                        // ">" chevron to close
-                        ui.painter().line_segment([c + egui::vec2(-3.0, -6.0), c + egui::vec2(3.0, 0.0)], arrow_stroke);
-                        ui.painter().line_segment([c + egui::vec2(3.0, 0.0), c + egui::vec2(-3.0, 6.0)], arrow_stroke);
-                    } else {
-                        // "<" chevron to open
-                        ui.painter().line_segment([c + egui::vec2(3.0, -6.0), c + egui::vec2(-3.0, 0.0)], arrow_stroke);
-                        ui.painter().line_segment([c + egui::vec2(-3.0, 0.0), c + egui::vec2(3.0, 6.0)], arrow_stroke);
-                    }
-                    let tip = if self.sidebar_open {
-                        "Close service panel"
-                    } else {
-                        "Open service panel"
-                    };
-                    if resp.on_hover_text(tip).clicked() {
-                        self.sidebar_open = !self.sidebar_open;
-                    }
-                });
+                        ui.painter().rect_filled(
+                            plate,
+                            egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 },
+                            fade(if hot { Color32::from_rgb(56, 52, 46) } else { Color32::from_rgb(40, 38, 35) }),
+                        );
+                        ui.painter().rect_stroke(rect, rounding, egui::Stroke::new(1.1, stroke), egui::StrokeKind::Inside);
+                        let c = plate.center();
+                        let ridge_col = fade(Color32::from_rgb(112, 104, 90));
+                        for &dy in &[-24.0f32, -19.0, 19.0, 24.0] {
+                            ui.painter().line_segment(
+                                [egui::pos2(plate.left() + 4.0, c.y + dy), egui::pos2(plate.right() - 4.0, c.y + dy)],
+                                egui::Stroke::new(1.0, ridge_col),
+                            );
+                        }
+                        let arrow_col = fade(if hot { Color32::from_rgb(248, 186, 92) } else { Color32::from_rgb(214, 200, 176) });
+                        let arrow_stroke = egui::Stroke::new(2.0, arrow_col);
+                        if self.sidebar_open {
+                            // ">" chevron to close
+                            ui.painter().line_segment([c + egui::vec2(-3.0, -6.0), c + egui::vec2(3.0, 0.0)], arrow_stroke);
+                            ui.painter().line_segment([c + egui::vec2(3.0, 0.0), c + egui::vec2(-3.0, 6.0)], arrow_stroke);
+                        } else {
+                            // "<" chevron to open
+                            ui.painter().line_segment([c + egui::vec2(3.0, -6.0), c + egui::vec2(-3.0, 0.0)], arrow_stroke);
+                            ui.painter().line_segment([c + egui::vec2(-3.0, 0.0), c + egui::vec2(3.0, 6.0)], arrow_stroke);
+                        }
+                        let tip = if self.sidebar_open {
+                            "Close service panel"
+                        } else {
+                            "Open service panel"
+                        };
+                        if resp.on_hover_text(tip).clicked() {
+                            self.sidebar_open = !self.sidebar_open;
+                        }
+                    });
+            }
         } else {
             self.sidebar_resizing = false;
         }
