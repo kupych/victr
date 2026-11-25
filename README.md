@@ -32,7 +32,7 @@ ViCTR models the full analog television pipeline — from NTSC baseband encoding
   - Injects a classic **phosphor-green/white TV OSD** (`CH 04`, call-sign, episode banner, `VOL |||||||---`, `MUTE`, `STEREO`/`MONO`) post-decoder into the electron guns, paired with a brief RF static burst & tuner click on channel switches.
 - **Slide-in Service Panel & Custom Presets**
   - Retro faux-walnut and brushed-metal slide-in controls drawer accessible in both windowed and fullscreen modes: a subtle low-opacity pull handle rests on the right edge, brightens on hover, and toggles the panel open or closed on click while the CRT glides smoothly alongside it.
-  - Includes 9 built-in presets, lets you **save, overwrite, and delete custom presets** stored in your user config directory, choose a **default startup profile**, and toggle the **cold CRT power-on warm-up** fade-in & auto-degauss on launch.
+  - Includes 9 built-in presets, lets you **save, overwrite, and delete custom presets** stored in your user config directory, choose a **default startup profile**, toggle the **cold CRT power-on warm-up**, and boot through a **CRT splash screen** (RF static → classic blue screen → auto-tune to Cable Guide, Last Watched, or Default Pattern).
 
 ## Screenshots
 

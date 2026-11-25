@@ -195,6 +195,16 @@ impl Sim {
         self.ch_v_pull_init = sign_v * (0.012 + 0.016 * self.next());
     }
 
+    /// Crisp input relay snap (e.g. RF static -> VIDEO 1 blue screen) with the mechanical
+    /// switch click and brief static pop, without AFT tuner detune.
+    pub fn snap_input(&mut self) {
+        self.channel_switch_t = 0.0;
+        self.ch_fine_tune_init = 0.0;
+        self.ch_tracking_init = 0.0;
+        self.ch_h_pull_init = 0.014;
+        self.ch_v_pull_init = 0.008;
+    }
+
     /// Live channel-switch AFT / tracking pull-in offsets: (fine_tune, tracking, h_pull, v_pull).
     fn channel_pull_in(&self) -> (f32, f32, f32, f32) {
         let ct = self.channel_switch_t;

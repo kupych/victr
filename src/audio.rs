@@ -105,6 +105,7 @@ pub struct AudioParams {
     pub degauss_t: f32,
     pub channel_switch_t: f32,
     pub whack_t: f32,
+    pub splash_static: f32,
     pub test_tone: bool,
     // RF
     pub rf: bool,
@@ -141,6 +142,7 @@ impl Default for AudioParams {
             degauss_t: 10.0,
             channel_switch_t: 10.0,
             whack_t: 10.0,
+            splash_static: 0.0,
             test_tone: false,
             rf: false,
             snr_db: 60.0,
@@ -470,6 +472,13 @@ impl Processor {
                 let e = self.noise() * p.extra_noise * 0.3;
                 l += e;
                 r += e;
+            }
+            // Untuned RF static hiss during startup splash static phase
+            if p.splash_static > 0.0 {
+                let ns = self.noise();
+                let st = self.static_lp.run(ns) * 0.22 * p.splash_static;
+                l = st;
+                r = st;
             }
             // Brief RF static burst when snapping to a new cable channel
             if p.channel_switch_t >= 0.0 && p.channel_switch_t < 0.25 {

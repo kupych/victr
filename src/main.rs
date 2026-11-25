@@ -12,6 +12,7 @@ mod osd;
 mod settings;
 mod shaders;
 mod sim;
+mod splash;
 
 use crate::app::CrtApp;
 use crate::gpu::Gpu;

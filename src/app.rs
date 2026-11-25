@@ -4,8 +4,9 @@ use crate::guide::{GuideState, GuideView};
 use crate::jellyfin::{ChannelKind, JellyfinManager, MediaItem, TuneTarget};
 use crate::mpv::{Player, StartOpts};
 use crate::osd::TvOsd;
-use crate::settings::{self, AppConfig, Input, Mask, Pattern, PhosphorSet, Settings, StartupPreset, TapeSpeed, UserPreset};
+use crate::settings::{self, AppConfig, Input, LastWatched, Mask, Pattern, PhosphorSet, Settings, StartupDestination, StartupPreset, TapeSpeed, UserPreset};
 use crate::sim::Sim;
+use crate::splash::{SplashEvent, SplashState};
 use egui::{Color32, RichText, Slider};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -85,6 +86,8 @@ pub struct CrtApp {
     jellyfin: JellyfinManager,
     guide: GuideState,
     osd: TvOsd,
+    splash: SplashState,
+    startup_dest_pending: bool,
     current_channel: Option<u16>,
     pending_tune_channel: Option<u16>,
     open_guide_on_connect: bool,
@@ -114,6 +117,17 @@ pub struct CrtApp {
 
 impl Drop for CrtApp {
     fn drop(&mut self) {
+        // Save final local video timestamp if watching a non-Jellyfin video
+        if self.current_channel.is_none() {
+            if let (Some(p), Some(LastWatched::LocalVideo { src, .. })) = (&self.player, &self.app_cfg.last_watched) {
+                let pos = p.shared.lock().unwrap().pos;
+                if pos > 2.0 {
+                    let src = src.clone();
+                    self.app_cfg.last_watched = Some(LastWatched::LocalVideo { src, pos_secs: pos });
+                    let _ = settings::save_app_config(&self.app_cfg);
+                }
+            }
+        }
         // Stop mpv first and guarantee Jellyfin playback progress is flushed before exiting.
         self.player = None;
         if let Some(h) = self.shutdown_flush.take() {
@@ -276,6 +290,10 @@ impl CrtApp {
         }
         let audio = if screenshot.is_none() { Some(AudioEngine::start()) } else { None };
         let screenshot_mode = screenshot.is_some();
+        let cli_has_media = mpv_src.is_some() || pattern.is_some();
+        let show_splash = app_cfg.splash_screen && !screenshot_mode && !cli_has_media;
+        let startup_dest_pending =
+            !screenshot_mode && !cli_has_media && app_cfg.startup_dest != StartupDestination::DefaultPattern;
         let mut app = CrtApp {
             s,
             sim,
@@ -334,6 +352,8 @@ impl CrtApp {
             },
             guide: GuideState::new(),
             osd: TvOsd::new(),
+            splash: SplashState::new(show_splash),
+            startup_dest_pending,
             current_channel: None,
             pending_tune_channel: None,
             open_guide_on_connect: false,
@@ -664,6 +684,50 @@ impl CrtApp {
                 {
                     let _ = settings::save_app_config(&self.app_cfg);
                 }
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut self.app_cfg.splash_screen, "Startup splash screen")
+                        .on_hover_text("Boot into RF static, snap to the classic blue screen (\"ViCTR - Virtual CRT Television Receiver\"), then tune into your startup destination.")
+                        .changed()
+                    {
+                        let _ = settings::save_app_config(&self.app_cfg);
+                    }
+                    if ui
+                        .small_button("Replay")
+                        .on_hover_text("Preview the startup static -> blue screen splash sequence")
+                        .clicked()
+                    {
+                        self.guide.active = false;
+                        self.player = None;
+                        self.splash = SplashState::new(true);
+                        self.startup_dest_pending =
+                            self.app_cfg.startup_dest != StartupDestination::DefaultPattern;
+                        self.reset_trails = true;
+                    }
+                });
+                let mut dest = self.app_cfg.startup_dest;
+                ui.horizontal(|ui| {
+                    ui.label("On startup open");
+                    egui::ComboBox::from_id_salt("startup_dest")
+                        .selected_text(dest.label())
+                        .width(178.0)
+                        .show_ui(ui, |ui| {
+                            for d in StartupDestination::ALL {
+                                ui.selectable_value(&mut dest, d, d.label());
+                            }
+                        });
+                });
+                if dest != self.app_cfg.startup_dest {
+                    self.app_cfg.startup_dest = dest;
+                    let _ = settings::save_app_config(&self.app_cfg);
+                }
+                if self.app_cfg.startup_dest == StartupDestination::LastWatched {
+                    let note = match &self.app_cfg.last_watched {
+                        Some(lw) => format!("Last watched: {}", lw.label()),
+                        None => "No last watched item yet — will fall back to Cable Guide.".to_string(),
+                    };
+                    ui.label(RichText::new(note).weak().small());
+                }
                 ui.separator();
 
                 let exists = self
@@ -783,6 +847,109 @@ impl CrtApp {
         }
     }
 
+    fn splash_waiting_for_jellyfin(&self) -> bool {
+        if self.jellyfin.connected || !self.jellyfin.cfg.is_complete() || !self.jellyfin.busy {
+            return false;
+        }
+        if self.open_guide_on_connect {
+            return true;
+        }
+        if !self.startup_dest_pending {
+            return false;
+        }
+        match self.app_cfg.startup_dest {
+            StartupDestination::Guide => true,
+            StartupDestination::LastWatched => !matches!(self.app_cfg.last_watched, Some(LastWatched::LocalVideo { .. })),
+            StartupDestination::DefaultPattern => false,
+        }
+    }
+
+    fn apply_startup_destination(&mut self) {
+        if self.open_guide_on_connect {
+            if self.jellyfin.connected {
+                self.open_guide_on_connect = false;
+                self.startup_dest_pending = false;
+                self.guide.active = true;
+                self.sim.switch_channel();
+                self.reset_trails = true;
+                self.osd.show_channel(1, "GUIDE", "", self.s.mono);
+            }
+            return;
+        }
+        if !self.startup_dest_pending {
+            return;
+        }
+        match self.app_cfg.startup_dest {
+            StartupDestination::DefaultPattern => {
+                self.startup_dest_pending = false;
+            }
+            StartupDestination::Guide => {
+                if self.jellyfin.connected {
+                    self.startup_dest_pending = false;
+                    self.guide.active = true;
+                    self.sim.switch_channel();
+                    self.reset_trails = true;
+                    self.osd.show_channel(1, "GUIDE", "", self.s.mono);
+                } else if !self.jellyfin.busy || !self.jellyfin.cfg.is_complete() {
+                    self.startup_dest_pending = false;
+                }
+            }
+            StartupDestination::LastWatched => match self.app_cfg.last_watched.clone() {
+                Some(LastWatched::LocalVideo { src, pos_secs }) => {
+                    self.startup_dest_pending = false;
+                    self.sim.switch_channel();
+                    self.start_video_at(src, pos_secs);
+                }
+                Some(LastWatched::JellyfinSeries { series_id, .. }) => {
+                    if self.jellyfin.connected {
+                        self.startup_dest_pending = false;
+                        let target_ch = self.jellyfin.channels.iter().find_map(|c| match &c.kind {
+                            ChannelKind::Series { series_id: sid, .. } if sid == &series_id => Some(c.number),
+                            _ => None,
+                        });
+                        if let Some(ch_num) = target_ch {
+                            self.tune_channel(ch_num);
+                        } else {
+                            self.guide.active = true;
+                            self.sim.switch_channel();
+                            self.osd.show_channel(1, "GUIDE", "", self.s.mono);
+                        }
+                    } else if !self.jellyfin.busy || !self.jellyfin.cfg.is_complete() {
+                        self.startup_dest_pending = false;
+                    }
+                }
+                Some(LastWatched::JellyfinGenre { genre }) => {
+                    if self.jellyfin.connected {
+                        self.startup_dest_pending = false;
+                        let target_ch = self.jellyfin.channels.iter().find_map(|c| match &c.kind {
+                            ChannelKind::MovieGenre { genre: g, .. } if g.eq_ignore_ascii_case(&genre) => Some(c.number),
+                            _ => None,
+                        });
+                        if let Some(ch_num) = target_ch {
+                            self.tune_channel(ch_num);
+                        } else {
+                            self.guide.active = true;
+                            self.sim.switch_channel();
+                            self.osd.show_channel(1, "GUIDE", "", self.s.mono);
+                        }
+                    } else if !self.jellyfin.busy || !self.jellyfin.cfg.is_complete() {
+                        self.startup_dest_pending = false;
+                    }
+                }
+                None => {
+                    if self.jellyfin.connected {
+                        self.startup_dest_pending = false;
+                        self.guide.active = true;
+                        self.sim.switch_channel();
+                        self.osd.show_channel(1, "GUIDE", "", self.s.mono);
+                    } else if !self.jellyfin.busy || !self.jellyfin.cfg.is_complete() {
+                        self.startup_dest_pending = false;
+                    }
+                }
+            },
+        }
+    }
+
     fn toggle_guide(&mut self) {
         if !self.jellyfin.connected {
             return;
@@ -818,6 +985,22 @@ impl CrtApp {
         self.guide.close_picker();
         self.sim.switch_channel();
         self.jellyfin.begin_watch(&target);
+        // Remember this channel as "Last watched" for startup auto-resume
+        let lw = self.jellyfin.channel_by_number(target.channel_number).and_then(|c| match &c.kind {
+            ChannelKind::Series { series_id, .. } => Some(LastWatched::JellyfinSeries {
+                series_id: series_id.clone(),
+                channel_name: c.name.clone(),
+                item_id: target.item.id.clone(),
+            }),
+            ChannelKind::MovieGenre { genre, .. } => Some(LastWatched::JellyfinGenre {
+                genre: genre.clone(),
+            }),
+            ChannelKind::Guide => None,
+        });
+        if let Some(lw) = lw {
+            self.app_cfg.last_watched = Some(lw);
+            let _ = settings::save_app_config(&self.app_cfg);
+        }
         self.start_video_at(target.stream_url.clone(), target.start_secs);
         self.video_name = format!("CH {:02} {}", target.channel_number, target.channel_name);
         let sub = if target.is_live_clock {
@@ -1349,6 +1532,12 @@ impl CrtApp {
     fn start_video_at(&mut self, src: String, start: f64) {
         // Stop the previous player FIRST so its teardown cannot race with the new audio session.
         self.player = None;
+        let _ = self.splash.skip();
+        self.startup_dest_pending = false;
+        if self.current_channel.is_none() && self.screenshot.is_none() {
+            self.app_cfg.last_watched = Some(LastWatched::LocalVideo { src: src.clone(), pos_secs: start });
+            let _ = settings::save_app_config(&self.app_cfg);
+        }
         let ring = self.audio.as_ref().map(|a| a.ring.clone());
         let opts = StartOpts {
             volume: (self.s.volume * 100.0) as f64,
@@ -1505,7 +1694,8 @@ impl CrtApp {
         p.degauss_t = self.sim.degauss_t;
         p.channel_switch_t = self.sim.channel_switch_t;
         p.whack_t = self.sim.whack_t;
-        p.test_tone = s.test_tone && s.pattern == Pattern::ColorBars;
+        p.splash_static = if self.splash.is_static() { 1.0 } else { 0.0 };
+        p.test_tone = s.test_tone && s.pattern == Pattern::ColorBars && !self.splash.is_active();
         let (c_sig_drop, c_noise, c_ghost, c_track, c_warble, c_hum, c_ripple) = self.sim.chaos_audio_offsets();
         let (ch_ft, ch_tr) = self.sim.channel_aft_offsets();
         p.rf = s.input == Input::Rf;
@@ -2350,10 +2540,37 @@ impl CrtApp {
                 self.osd.show_action("GUIDE SYNCED");
             }
         }
-        if self.open_guide_on_connect && self.jellyfin.connected {
-            self.open_guide_on_connect = false;
-            self.guide.active = true;
-            self.osd.show_channel(1, "GUIDE", "", self.s.mono);
+        // Step startup splash screen (RF static -> blue screen -> configured startup destination)
+        if self.splash.is_active() {
+            let skip_key = !ctx.egui_wants_keyboard_input()
+                && !self.save_preset_open
+                && ctx.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                        || i.consume_key(egui::Modifiers::NONE, egui::Key::Space)
+                });
+            let ev = if skip_key {
+                self.splash.skip();
+                SplashEvent::Finished
+            } else {
+                self.splash.step(real_dt, self.splash_waiting_for_jellyfin())
+            };
+            match ev {
+                SplashEvent::None => {}
+                SplashEvent::SnappedToBlue => {
+                    self.sim.snap_input();
+                    self.reset_trails = true;
+                }
+                SplashEvent::Finished => {
+                    self.reset_trails = true;
+                    if self.startup_dest_pending || self.open_guide_on_connect {
+                        self.apply_startup_destination();
+                    } else {
+                        self.sim.switch_channel();
+                    }
+                }
+            }
+        } else if self.startup_dest_pending || self.open_guide_on_connect {
+            self.apply_startup_destination();
         }
         if let Some(pending) = self.pending_tune_channel {
             if let Some(ch) = self.jellyfin.channel_by_number(pending) {
@@ -3120,7 +3337,29 @@ impl CrtApp {
                     fi.u.scan_a = (w.max(fi.u.tau_fast[1] * 1.5)).min(1.0) * self.s.scan_exposure;
                     fi.u.eye_k_frame = if self.s.eye_ms <= 0.5 { 1.0 } else { 1.0 - (-(frame_dt * 1000.0) / self.s.eye_ms).exp() };
                 }
-                if self.guide.active && self.jellyfin.connected {
+                if self.splash.is_active() {
+                    if resp.clicked() && !overlay_active {
+                        self.splash.skip();
+                        self.reset_trails = true;
+                        if self.startup_dest_pending || self.open_guide_on_connect {
+                            self.apply_startup_destination();
+                        } else {
+                            self.sim.switch_channel();
+                        }
+                    }
+                }
+                if self.splash.is_active() {
+                    let hint = if self.splash_waiting_for_jellyfin() {
+                        match self.app_cfg.startup_dest {
+                            StartupDestination::LastWatched => Some("TUNING LAST WATCHED..."),
+                            _ => Some("LOADING GUIDE..."),
+                        }
+                    } else {
+                        None
+                    };
+                    fi.image = Some(self.splash.render(hint));
+                    fi.u.pattern = Pattern::Image.id();
+                } else if self.guide.active && self.jellyfin.connected {
                     // Ensure episodes for all visible rows & artwork for the highlighted channel are fetched
                     let (needed_sids, sel_art_id) = if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
                         if let Some(pch) = self.jellyfin.channel_by_number(pch_num) {

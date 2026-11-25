@@ -990,6 +990,66 @@ pub enum StartupPreset {
     User(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StartupDestination {
+    Guide,
+    LastWatched,
+    DefaultPattern,
+}
+
+impl Default for StartupDestination {
+    fn default() -> Self {
+        Self::Guide
+    }
+}
+
+impl StartupDestination {
+    pub const ALL: [StartupDestination; 3] = [
+        StartupDestination::Guide,
+        StartupDestination::LastWatched,
+        StartupDestination::DefaultPattern,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            StartupDestination::Guide => "90s Cable Guide",
+            StartupDestination::LastWatched => "Last watched",
+            StartupDestination::DefaultPattern => "Default test pattern",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum LastWatched {
+    JellyfinSeries {
+        series_id: String,
+        channel_name: String,
+        #[serde(default)]
+        item_id: String,
+    },
+    JellyfinGenre {
+        genre: String,
+    },
+    LocalVideo {
+        src: String,
+        #[serde(default)]
+        pos_secs: f64,
+    },
+}
+
+impl LastWatched {
+    pub fn label(&self) -> String {
+        match self {
+            LastWatched::JellyfinSeries { channel_name, .. } => channel_name.clone(),
+            LastWatched::JellyfinGenre { genre } => format!("{genre} Movies"),
+            LastWatched::LocalVideo { src, .. } => std::path::Path::new(src)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| src.clone()),
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1000,6 +1060,12 @@ pub struct AppConfig {
     pub default_preset: Option<StartupPreset>,
     #[serde(default = "default_true")]
     pub cold_power_on: bool,
+    #[serde(default = "default_true")]
+    pub splash_screen: bool,
+    #[serde(default)]
+    pub startup_dest: StartupDestination,
+    #[serde(default)]
+    pub last_watched: Option<LastWatched>,
 }
 
 impl Default for AppConfig {
@@ -1007,6 +1073,9 @@ impl Default for AppConfig {
         Self {
             default_preset: None,
             cold_power_on: true,
+            splash_screen: true,
+            startup_dest: StartupDestination::Guide,
+            last_watched: None,
         }
     }
 }
@@ -1128,20 +1197,35 @@ mod tests {
         let cfg = AppConfig {
             default_preset: Some(StartupPreset::User("sony-pvm-warm.preset".into())),
             cold_power_on: false,
+            splash_screen: true,
+            startup_dest: StartupDestination::LastWatched,
+            last_watched: Some(LastWatched::JellyfinSeries {
+                series_id: "simpsons-id".into(),
+                channel_name: "The Simpsons".into(),
+                item_id: "ep1".into(),
+            }),
         };
         save_app_config_to(&path, &cfg).unwrap();
         let loaded = load_app_config_from(&path);
         assert_eq!(loaded.default_preset, Some(StartupPreset::User("sony-pvm-warm.preset".into())));
         assert!(!loaded.cold_power_on);
+        assert!(loaded.splash_screen);
+        assert_eq!(loaded.startup_dest, StartupDestination::LastWatched);
+        assert_eq!(loaded.last_watched.as_ref().map(|w| w.label()), Some("The Simpsons".into()));
 
         let cfg2 = AppConfig {
             default_preset: Some(StartupPreset::BuiltIn(4)),
             cold_power_on: true,
+            splash_screen: false,
+            startup_dest: StartupDestination::DefaultPattern,
+            last_watched: None,
         };
         save_app_config_to(&path, &cfg2).unwrap();
         let loaded2 = load_app_config_from(&path);
         assert_eq!(loaded2.default_preset, Some(StartupPreset::BuiltIn(4)));
         assert!(loaded2.cold_power_on);
+        assert!(!loaded2.splash_screen);
+        assert_eq!(loaded2.startup_dest, StartupDestination::DefaultPattern);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
