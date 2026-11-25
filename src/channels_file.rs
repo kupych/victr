@@ -210,6 +210,8 @@ pub fn build_inline_channels(cfg: &ChannelsFileConfig) -> Vec<Channel> {
                 "web"
             } else if crate::retro::is_retro_url(&def.stream_url) {
                 "game"
+            } else if crate::capture::is_capture_url(&def.stream_url) {
+                "capture"
             } else {
                 "live"
             }
@@ -222,7 +224,7 @@ pub fn build_inline_channels(cfg: &ChannelsFileConfig) -> Vec<Channel> {
         };
 
         let ch_kind = match inferred {
-            "live" | "stream" | "livestream" | "web" | "game" | "retro" => {
+            "live" | "stream" | "livestream" | "web" | "game" | "retro" | "capture" => {
                 let raw_src = if !def.stream_url.trim().is_empty() {
                     def.stream_url.trim()
                 } else {
@@ -239,13 +241,23 @@ pub fn build_inline_channels(cfg: &ChannelsFileConfig) -> Vec<Channel> {
                     } else {
                         crate::retro::make_retro_url(raw_src, None)
                     }
+                } else if inferred == "capture" {
+                    if crate::capture::is_capture_url(raw_src) {
+                        raw_src.to_string()
+                    } else {
+                        format!("capture://window/{raw_src}")
+                    }
                 } else {
                     raw_src.to_string()
                 };
                 ChannelKind::LiveStream {
                     stream_url,
                     group: if def.group.trim().is_empty() {
-                        if inferred == "game" || inferred == "retro" { "Game".into() } else { "Live".into() }
+                        if inferred == "game" || inferred == "retro" || inferred == "capture" {
+                            "Game".into()
+                        } else {
+                            "Live".into()
+                        }
                     } else {
                         def.group.trim().to_string()
                     },

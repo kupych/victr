@@ -1,4 +1,5 @@
 use crate::audio::AudioEngine;
+use crate::capture::{self, CapturePlayer, WindowInfo};
 use crate::channels_file::{self, ChannelsFileManager};
 use crate::custom_provider::CustomProviderManager;
 use crate::folders::FoldersManager;
@@ -82,10 +83,11 @@ pub struct CrtApp {
     last_instant: std::time::Instant,
     fps: f32,
     scan_clock: ScanClock,
-    // video through mpv, live web page channels & libretro game console
+    // video through mpv, live web page channels, libretro console & external window/V4L2 capture
     player: Option<Player>,
     web_player: Option<WebPlayer>,
     retro_player: Option<RetroPlayer>,
+    capture_player: Option<CapturePlayer>,
     video_image: Option<(u64, Arc<(usize, usize, Vec<u8>)>)>,
     video_frame_no: u64,
     video_name: String,
@@ -130,6 +132,10 @@ pub struct CrtApp {
     new_type_name: String,
     channels_file_msg: String,
     retro_selected_core: String,
+    capture_windows: Vec<WindowInfo>,
+    capture_monitors: Vec<String>,
+    capture_v4l2: Vec<String>,
+    capture_custom_query: String,
     panel_season_filter: Option<u32>,
     // sound
     audio: Option<AudioEngine>,
@@ -171,10 +177,11 @@ impl Drop for CrtApp {
                 }
             }
         }
-        // Stop mpv / web browser / retro console first (flushes SRAM saves & Jellyfin/Plex progress).
+        // Stop mpv / web browser / retro console / external capture first.
         self.player = None;
         self.web_player = None;
         self.retro_player = None;
+        self.capture_player = None;
         for h in self.shutdown_flushes.drain(..) {
             let _ = h.join();
         }
@@ -387,6 +394,7 @@ impl CrtApp {
             player: None,
             web_player: None,
             retro_player: None,
+            capture_player: None,
             video_image: None,
             video_frame_no: 0,
             video_name: String::new(),
@@ -458,6 +466,10 @@ impl CrtApp {
             new_type_name: String::new(),
             channels_file_msg: String::new(),
             retro_selected_core: String::new(),
+            capture_windows: Vec::new(),
+            capture_monitors: Vec::new(),
+            capture_v4l2: Vec::new(),
+            capture_custom_query: String::new(),
             panel_season_filter: None,
             audio,
             inbox: if screenshot_mode { None } else { Some(crate::link::listen(egui_ctx.clone())) },
@@ -852,6 +864,7 @@ impl CrtApp {
                         self.player = None;
                         self.web_player = None;
                         self.retro_player = None;
+                        self.capture_player = None;
                         self.splash = SplashState::new(true);
                         self.startup_dest_pending =
                             self.app_cfg.startup_dest != StartupDestination::DefaultPattern;
@@ -989,6 +1002,7 @@ impl CrtApp {
         self.player = None;
         self.web_player = None;
         self.retro_player = None;
+        self.capture_player = None;
         self.sidebar_open = false;
         self.save_preset_open = false;
         if let Some(w) = self.active_watch.take() {
@@ -2149,6 +2163,117 @@ impl CrtApp {
                         );
                     });
 
+                // ---- Source 0b: External Emulator Window / Monitor / USB Capture Card (AV 1)
+                let cap_hdr = if self.capture_player.is_some() {
+                    "External Input / Capture (LIVE)".to_string()
+                } else {
+                    "External Input / Capture (Dolphin, PCSX2…)".to_string()
+                };
+                egui::CollapsingHeader::new(RichText::new(cap_hdr).strong().small())
+                    .id_salt("src_capture_input")
+                    .default_open(self.capture_player.is_some())
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Mirror any running emulator window (Dolphin, PCSX2, RetroArch, etc.), Wayland monitor, or USB HDMI/Composite capture card (/dev/video0) directly into the CRT.")
+                                .weak()
+                                .small(),
+                        );
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Scan Windows & Devices").clicked() {
+                                self.capture_windows = capture::list_open_windows();
+                                self.capture_monitors = capture::list_monitors();
+                                self.capture_v4l2 = capture::list_v4l2_devices();
+                            }
+                            if self.capture_player.is_some() && ui.small_button("Stop Capture").clicked() {
+                                self.capture_player = None;
+                            }
+                        });
+                        // Quick 1-click emulator window presets (auto-connect as soon as the window opens!)
+                        let mut cap_start: Option<(String, String)> = None;
+                        ui.horizontal_wrapped(|ui| {
+                            for (lbl, q) in [
+                                ("Dolphin", "capture://window/dolphin"),
+                                ("PCSX2", "capture://window/pcsx2"),
+                                ("RetroArch", "capture://window/retroarch"),
+                            ] {
+                                if ui
+                                    .small_button(lbl)
+                                    .on_hover_text(format!("Mirror any open {lbl} window onto the CRT (auto-waits until launched)"))
+                                    .clicked()
+                                {
+                                    cap_start = Some((lbl.to_string(), q.to_string()));
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.capture_custom_query)
+                                    .hint_text("Window title/class or capture:// URL")
+                                    .desired_width(214.0),
+                            );
+                            let go = ui.small_button("Mirror").clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if go && !self.capture_custom_query.trim().is_empty() {
+                                let raw = self.capture_custom_query.trim().to_string();
+                                let url = if capture::is_capture_url(&raw) {
+                                    raw.clone()
+                                } else {
+                                    format!("capture://window/{raw}")
+                                };
+                                cap_start = Some((raw, url));
+                            }
+                        });
+                        if !self.capture_windows.is_empty() {
+                            ui.label(RichText::new("Open windows (click to mirror)").small().strong());
+                            let wins = self.capture_windows.clone();
+                            for w in wins {
+                                let lbl = w.label();
+                                let url = format!("capture://window/{}", w.match_key());
+                                if ui.selectable_label(false, &lbl).clicked() {
+                                    cap_start = Some((lbl, url));
+                                }
+                            }
+                        }
+                        if !self.capture_monitors.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new("Displays:").weak().small());
+                                for m in self.capture_monitors.clone() {
+                                    if ui.small_button(&m).clicked() {
+                                        cap_start = Some((m.clone(), format!("capture://output/{m}")));
+                                    }
+                                }
+                            });
+                        }
+                        if !self.capture_v4l2.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new("Capture cards:").weak().small());
+                                for d in self.capture_v4l2.clone() {
+                                    if ui.small_button(&d).clicked() {
+                                        cap_start = Some((d.clone(), format!("capture://v4l2{d}")));
+                                    }
+                                }
+                            });
+                        }
+                        if let Some((lbl, url)) = cap_start {
+                            self.guide.active = false;
+                            self.sim.switch_channel();
+                            self.apply_channel_profile("game", None);
+                            self.start_video_at(url, 0.0);
+                            self.video_name = format!("AV 1 · {lbl}");
+                            self.osd.show_channel(0, "AV1", &lbl, self.s.mono);
+                        }
+                        if let Some(cp) = &self.capture_player {
+                            let st = cp.shared.lock().unwrap().status.clone();
+                            ui.label(RichText::new(st).small().color(Color32::from_rgb(112, 236, 184)));
+                        }
+                        ui.label(
+                            RichText::new("Tip: Pin Dolphin/PCSX2 to a channel in channels.json with kind:\"capture\" and stream_url:\"capture://window/dolphin\".")
+                                .weak()
+                                .small(),
+                        );
+                    });
+
                 // ---- Source 1: Local Nested Folders
                 let dir_count = self.folders.channels.len();
                 let dir_hdr = if dir_count > 0 {
@@ -2884,11 +3009,20 @@ impl CrtApp {
         self.player = None;
         self.web_player = None;
         self.retro_player = None;
+        self.capture_player = None;
         let _ = self.splash.skip();
         self.startup_dest_pending = false;
         if self.current_channel.is_none() && self.screenshot.is_none() {
             self.app_cfg.last_watched = Some(LastWatched::LocalVideo { src: src.clone(), pos_secs: start });
             let _ = settings::save_app_config(&self.app_cfg);
+        }
+        if capture::is_capture_url(&src) {
+            self.capture_player = Some(CapturePlayer::start(&src));
+            self.video_name = src.clone();
+            self.video_frame_no = 0;
+            self.s.pattern = Pattern::Video;
+            self.reset_trails = true;
+            return;
         }
         if retro::is_retro_url(&src) {
             let (rom_path, core_hint) = retro::parse_retro_url(&src);
@@ -2981,13 +3115,20 @@ impl CrtApp {
                     if ui.button("Open a video…").clicked() {
                         self.message = "pickvideo".into();
                     }
-                    if (self.player.is_some() || self.web_player.is_some()) && ui.button("Stop").clicked() {
+                    if (self.player.is_some()
+                        || self.web_player.is_some()
+                        || self.retro_player.is_some()
+                        || self.capture_player.is_some())
+                        && ui.button("Stop").clicked()
+                    {
                         stop = true;
                     }
                 });
                 if stop {
                     self.player.take();
                     self.web_player.take();
+                    self.retro_player.take();
+                    self.capture_player.take();
                 }
                 ui.horizontal(|ui| {
                     let te = ui.add(
@@ -4426,6 +4567,15 @@ impl CrtApp {
             }
         } else if let Some(rp) = &self.retro_player {
             let sh = rp.shared.lock().unwrap();
+            if sh.frame_no != self.video_frame_no {
+                self.video_frame_no = sh.frame_no;
+                if let Some(f) = &sh.frame {
+                    self.image_counter += 1;
+                    self.video_image = Some((self.image_counter, f.clone()));
+                }
+            }
+        } else if let Some(cp) = &self.capture_player {
+            let sh = cp.shared.lock().unwrap();
             if sh.frame_no != self.video_frame_no {
                 self.video_frame_no = sh.frame_no;
                 if let Some(f) = &sh.frame {

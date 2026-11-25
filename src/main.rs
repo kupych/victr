@@ -3,6 +3,7 @@
 mod about;
 mod app;
 mod audio;
+mod capture;
 mod channels_file;
 mod custom_provider;
 mod folders;
