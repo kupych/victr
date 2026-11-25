@@ -512,9 +512,21 @@ pub fn build_stream_url(server_url: &str, api_key: &str, item_id: &str) -> Strin
 // ------------------------------------------------------------------ Jellyfin HTTP Client
 
 fn make_agent() -> ureq::Agent {
+    // Handle redirects manually so 301/302/307/308 (e.g. HTTP -> HTTPS reverse proxies)
+    // preserve POST/DELETE methods, JSON bodies, and Jellyfin auth headers instead of
+    // ureq returning an empty 308 response or downgrading POST to GET.
     ureq::AgentBuilder::new()
+        .redirects(0)
         .timeout_connect(std::time::Duration::from_secs(6))
         .timeout(std::time::Duration::from_secs(30))
+        .build()
+}
+
+fn make_fast_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout_connect(std::time::Duration::from_millis(1500))
+        .timeout(std::time::Duration::from_millis(2500))
         .build()
 }
 
@@ -524,6 +536,85 @@ fn auth_header_no_token() -> &'static str {
 
 fn auth_header(api_key: &str) -> String {
     format!("{}, Token=\"{}\"", auth_header_no_token(), api_key.trim())
+}
+
+fn resolve_redirect_url(cur_url: &str, location: &str) -> String {
+    let loc = location.trim();
+    if loc.starts_with("http://") || loc.starts_with("https://") {
+        return loc.to_string();
+    }
+    if let Some(scheme_end) = cur_url.find("://") {
+        let after_scheme = &cur_url[scheme_end + 3..];
+        let origin_len = after_scheme
+            .find('/')
+            .map(|p| scheme_end + 3 + p)
+            .unwrap_or(cur_url.len());
+        let origin = &cur_url[..origin_len];
+        if loc.starts_with('/') {
+            return format!("{origin}{loc}");
+        }
+        let base_dir = match cur_url[origin_len..].rfind('/') {
+            Some(p) => &cur_url[..origin_len + p + 1],
+            None => return format!("{origin}/{loc}"),
+        };
+        return format!("{base_dir}{loc}");
+    }
+    loc.to_string()
+}
+
+/// Sends an HTTP request while following up to 5 redirects (301/302/303/307/308)
+/// and preserving the HTTP method, Jellyfin auth headers, and JSON/empty body.
+fn send_jellyfin_req(
+    agent: &ureq::Agent,
+    method: &str,
+    url: &str,
+    api_key: Option<&str>,
+    json_body: Option<&serde_json::Value>,
+) -> Result<ureq::Response, ureq::Error> {
+    let mut cur_url = url.to_string();
+    for _ in 0..5 {
+        let mut req = agent.request(method, &cur_url);
+        if let Some(key) = api_key {
+            let k = key.trim();
+            req = req.set("X-Emby-Token", k).set("Authorization", &auth_header(k));
+        } else {
+            req = req
+                .set("Authorization", auth_header_no_token())
+                .set("X-Emby-Authorization", auth_header_no_token());
+        }
+        let resp = if let Some(body) = json_body {
+            req.send_json(body.clone())?
+        } else if method.eq_ignore_ascii_case("POST") {
+            req.send_bytes(&[])?
+        } else {
+            req.call()?
+        };
+        let status = resp.status();
+        if (300..=399).contains(&status) {
+            if let Some(loc) = resp.header("location") {
+                cur_url = resolve_redirect_url(&cur_url, loc);
+                continue;
+            }
+        }
+        return Ok(resp);
+    }
+    // Final attempt without further redirects
+    let mut req = agent.request(method, &cur_url);
+    if let Some(key) = api_key {
+        let k = key.trim();
+        req = req.set("X-Emby-Token", k).set("Authorization", &auth_header(k));
+    } else {
+        req = req
+            .set("Authorization", auth_header_no_token())
+            .set("X-Emby-Authorization", auth_header_no_token());
+    }
+    if let Some(body) = json_body {
+        req.send_json(body.clone())
+    } else if method.eq_ignore_ascii_case("POST") {
+        req.send_bytes(&[])
+    } else {
+        req.call()
+    }
 }
 
 #[derive(Deserialize)]
@@ -552,6 +643,9 @@ fn describe_http_err(err: ureq::Error) -> String {
 fn verify_played_resp(res: Result<ureq::Response, ureq::Error>, expected: bool) -> Result<(), String> {
     let resp = res.map_err(describe_http_err)?;
     let status = resp.status();
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status} {}", resp.status_text()));
+    }
     if status == 204 {
         return Ok(());
     }
@@ -582,15 +676,23 @@ pub fn authenticate_by_name(server_url: &str, username: &str, password: &str) ->
         "Username": username.trim(),
         "Pw": password,
     });
-    let resp = agent
-        .post(&format!("{base}/Users/AuthenticateByName"))
-        .set("Authorization", auth_header_no_token())
-        .set("X-Emby-Authorization", auth_header_no_token())
-        .send_json(body)
-        .map_err(|e| format!("Sign-in failed: {}", describe_http_err(e)))?;
-    let parsed: RawAuthResp = resp
-        .into_json()
-        .map_err(|e| format!("Invalid Jellyfin auth JSON: {e}"))?;
+    let resp = send_jellyfin_req(
+        &agent,
+        "POST",
+        &format!("{base}/Users/AuthenticateByName"),
+        None,
+        Some(&body),
+    )
+    .map_err(|e| format!("Sign-in failed: {}", describe_http_err(e)))?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        return Err(format!("Sign-in failed: HTTP {status} {}", resp.status_text()));
+    }
+    let text = resp.into_string().unwrap_or_default();
+    let parsed: RawAuthResp = serde_json::from_str(&text).map_err(|e| {
+        let snippet: String = text.trim().chars().take(120).collect();
+        format!("Invalid Jellyfin auth JSON (HTTP {status}): {e} [{snippet}]")
+    })?;
     Ok((parsed.access_token, JellyfinUser { id: parsed.user.id, name: parsed.user.name }))
 }
 
@@ -681,12 +783,12 @@ struct RawScheduledTask {
 }
 
 fn get_json<T: for<'de> Deserialize<'de>>(agent: &ureq::Agent, url: &str, api_key: &str) -> Result<T, String> {
-    let resp = agent
-        .get(url)
-        .set("X-Emby-Token", api_key.trim())
-        .set("Authorization", &auth_header(api_key))
-        .call()
-        .map_err(|e| format!("Jellyfin request failed: {e}"))?;
+    let resp = send_jellyfin_req(agent, "GET", url, Some(api_key), None)
+        .map_err(|e| format!("Jellyfin request failed: {}", describe_http_err(e)))?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        return Err(format!("Jellyfin request failed: HTTP {status} {}", resp.status_text()));
+    }
     resp.into_json::<T>().map_err(|e| format!("Invalid Jellyfin JSON: {e}"))
 }
 
@@ -776,12 +878,11 @@ pub fn trigger_library_scan(server_url: &str, api_key: &str) -> Result<(), Strin
         return Err("Jellyfin server not configured.".into());
     }
     let agent = make_agent();
-    agent
-        .post(&format!("{base}/Library/Refresh"))
-        .set("X-Emby-Token", api_key.trim())
-        .set("Authorization", &auth_header(api_key))
-        .send_bytes(&[])
-        .map_err(|e| format!("Library scan request failed: {e}"))?;
+    let resp = send_jellyfin_req(&agent, "POST", &format!("{base}/Library/Refresh"), Some(api_key), None)
+        .map_err(|e| format!("Library scan request failed: {}", describe_http_err(e)))?;
+    if !(200..300).contains(&resp.status()) {
+        return Err(format!("Library scan request failed: HTTP {} {}", resp.status(), resp.status_text()));
+    }
     Ok(())
 }
 
@@ -848,7 +949,10 @@ pub fn fetch_artwork(server_url: &str, api_key: &str, item_id: &str) -> Option<A
         format!("{base}/Items/{item_id}/Images/Primary?maxWidth=260&quality=80&api_key={}", api_key.trim()),
     ];
     for url in urls {
-        if let Ok(resp) = agent.get(&url).call() {
+        if let Ok(resp) = send_jellyfin_req(&agent, "GET", &url, Some(api_key), None) {
+            if !(200..300).contains(&resp.status()) {
+                continue;
+            }
             let mut bytes = Vec::new();
             if resp.into_reader().read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
                 if let Ok(img) = image::load_from_memory(&bytes) {
@@ -998,13 +1102,6 @@ pub fn fetch_lineup(cfg: &JellyfinConfig) -> Result<Vec<Channel>, String> {
 
 // ------------------------------------------------------------------ Playback Progress Sync
 
-fn make_fast_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_millis(1500))
-        .timeout(std::time::Duration::from_millis(2500))
-        .build()
-}
-
 fn report_session_with_agent(
     agent: &ureq::Agent,
     server_url: &str,
@@ -1028,27 +1125,26 @@ fn report_session_with_agent(
         "CanSeek": true,
         "PlayMethod": "DirectStream"
     });
-    let _ = agent
-        .post(&format!("{base}{endpoint}"))
-        .set("X-Emby-Token", api_key.trim())
-        .set("Authorization", &auth_header(api_key))
-        .send_json(body);
+    let _ = send_jellyfin_req(agent, "POST", &format!("{base}{endpoint}"), Some(api_key), Some(&body));
 
-    // Dashboard API keys are not tied to a user session, so also persist PlaybackPositionTicks
-    // directly on the user's UserData record when saving progress / stopping.
+    // Also persist PlaybackPositionTicks directly on the user's UserData record when saving progress / stopping.
     if !user_id.is_empty() && endpoint != "/Sessions/Playing" {
         let ud_body = serde_json::json!({ "PlaybackPositionTicks": ticks });
-        let v2 = agent
-            .post(&format!("{base}/UserItems/{item_id}/UserData?userId={user_id}"))
-            .set("X-Emby-Token", api_key.trim())
-            .set("Authorization", &auth_header(api_key))
-            .send_json(ud_body.clone());
-        if v2.is_err() {
-            let _ = agent
-                .post(&format!("{base}/Users/{user_id}/Items/{item_id}/UserData"))
-                .set("X-Emby-Token", api_key.trim())
-                .set("Authorization", &auth_header(api_key))
-                .send_json(ud_body);
+        let v2 = send_jellyfin_req(
+            agent,
+            "POST",
+            &format!("{base}/UserItems/{item_id}/UserData?userId={user_id}"),
+            Some(api_key),
+            Some(&ud_body),
+        );
+        if v2.map(|r| !(200..300).contains(&r.status())).unwrap_or(true) {
+            let _ = send_jellyfin_req(
+                agent,
+                "POST",
+                &format!("{base}/Users/{user_id}/Items/{item_id}/UserData"),
+                Some(api_key),
+                Some(&ud_body),
+            );
         }
     }
 }
@@ -1071,11 +1167,13 @@ fn mark_played_with_agent(
     let mut errs = Vec::new();
     // 1) Jellyfin 10.9+ UserPlayedItems
     let r1 = verify_played_resp(
-        agent
-            .post(&format!("{base}/UserPlayedItems/{item_id}?userId={user_id}"))
-            .set("X-Emby-Token", api_key.trim())
-            .set("Authorization", &auth_header(api_key))
-            .send_bytes(&[]),
+        send_jellyfin_req(
+            agent,
+            "POST",
+            &format!("{base}/UserPlayedItems/{item_id}?userId={user_id}"),
+            Some(api_key),
+            None,
+        ),
         true,
     );
     match r1 {
@@ -1084,11 +1182,13 @@ fn mark_played_with_agent(
     }
     // 2) Legacy Users/{uid}/PlayedItems/{id}
     let r2 = verify_played_resp(
-        agent
-            .post(&format!("{base}/Users/{user_id}/PlayedItems/{item_id}"))
-            .set("X-Emby-Token", api_key.trim())
-            .set("Authorization", &auth_header(api_key))
-            .send_bytes(&[]),
+        send_jellyfin_req(
+            agent,
+            "POST",
+            &format!("{base}/Users/{user_id}/PlayedItems/{item_id}"),
+            Some(api_key),
+            None,
+        ),
         true,
     );
     match r2 {
@@ -1098,11 +1198,13 @@ fn mark_played_with_agent(
     // 3) Jellyfin 10.9+ direct UserData update
     let ud = serde_json::json!({ "Played": true, "PlaybackPositionTicks": 0 });
     let r3 = verify_played_resp(
-        agent
-            .post(&format!("{base}/UserItems/{item_id}/UserData?userId={user_id}"))
-            .set("X-Emby-Token", api_key.trim())
-            .set("Authorization", &auth_header(api_key))
-            .send_json(ud.clone()),
+        send_jellyfin_req(
+            agent,
+            "POST",
+            &format!("{base}/UserItems/{item_id}/UserData?userId={user_id}"),
+            Some(api_key),
+            Some(&ud),
+        ),
         true,
     );
     match r3 {
@@ -1111,11 +1213,13 @@ fn mark_played_with_agent(
     }
     // 4) Legacy Users/{uid}/Items/{id}/UserData
     let r4 = verify_played_resp(
-        agent
-            .post(&format!("{base}/Users/{user_id}/Items/{item_id}/UserData"))
-            .set("X-Emby-Token", api_key.trim())
-            .set("Authorization", &auth_header(api_key))
-            .send_json(ud),
+        send_jellyfin_req(
+            agent,
+            "POST",
+            &format!("{base}/Users/{user_id}/Items/{item_id}/UserData"),
+            Some(api_key),
+            Some(&ud),
+        ),
         true,
     );
     match r4 {
@@ -1141,11 +1245,13 @@ fn mark_unplayed(server_url: &str, api_key: &str, user_id: &str, item_id: &str) 
     let agent = make_agent();
     let mut errs = Vec::new();
     let r1 = verify_played_resp(
-        agent
-            .delete(&format!("{base}/UserPlayedItems/{item_id}?userId={user_id}"))
-            .set("X-Emby-Token", api_key.trim())
-            .set("Authorization", &auth_header(api_key))
-            .call(),
+        send_jellyfin_req(
+            &agent,
+            "DELETE",
+            &format!("{base}/UserPlayedItems/{item_id}?userId={user_id}"),
+            Some(api_key),
+            None,
+        ),
         false,
     );
     match r1 {
@@ -1153,11 +1259,13 @@ fn mark_unplayed(server_url: &str, api_key: &str, user_id: &str, item_id: &str) 
         Err(e) => errs.push(format!("UserPlayedItems: {e}")),
     }
     let r2 = verify_played_resp(
-        agent
-            .delete(&format!("{base}/Users/{user_id}/PlayedItems/{item_id}"))
-            .set("X-Emby-Token", api_key.trim())
-            .set("Authorization", &auth_header(api_key))
-            .call(),
+        send_jellyfin_req(
+            &agent,
+            "DELETE",
+            &format!("{base}/Users/{user_id}/PlayedItems/{item_id}"),
+            Some(api_key),
+            None,
+        ),
         false,
     );
     match r2 {
@@ -1166,11 +1274,13 @@ fn mark_unplayed(server_url: &str, api_key: &str, user_id: &str, item_id: &str) 
     }
     let ud = serde_json::json!({ "Played": false });
     let r3 = verify_played_resp(
-        agent
-            .post(&format!("{base}/UserItems/{item_id}/UserData?userId={user_id}"))
-            .set("X-Emby-Token", api_key.trim())
-            .set("Authorization", &auth_header(api_key))
-            .send_json(ud.clone()),
+        send_jellyfin_req(
+            &agent,
+            "POST",
+            &format!("{base}/UserItems/{item_id}/UserData?userId={user_id}"),
+            Some(api_key),
+            Some(&ud),
+        ),
         false,
     );
     match r3 {
@@ -1178,11 +1288,13 @@ fn mark_unplayed(server_url: &str, api_key: &str, user_id: &str, item_id: &str) 
         Err(e) => errs.push(format!("UserItems/UserData: {e}")),
     }
     let r4 = verify_played_resp(
-        agent
-            .post(&format!("{base}/Users/{user_id}/Items/{item_id}/UserData"))
-            .set("X-Emby-Token", api_key.trim())
-            .set("Authorization", &auth_header(api_key))
-            .send_json(ud),
+        send_jellyfin_req(
+            &agent,
+            "POST",
+            &format!("{base}/Users/{user_id}/Items/{item_id}/UserData"),
+            Some(api_key),
+            Some(&ud),
+        ),
         false,
     );
     match r4 {
@@ -1957,5 +2069,86 @@ mod tests {
         assert_eq!(merged[2].episode, None);
         // Stale next_up_id pointing to an already-watched episode must be skipped in favor of first unwatched
         assert_eq!(pick_next_episode_index(&merged, Some("e1")), Some(2));
+    }
+
+    #[test]
+    fn http_308_redirect_preserves_post_body_and_auth() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+
+        let srv = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut raw = Vec::new();
+                let mut tmp = [0u8; 1024];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                loop {
+                    let n = stream.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&tmp[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            let hdr = String::from_utf8_lossy(&raw[..pos]);
+                            for line in hdr.lines() {
+                                if let Some(v) = line.strip_prefix("Content-Length:").or_else(|| line.strip_prefix("content-length:")) {
+                                    content_len = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(he) = header_end {
+                        if raw.len() >= he + content_len {
+                            break;
+                        }
+                    }
+                }
+                let req = String::from_utf8_lossy(&raw);
+                let first_line = req.lines().next().unwrap_or("");
+                if first_line.starts_with("POST /Users/AuthenticateByName ") {
+                    let resp = format!(
+                        "HTTP/1.1 308 Permanent Redirect\r\nLocation: http://{addr}/final/Users/AuthenticateByName\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else if first_line.starts_with("POST /final/Users/AuthenticateByName ") {
+                    assert!(req.contains("\"Username\":\"homer\""), "POST JSON body must survive 308 redirect: {req}");
+                    let body = r#"{"AccessToken":"tok123","User":{"Id":"u1","Name":"Homer"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else if first_line.starts_with("POST /UserPlayedItems/ep1?userId=u1 ") {
+                    let resp = format!(
+                        "HTTP/1.1 308 Permanent Redirect\r\nLocation: /final/UserPlayedItems/ep1?userId=u1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else if first_line.starts_with("POST /final/UserPlayedItems/ep1?userId=u1 ") {
+                    assert!(req.contains("tok123"), "Auth header must survive 308 redirect: {req}");
+                    let body = r#"{"Played":true,"PlaybackPositionTicks":0}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        let (tok, user) = authenticate_by_name(&base, "homer", "donut").expect("POST login must survive 308 redirect");
+        assert_eq!(tok, "tok123");
+        assert_eq!(user.id, "u1");
+
+        mark_played(&base, &tok, &user.id, "ep1").expect("POST mark_played must survive 308 redirect");
+        srv.join().unwrap();
     }
 }
