@@ -5,6 +5,7 @@ use crate::guide::{GuideState, GuideView};
 use crate::jellyfin::JellyfinManager;
 use crate::mpv::{Player, StartOpts};
 use crate::osd::TvOsd;
+use crate::plex::PlexManager;
 use crate::provider::{self, ActiveWatch, ArtworkImage, Channel, ChannelKind, MediaItem, TuneTarget};
 use crate::settings::{self, AppConfig, Input, LastWatched, Mask, Pattern, PhosphorSet, Settings, StartupDestination, StartupPreset, TapeSpeed, UserPreset};
 use crate::sim::Sim;
@@ -86,6 +87,7 @@ pub struct CrtApp {
     seek_drag: Option<f64>,
     // Multi-provider 90s cable guide & TV OSD
     jellyfin: JellyfinManager,
+    plex: PlexManager,
     folders: FoldersManager,
     lineup: Vec<Channel>,
     active_watch: Option<ActiveWatch>,
@@ -100,6 +102,7 @@ pub struct CrtApp {
     last_ended_item: Option<String>,
     muted: bool,
     show_api_key: bool,
+    show_plex_token: bool,
     jf_username: String,
     jf_password: String,
     folder_path_input: String,
@@ -116,7 +119,7 @@ pub struct CrtApp {
     pending_fullscreen: Option<bool>,
     pending_close: bool,
     quitting_since: Option<std::time::Instant>,
-    shutdown_flush: Option<std::thread::JoinHandle<()>>,
+    shutdown_flushes: Vec<std::thread::JoinHandle<()>>,
     fs_since: std::time::Instant,
     last_pointer_move: std::time::Instant,
 }
@@ -140,12 +143,13 @@ impl Drop for CrtApp {
                 self.folders.save_resume(&w.item_id, w.last_pos, w.duration_secs);
             }
         }
-        // Stop mpv first and guarantee Jellyfin playback progress is flushed before exiting.
+        // Stop mpv first and guarantee Jellyfin & Plex playback progress is flushed before exiting.
         self.player = None;
-        if let Some(h) = self.shutdown_flush.take() {
+        for h in self.shutdown_flushes.drain(..) {
             let _ = h.join();
         }
         self.jellyfin.finish_watch_sync();
+        self.plex.finish_watch_sync();
         if self.inbox.is_some() {
             crate::link::cleanup();
         }
@@ -362,6 +366,11 @@ impl CrtApp {
             } else {
                 JellyfinManager::new()
             },
+            plex: if screenshot_mode && !std::env::var_os("VICTR_GUIDE_CONNECT").is_some() {
+                PlexManager::new_offline()
+            } else {
+                PlexManager::new()
+            },
             folders: if screenshot_mode && !std::env::var_os("VICTR_GUIDE_CONNECT").is_some() {
                 FoldersManager::new_offline()
             } else {
@@ -380,6 +389,7 @@ impl CrtApp {
             last_ended_item: None,
             muted: false,
             show_api_key: false,
+            show_plex_token: false,
             jf_username: String::new(),
             jf_password: String::new(),
             folder_path_input: String::new(),
@@ -394,7 +404,7 @@ impl CrtApp {
             pending_fullscreen: None,
             pending_close: false,
             quitting_since: None,
-            shutdown_flush: None,
+            shutdown_flushes: Vec::new(),
             fs_since: std::time::Instant::now(),
             last_pointer_move: std::time::Instant::now(),
         };
@@ -861,8 +871,13 @@ impl CrtApp {
                 self.folders.save_resume(&w.item_id, w.last_pos, w.duration_secs);
             }
         }
-        if self.shutdown_flush.is_none() {
-            self.shutdown_flush = self.jellyfin.finish_watch_async_joinable();
+        if self.shutdown_flushes.is_empty() {
+            if let Some(h) = self.jellyfin.finish_watch_async_joinable() {
+                self.shutdown_flushes.push(h);
+            }
+            if let Some(h) = self.plex.finish_watch_async_joinable() {
+                self.shutdown_flushes.push(h);
+            }
         }
         if self.sim.power_on {
             self.sim.set_power(false);
@@ -877,12 +892,15 @@ impl CrtApp {
     }
 
     fn any_source_busy(&self) -> bool {
-        self.jellyfin.busy || self.folders.busy
+        self.jellyfin.busy || self.plex.busy || self.folders.busy
     }
 
     fn rebuild_lineup(&mut self) {
-        let mut raw = Vec::with_capacity(self.jellyfin.channels.len() + self.folders.channels.len());
+        let mut raw = Vec::with_capacity(
+            self.jellyfin.channels.len() + self.plex.channels.len() + self.folders.channels.len(),
+        );
         raw.extend(self.jellyfin.channels.iter().cloned());
+        raw.extend(self.plex.channels.iter().cloned());
         raw.extend(self.folders.channels.iter().cloned());
         if raw.is_empty() {
             self.lineup.clear();
@@ -917,9 +935,11 @@ impl CrtApp {
     }
 
     fn ensure_channel_episodes(&mut self, ch: &Channel) {
-        if ch.provider_id == "jellyfin" {
-            if let ChannelKind::Series { series_id, loaded_episodes: false, .. } = &ch.kind {
-                self.jellyfin.ensure_series_episodes(series_id);
+        if let ChannelKind::Series { series_id, loaded_episodes: false, .. } = &ch.kind {
+            match ch.provider_id.as_str() {
+                "jellyfin" => self.jellyfin.ensure_series_episodes(series_id),
+                "plex" => self.plex.ensure_series_episodes(series_id),
+                _ => {}
             }
         }
     }
@@ -930,6 +950,7 @@ impl CrtApp {
         }
         match provider_id {
             "jellyfin" => self.jellyfin.request_artwork(art_id),
+            "plex" => self.plex.request_artwork(art_id),
             "folders" => self.folders.request_artwork(art_id),
             _ => None,
         }
@@ -942,6 +963,7 @@ impl CrtApp {
             .unwrap_or_default();
         match provider_id.as_str() {
             "jellyfin" => self.jellyfin.set_item_played(item_id, played),
+            "plex" => self.plex.set_item_played(item_id, played),
             "folders" => self.folders.set_item_played(item_id, played),
             _ => {}
         }
@@ -957,6 +979,7 @@ impl CrtApp {
         let Some(w) = self.active_watch.take() else { return };
         match w.provider_id.as_str() {
             "jellyfin" => self.jellyfin.finish_watch(),
+            "plex" => self.plex.finish_watch(),
             "folders" => {
                 if w.dwell_secs >= 15.0 && !w.marked_played {
                     self.folders.save_resume(&w.item_id, w.last_pos, w.duration_secs);
@@ -973,6 +996,10 @@ impl CrtApp {
             self.jellyfin.connect_and_load();
             started = true;
         }
+        if self.plex.cfg.is_complete() && !self.plex.busy {
+            self.plex.connect_and_load();
+            started = true;
+        }
         if self.folders.cfg.roots.iter().any(|r| r.enabled) && !self.folders.busy {
             self.folders.rescan_async();
             started = true;
@@ -985,10 +1012,11 @@ impl CrtApp {
 
     fn splash_waiting_for_sources(&self) -> bool {
         let jf_loading = !self.jellyfin.connected && self.jellyfin.cfg.is_complete() && self.jellyfin.busy;
+        let px_loading = !self.plex.connected && self.plex.cfg.is_complete() && self.plex.busy;
         let dir_loading = self.folders.channels.is_empty()
             && self.folders.cfg.roots.iter().any(|r| r.enabled)
             && self.folders.busy;
-        if !jf_loading && !dir_loading {
+        if !jf_loading && !px_loading && !dir_loading {
             return false;
         }
         if self.open_guide_on_connect {
@@ -1163,6 +1191,8 @@ impl CrtApp {
         });
         if target.provider_id == "jellyfin" {
             self.jellyfin.begin_watch(&target);
+        } else if target.provider_id == "plex" {
+            self.plex.begin_watch(&target);
         }
         // Remember this channel as "Last watched" for startup auto-resume
         if !target.provider_id.is_empty() && target.provider_id != "guide" {
@@ -1335,7 +1365,7 @@ impl CrtApp {
             .default_open(false)
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new("Combine Jellyfin servers and nested local folders into one 90s Prevue Cable Guide lineup.")
+                    RichText::new("Combine Jellyfin, Plex, and nested local folders into one 90s Prevue Cable Guide lineup.")
                         .weak()
                         .small(),
                 );
@@ -1444,9 +1474,9 @@ impl CrtApp {
                             if !matches!(bch.kind, ChannelKind::Guide | ChannelKind::LiveStream { .. }) {
                                 self.ensure_channel_episodes(&bch);
                                 let items = bch.items().to_vec();
-                                let bch_jf_series_id = if bch.provider_id == "jellyfin" {
+                                let bch_remote_series = if bch.provider_id == "jellyfin" || bch.provider_id == "plex" {
                                     match &bch.kind {
-                                        ChannelKind::Series { series_id, .. } => Some(series_id.clone()),
+                                        ChannelKind::Series { series_id, .. } => Some((bch.provider_id.clone(), series_id.clone())),
                                         _ => None,
                                     }
                                 } else {
@@ -1456,7 +1486,7 @@ impl CrtApp {
                                 let header = format!("Episodes / Movies — CH {:02} {} [{badge}] ({})", bch.number, bch.name, items.len());
                                 let mut play_req: Option<(MediaItem, bool)> = None;
                                 let mut watch_toggle: Option<(String, bool)> = None;
-                                let mut reload_sid: Option<String> = None;
+                                let mut reload_sid: Option<(String, String)> = None;
                                 egui::CollapsingHeader::new(RichText::new(header).small().strong())
                                     .id_salt("ch_ep_browser")
                                     .default_open(false)
@@ -1484,9 +1514,9 @@ impl CrtApp {
                                                     }
                                                 }
                                             }
-                                            if let Some(sid) = &bch_jf_series_id {
-                                                if ui.small_button("Reload list").on_hover_text("Re-fetch all episodes for this series from Jellyfin").clicked() {
-                                                    reload_sid = Some(sid.clone());
+                                            if let Some((prov, sid)) = &bch_remote_series {
+                                                if ui.small_button("Reload list").on_hover_text("Re-fetch all episodes for this series from the server").clicked() {
+                                                    reload_sid = Some((prov.clone(), sid.clone()));
                                                 }
                                             }
                                         });
@@ -1520,8 +1550,12 @@ impl CrtApp {
                                                 }
                                             });
                                     });
-                                if let Some(sid) = reload_sid {
-                                    self.jellyfin.reload_series_episodes(&sid);
+                                if let Some((prov, sid)) = reload_sid {
+                                    if prov == "jellyfin" {
+                                        self.jellyfin.reload_series_episodes(&sid);
+                                    } else if prov == "plex" {
+                                        self.plex.reload_series_episodes(&sid);
+                                    }
                                 }
                                 if let Some((iid, played)) = watch_toggle {
                                     self.set_channel_item_played(bch_num, &iid, played);
@@ -1809,6 +1843,134 @@ impl CrtApp {
                             });
                             if clear_err {
                                 self.jellyfin.last_error.clear();
+                            }
+                        }
+                    });
+
+                // ---- Source 3: Plex Media Server
+                let px_hdr = if self.plex.connected {
+                    format!("Plex Server ({} ch)", self.plex.channels.len())
+                } else {
+                    "Plex Server".to_string()
+                };
+                egui::CollapsingHeader::new(RichText::new(px_hdr).strong().small())
+                    .id_salt("src_plex")
+                    .default_open(self.plex.connected)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Server URL");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.plex.cfg.server_url)
+                                    .hint_text("http://192.168.1.10:32400")
+                                    .desired_width(230.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("X-Plex-Token");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.plex.cfg.token)
+                                    .password(!self.show_plex_token)
+                                    .hint_text("Paste your Plex token")
+                                    .desired_width(172.0),
+                            )
+                            .on_hover_text("Find your token in Plex Web: open any item -> Get Info -> View XML -> copy X-Plex-Token from the URL.");
+                            if ui.small_button(if self.show_plex_token { "Hide" } else { "Show" }).clicked() {
+                                self.show_plex_token = !self.show_plex_token;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let connect_lbl = if self.plex.connected { "Reconnect" } else { "Connect" };
+                            if ui.add_enabled(!self.plex.busy, egui::Button::new(connect_lbl)).clicked() {
+                                self.plex.connect_and_load();
+                            }
+                            if self.plex.connected
+                                && ui
+                                    .add_enabled(!self.plex.busy, egui::Button::new("Refresh"))
+                                    .on_hover_text("Reload channels, episodes, and watched states from Plex")
+                                    .clicked()
+                            {
+                                self.plex.connect_and_load();
+                            }
+                            if self.plex.connected
+                                && ui
+                                    .add_enabled(!self.plex.busy, egui::Button::new("Rescan Server"))
+                                    .on_hover_text("Ask Plex to scan its libraries for new media, then reload the guide")
+                                    .clicked()
+                            {
+                                self.plex.scan_server_library();
+                            }
+                            if self.plex.connected && ui.button("Disconnect").clicked() {
+                                self.plex.disconnect();
+                                self.rebuild_lineup();
+                                if !self.has_channels() {
+                                    self.guide.active = false;
+                                    self.current_channel = None;
+                                }
+                            }
+                        });
+                        if self.plex.connected {
+                            let mut auto_changed = false;
+                            ui.horizontal(|ui| {
+                                ui.label("Auto-sync");
+                                let cur_mins = self.plex.cfg.auto_refresh_mins;
+                                let lbl = if cur_mins == 0 {
+                                    "Manual only".to_string()
+                                } else {
+                                    format!("Every {cur_mins} min")
+                                };
+                                egui::ComboBox::from_id_salt("plex_auto_sync")
+                                    .selected_text(lbl)
+                                    .width(126.0)
+                                    .show_ui(ui, |ui| {
+                                        for &(mins, text) in &[
+                                            (0u32, "Manual only"),
+                                            (5, "Every 5 min"),
+                                            (10, "Every 10 min"),
+                                            (15, "Every 15 min"),
+                                            (30, "Every 30 min"),
+                                            (60, "Every 60 min"),
+                                        ] {
+                                            if ui.selectable_label(self.plex.cfg.auto_refresh_mins == mins, text).clicked() {
+                                                self.plex.cfg.auto_refresh_mins = mins;
+                                                auto_changed = true;
+                                            }
+                                        }
+                                    });
+                            });
+                            if auto_changed {
+                                let _ = crate::plex::save_config(&self.plex.cfg);
+                            }
+                        }
+                        if !self.plex.status.is_empty() {
+                            let col = if self.plex.connected {
+                                Color32::from_rgb(112, 236, 184)
+                            } else {
+                                Color32::from_rgb(235, 175, 100)
+                            };
+                            let status_line = if self.plex.connected {
+                                match self.plex.last_sync_label() {
+                                    Some(ago) => format!("{} (synced {ago})", self.plex.status),
+                                    None => self.plex.status.clone(),
+                                }
+                            } else {
+                                self.plex.status.clone()
+                            };
+                            ui.label(RichText::new(status_line).small().color(col));
+                        }
+                        if !self.plex.last_error.is_empty() {
+                            let mut clear_err = false;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(&self.plex.last_error)
+                                        .small()
+                                        .color(Color32::from_rgb(248, 122, 108)),
+                                );
+                                if ui.small_button("×").on_hover_text("Dismiss error").clicked() {
+                                    clear_err = true;
+                                }
+                            });
+                            if clear_err {
+                                self.plex.last_error.clear();
                             }
                         }
                     });
@@ -2815,16 +2977,21 @@ impl CrtApp {
         }
 
         // Poll background media providers & remote digit-entry commit timer
-        let prev_err = self.jellyfin.last_error.clone();
+        let prev_jf_err = self.jellyfin.last_error.clone();
+        let prev_px_err = self.plex.last_error.clone();
         let jf_changed = self.jellyfin.poll();
+        let px_changed = self.plex.poll();
         let dir_changed = self.folders.poll();
-        if jf_changed || dir_changed {
+        if jf_changed || px_changed || dir_changed {
             self.rebuild_lineup();
         }
-        if !self.jellyfin.last_error.is_empty() && self.jellyfin.last_error != prev_err {
+        if !self.jellyfin.last_error.is_empty() && self.jellyfin.last_error != prev_jf_err {
             self.osd.show_action("JELLYFIN SYNC ERR");
         }
-        if (jf_changed || dir_changed) && self.notify_guide_synced && !self.any_source_busy() {
+        if !self.plex.last_error.is_empty() && self.plex.last_error != prev_px_err {
+            self.osd.show_action("PLEX SYNC ERR");
+        }
+        if (jf_changed || px_changed || dir_changed) && self.notify_guide_synced && !self.any_source_busy() {
             self.notify_guide_synced = false;
             if self.has_channels() {
                 self.osd.show_action("GUIDE SYNCED");
@@ -3181,6 +3348,11 @@ impl CrtApp {
                 }
                 if w.provider_id == "jellyfin" {
                     if self.jellyfin.tick_watch(real_dt, pos, dur, paused) {
+                        w.marked_played = true;
+                        rebuild_after_tick = true;
+                    }
+                } else if w.provider_id == "plex" {
+                    if self.plex.tick_watch(real_dt, pos, dur, paused) {
                         w.marked_played = true;
                         rebuild_after_tick = true;
                     }
@@ -3671,15 +3843,15 @@ impl CrtApp {
                     fi.u.pattern = Pattern::Image.id();
                 } else if self.guide.active && self.has_channels() {
                     // Ensure episodes for all visible rows & artwork for the highlighted channel are fetched
-                    let (needed_jf_sids, sel_art_provider, sel_art_id) =
+                    let (needed_sids, sel_art_provider, sel_art_id) =
                         if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
                             if let Some(pch) = self.channel_by_number(pch_num).cloned() {
                                 let len = pch.items().len();
                                 self.guide.clamp_picker(len);
                                 let mut sids = Vec::new();
-                                if pch.provider_id == "jellyfin" {
+                                if pch.provider_id == "jellyfin" || pch.provider_id == "plex" {
                                     if let ChannelKind::Series { series_id, loaded_episodes: false, .. } = &pch.kind {
-                                        sids.push(series_id.clone());
+                                        sids.push((pch.provider_id.clone(), series_id.clone()));
                                     }
                                 }
                                 let art = pch
@@ -3704,9 +3876,9 @@ impl CrtApp {
                             let mut sids = Vec::new();
                             for row in 0..6 {
                                 if let Some(ch) = vis.get(self.guide.scroll_row + row) {
-                                    if ch.provider_id == "jellyfin" {
+                                    if ch.provider_id == "jellyfin" || ch.provider_id == "plex" {
                                         if let ChannelKind::Series { series_id, loaded_episodes: false, .. } = &ch.kind {
-                                            sids.push(series_id.clone());
+                                            sids.push((ch.provider_id.clone(), series_id.clone()));
                                         }
                                     }
                                 }
@@ -3717,8 +3889,12 @@ impl CrtApp {
                                 .unwrap_or_default();
                             (sids, prov, art)
                         };
-                    for sid in needed_jf_sids {
-                        self.jellyfin.ensure_series_episodes(&sid);
+                    for (prov, sid) in needed_sids {
+                        if prov == "jellyfin" {
+                            self.jellyfin.ensure_series_episodes(&sid);
+                        } else if prov == "plex" {
+                            self.plex.ensure_series_episodes(&sid);
+                        }
                     }
                     let art_img = self.request_channel_artwork(&sel_art_provider, &sel_art_id);
                     let now_lbl = self.active_watch.as_ref().map(|w| {

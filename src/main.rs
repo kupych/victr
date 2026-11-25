@@ -10,6 +10,7 @@ mod jellyfin;
 mod link;
 mod mpv;
 mod osd;
+mod plex;
 mod provider;
 mod settings;
 mod shaders;

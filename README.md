@@ -28,6 +28,7 @@ ViCTR models the full analog television pipeline — from NTSC baseband encoding
 - **90s Prevue Cable Guide & Multi-Source Channels**
   - Combine multiple sources into one seamless 1990s **Prevue Channel** split-screen cable guide rendered straight through the NTSC signal path (live video preview + artwork/synopsis + 30-minute scrolling grid):
     - **Jellyfin Server**: Sign in with username/password or API key to sync series, movies, artwork, and watched/resume status.
+    - **Plex Media Server**: Connect via Server URL + `X-Plex-Token` to stream TV shows, movie genres, On Deck resume positions, transcoded artwork, and scrobble/timeline watched sync.
     - **Nested Local Folders**: Point at any local folder (`Show/Season 01/S01E01.mkv`, `Movies/Action/...`) to automatically build series & movie channels with local artwork (`poster`/`fanart`/`folder.*`) and local watched/resume tracking.
   - Automatically builds virtual channels: **`CH 01`** Program Guide, **`CH 02+`** per-series channels (Continue Watching & Favorites first, resuming your next unwatched episode and auto-advancing), and **`CH 50+`** 24/7 live-clock movie genre channels (`ACTION`, `COMEDY`, `SCI-FI`, etc.).
   - Syncs playback progress & watched status back to Jellyfin (or locally for folder channels) after >20 seconds of viewing (so quick channel-surfing stays clean) and marks items watched at 90% completion.
@@ -150,6 +151,7 @@ src/
 ├── provider.rs  # Provider-agnostic virtual TV channel domain & unified cable lineup builder
 ├── folders.rs   # Recursive nested local folders provider, episode parser & local watch tracking
 ├── jellyfin.rs  # Jellyfin REST client, auth, hybrid scheduler & watch sync
+├── plex.rs      # Plex Media Server REST client, On Deck, artwork & scrobble/timeline watch sync
 ├── guide.rs     # 640×480 classic 1990s Prevue Channel split-screen bitmap renderer
 ├── splash.rs    # Startup RF static -> classic blue screen CRT boot splash renderer
 ├── osd.rs       # 8×8 pixel font & post-decoder phosphor-green/white TV OSD
