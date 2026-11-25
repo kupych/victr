@@ -518,11 +518,80 @@ fn make_agent() -> ureq::Agent {
         .build()
 }
 
+fn auth_header_no_token() -> &'static str {
+    "MediaBrowser Client=\"ViCTR\", Device=\"ViCTR CRT\", DeviceId=\"victr-crt-receiver\", Version=\"0.1.0\""
+}
+
 fn auth_header(api_key: &str) -> String {
-    format!(
-        "MediaBrowser Client=\"ViCTR\", Device=\"ViCTR CRT\", DeviceId=\"victr-crt-receiver\", Version=\"0.1.0\", Token=\"{}\"",
-        api_key.trim()
-    )
+    format!("{}, Token=\"{}\"", auth_header_no_token(), api_key.trim())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RawAuthResp {
+    access_token: String,
+    user: RawUser,
+}
+
+fn describe_http_err(err: ureq::Error) -> String {
+    match err {
+        ureq::Error::Status(code, resp) => {
+            let status_text = resp.status_text().to_string();
+            let body = resp.into_string().unwrap_or_default();
+            let snippet: String = body.trim().chars().take(120).collect();
+            if snippet.is_empty() {
+                format!("{code} {status_text}")
+            } else {
+                format!("{code} {status_text}: {snippet}")
+            }
+        }
+        ureq::Error::Transport(t) => format!("network error: {t}"),
+    }
+}
+
+fn verify_played_resp(res: Result<ureq::Response, ureq::Error>, expected: bool) -> Result<(), String> {
+    let resp = res.map_err(describe_http_err)?;
+    let status = resp.status();
+    if status == 204 {
+        return Ok(());
+    }
+    let body = resp.into_string().unwrap_or_default();
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if let Ok(ud) = serde_json::from_str::<RawUserData>(trimmed) {
+        if ud.played == expected {
+            Ok(())
+        } else {
+            Err(format!("HTTP {status} returned Played={} (expected {expected})", ud.played))
+        }
+    } else {
+        let snippet: String = trimmed.chars().take(100).collect();
+        Err(format!("HTTP {status} unexpected body: {snippet}"))
+    }
+}
+
+pub fn authenticate_by_name(server_url: &str, username: &str, password: &str) -> Result<(String, JellyfinUser), String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if base.is_empty() || username.trim().is_empty() {
+        return Err("Enter both Server URL and Username.".into());
+    }
+    let agent = make_agent();
+    let body = serde_json::json!({
+        "Username": username.trim(),
+        "Pw": password,
+    });
+    let resp = agent
+        .post(&format!("{base}/Users/AuthenticateByName"))
+        .set("Authorization", auth_header_no_token())
+        .set("X-Emby-Authorization", auth_header_no_token())
+        .send_json(body)
+        .map_err(|e| format!("Sign-in failed: {}", describe_http_err(e)))?;
+    let parsed: RawAuthResp = resp
+        .into_json()
+        .map_err(|e| format!("Invalid Jellyfin auth JSON: {e}"))?;
+    Ok((parsed.access_token, JellyfinUser { id: parsed.user.id, name: parsed.user.name }))
 }
 
 #[derive(Deserialize)]
@@ -999,33 +1068,65 @@ fn mark_played_with_agent(
     if base.is_empty() || api_key.trim().is_empty() || user_id.is_empty() || item_id.is_empty() {
         return Err("Jellyfin server not configured.".into());
     }
-    // Use `.send_bytes(&[])` so `Content-Length: 0` is always sent (Kestrel rejects POST without Content-Length).
-    // Try Jellyfin 10.9+ `/UserPlayedItems/{id}?userId=`, then legacy `/Users/{uid}/PlayedItems/{id}`,
-    // then direct `UserData` update.
-    let r1 = agent
-        .post(&format!("{base}/UserPlayedItems/{item_id}?userId={user_id}"))
-        .set("X-Emby-Token", api_key.trim())
-        .set("Authorization", &auth_header(api_key))
-        .send_bytes(&[]);
-    if r1.is_ok() {
-        return Ok(());
+    let mut errs = Vec::new();
+    // 1) Jellyfin 10.9+ UserPlayedItems
+    let r1 = verify_played_resp(
+        agent
+            .post(&format!("{base}/UserPlayedItems/{item_id}?userId={user_id}"))
+            .set("X-Emby-Token", api_key.trim())
+            .set("Authorization", &auth_header(api_key))
+            .send_bytes(&[]),
+        true,
+    );
+    match r1 {
+        Ok(()) => return Ok(()),
+        Err(e) => errs.push(format!("UserPlayedItems: {e}")),
     }
-    let r2 = agent
-        .post(&format!("{base}/Users/{user_id}/PlayedItems/{item_id}"))
-        .set("X-Emby-Token", api_key.trim())
-        .set("Authorization", &auth_header(api_key))
-        .send_bytes(&[]);
-    if r2.is_ok() {
-        return Ok(());
+    // 2) Legacy Users/{uid}/PlayedItems/{id}
+    let r2 = verify_played_resp(
+        agent
+            .post(&format!("{base}/Users/{user_id}/PlayedItems/{item_id}"))
+            .set("X-Emby-Token", api_key.trim())
+            .set("Authorization", &auth_header(api_key))
+            .send_bytes(&[]),
+        true,
+    );
+    match r2 {
+        Ok(()) => return Ok(()),
+        Err(e) => errs.push(format!("PlayedItems: {e}")),
     }
+    // 3) Jellyfin 10.9+ direct UserData update
     let ud = serde_json::json!({ "Played": true, "PlaybackPositionTicks": 0 });
-    agent
-        .post(&format!("{base}/UserItems/{item_id}/UserData?userId={user_id}"))
-        .set("X-Emby-Token", api_key.trim())
-        .set("Authorization", &auth_header(api_key))
-        .send_json(ud)
-        .map(|_| ())
-        .map_err(|e| format!("Mark watched failed: {e}"))
+    let r3 = verify_played_resp(
+        agent
+            .post(&format!("{base}/UserItems/{item_id}/UserData?userId={user_id}"))
+            .set("X-Emby-Token", api_key.trim())
+            .set("Authorization", &auth_header(api_key))
+            .send_json(ud.clone()),
+        true,
+    );
+    match r3 {
+        Ok(()) => return Ok(()),
+        Err(e) => errs.push(format!("UserItems/UserData: {e}")),
+    }
+    // 4) Legacy Users/{uid}/Items/{id}/UserData
+    let r4 = verify_played_resp(
+        agent
+            .post(&format!("{base}/Users/{user_id}/Items/{item_id}/UserData"))
+            .set("X-Emby-Token", api_key.trim())
+            .set("Authorization", &auth_header(api_key))
+            .send_json(ud),
+        true,
+    );
+    match r4 {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            errs.push(format!("Users/Items/UserData: {e}"));
+            let msg = format!("Mark watched rejected by Jellyfin ({})", errs.join(" | "));
+            eprintln!("[ViCTR Jellyfin] {msg}");
+            Err(msg)
+        }
+    }
 }
 
 fn mark_played(server_url: &str, api_key: &str, user_id: &str, item_id: &str) -> Result<(), String> {
@@ -1038,30 +1139,61 @@ fn mark_unplayed(server_url: &str, api_key: &str, user_id: &str, item_id: &str) 
         return Err("Jellyfin server not configured.".into());
     }
     let agent = make_agent();
-    let r1 = agent
-        .delete(&format!("{base}/UserPlayedItems/{item_id}?userId={user_id}"))
-        .set("X-Emby-Token", api_key.trim())
-        .set("Authorization", &auth_header(api_key))
-        .call();
-    if r1.is_ok() {
-        return Ok(());
+    let mut errs = Vec::new();
+    let r1 = verify_played_resp(
+        agent
+            .delete(&format!("{base}/UserPlayedItems/{item_id}?userId={user_id}"))
+            .set("X-Emby-Token", api_key.trim())
+            .set("Authorization", &auth_header(api_key))
+            .call(),
+        false,
+    );
+    match r1 {
+        Ok(()) => return Ok(()),
+        Err(e) => errs.push(format!("UserPlayedItems: {e}")),
     }
-    let r2 = agent
-        .delete(&format!("{base}/Users/{user_id}/PlayedItems/{item_id}"))
-        .set("X-Emby-Token", api_key.trim())
-        .set("Authorization", &auth_header(api_key))
-        .call();
-    if r2.is_ok() {
-        return Ok(());
+    let r2 = verify_played_resp(
+        agent
+            .delete(&format!("{base}/Users/{user_id}/PlayedItems/{item_id}"))
+            .set("X-Emby-Token", api_key.trim())
+            .set("Authorization", &auth_header(api_key))
+            .call(),
+        false,
+    );
+    match r2 {
+        Ok(()) => return Ok(()),
+        Err(e) => errs.push(format!("PlayedItems: {e}")),
     }
     let ud = serde_json::json!({ "Played": false });
-    agent
-        .post(&format!("{base}/UserItems/{item_id}/UserData?userId={user_id}"))
-        .set("X-Emby-Token", api_key.trim())
-        .set("Authorization", &auth_header(api_key))
-        .send_json(ud)
-        .map(|_| ())
-        .map_err(|e| format!("Mark unwatched failed: {e}"))
+    let r3 = verify_played_resp(
+        agent
+            .post(&format!("{base}/UserItems/{item_id}/UserData?userId={user_id}"))
+            .set("X-Emby-Token", api_key.trim())
+            .set("Authorization", &auth_header(api_key))
+            .send_json(ud.clone()),
+        false,
+    );
+    match r3 {
+        Ok(()) => return Ok(()),
+        Err(e) => errs.push(format!("UserItems/UserData: {e}")),
+    }
+    let r4 = verify_played_resp(
+        agent
+            .post(&format!("{base}/Users/{user_id}/Items/{item_id}/UserData"))
+            .set("X-Emby-Token", api_key.trim())
+            .set("Authorization", &auth_header(api_key))
+            .send_json(ud),
+        false,
+    );
+    match r4 {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            errs.push(format!("Users/Items/UserData: {e}"));
+            let msg = format!("Mark unwatched rejected by Jellyfin ({})", errs.join(" | "));
+            eprintln!("[ViCTR Jellyfin] {msg}");
+            Err(msg)
+        }
+    }
 }
 
 // ------------------------------------------------------------------ Async Manager
@@ -1069,11 +1201,12 @@ fn mark_unplayed(server_url: &str, api_key: &str, user_id: &str, item_id: &str) 
 /// Async messages returned from background Jellyfin worker threads.
 pub enum JellyfinEvent {
     UsersLoaded(Result<Vec<JellyfinUser>, String>),
+    AuthCompleted(Result<(String, JellyfinUser), String>),
     LineupLoaded(Result<Vec<Channel>, String>),
     EpisodesLoaded(String, Result<Vec<MediaItem>, String>),
     ScanProgress(String),
     LibraryScanTriggered(Result<(), String>),
-    ActionError(String),
+    PlayedSynced(Result<(), String>),
     ArtworkLoaded(String, ArtworkImage),
 }
 
@@ -1098,10 +1231,12 @@ pub struct JellyfinManager {
     pub connected: bool,
     pub busy: bool,
     pub status: String,
+    pub last_error: String,
     pub active_watch: Option<ActiveWatch>,
     pub artwork_cache: HashMap<String, Option<ArtworkImage>>,
     pub last_sync_at: Option<std::time::Instant>,
     background_refresh: bool,
+    pending_played_writes: usize,
     episodes_loading: HashMap<String, bool>,
     episodes_failed_at: HashMap<String, std::time::Instant>,
     events: Arc<Mutex<Vec<JellyfinEvent>>>,
@@ -1116,10 +1251,12 @@ impl JellyfinManager {
             connected: false,
             busy: false,
             status: String::new(),
+            last_error: String::new(),
             active_watch: None,
             artwork_cache: HashMap::new(),
             last_sync_at: None,
             background_refresh: false,
+            pending_played_writes: 0,
             episodes_loading: HashMap::new(),
             episodes_failed_at: HashMap::new(),
             events: Arc::new(Mutex::new(Vec::new())),
@@ -1143,10 +1280,25 @@ impl JellyfinManager {
         let key = self.cfg.api_key.clone();
         let ev = self.events.clone();
         self.busy = true;
+        self.last_error.clear();
         self.status = "Connecting to Jellyfin…".into();
         std::thread::spawn(move || {
             let res = fetch_users(&url, &key);
             ev.lock().unwrap().push(JellyfinEvent::UsersLoaded(res));
+        });
+    }
+
+    /// Signs in with a Jellyfin username & password to obtain a user-scoped access token
+    /// (password is never saved to disk; only the returned AccessToken is persisted).
+    pub fn sign_in_async(&mut self, username: String, password: String) {
+        let url = self.cfg.normalized_url();
+        let ev = self.events.clone();
+        self.busy = true;
+        self.last_error.clear();
+        self.status = format!("Signing in to Jellyfin as {}…", username.trim());
+        std::thread::spawn(move || {
+            let res = authenticate_by_name(&url, &username, &password);
+            ev.lock().unwrap().push(JellyfinEvent::AuthCompleted(res));
         });
     }
 
@@ -1291,6 +1443,7 @@ impl JellyfinManager {
     pub fn poll(&mut self) -> bool {
         if self.connected
             && !self.busy
+            && self.pending_played_writes == 0
             && self.cfg.auto_refresh_mins > 0
             && self
                 .last_sync_at
@@ -1322,6 +1475,25 @@ impl JellyfinManager {
                             }
                         }
                         Err(e) => {
+                            self.status = e;
+                        }
+                    }
+                    changed = true;
+                }
+                JellyfinEvent::AuthCompleted(res) => {
+                    self.busy = false;
+                    match res {
+                        Ok((token, user)) => {
+                            self.cfg.api_key = token;
+                            self.cfg.user_id = user.id.clone();
+                            self.cfg.user_name = user.name.clone();
+                            self.users = vec![user];
+                            self.last_error.clear();
+                            self.status = format!("Signed in as {} — loading guide…", self.cfg.user_name);
+                            self.connect_and_load();
+                        }
+                        Err(e) => {
+                            self.last_error = e.clone();
                             self.status = e;
                         }
                     }
@@ -1409,9 +1581,17 @@ impl JellyfinManager {
                     }
                     changed = true;
                 }
-                JellyfinEvent::ActionError(msg) => {
-                    self.status = msg;
-                    changed = true;
+                JellyfinEvent::PlayedSynced(res) => {
+                    self.pending_played_writes = self.pending_played_writes.saturating_sub(1);
+                    match res {
+                        Ok(()) => {
+                            self.last_error.clear();
+                        }
+                        Err(msg) => {
+                            self.last_error = msg;
+                            changed = true;
+                        }
+                    }
                 }
                 JellyfinEvent::ArtworkLoaded(id, img) => {
                     self.artwork_cache.insert(id, Some(img));
@@ -1495,15 +1675,14 @@ impl JellyfinManager {
         let id = item_id.to_string();
         let ev = self.events.clone();
         if !url.is_empty() && !key.trim().is_empty() && !uid.is_empty() {
+            self.pending_played_writes += 1;
             std::thread::spawn(move || {
                 let res = if played {
                     mark_played(&url, &key, &uid, &id)
                 } else {
                     mark_unplayed(&url, &key, &uid, &id)
                 };
-                if let Err(e) = res {
-                    ev.lock().unwrap().push(JellyfinEvent::ActionError(e));
-                }
+                ev.lock().unwrap().push(JellyfinEvent::PlayedSynced(res));
             });
         }
     }

@@ -92,6 +92,8 @@ pub struct CrtApp {
     last_ended_item: Option<String>,
     muted: bool,
     show_api_key: bool,
+    jf_username: String,
+    jf_password: String,
     panel_season_filter: Option<u32>,
     // sound
     audio: Option<AudioEngine>,
@@ -339,6 +341,8 @@ impl CrtApp {
             last_ended_item: None,
             muted: false,
             show_api_key: false,
+            jf_username: String::new(),
+            jf_password: String::new(),
             panel_season_filter: None,
             audio,
             inbox: if screenshot_mode { None } else { Some(crate::link::listen(egui_ctx.clone())) },
@@ -985,17 +989,53 @@ impl CrtApp {
                     );
                 });
                 ui.horizontal(|ui| {
-                    ui.label("API Key");
+                    ui.label("API Key / Token");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.jellyfin.cfg.api_key)
                             .password(!self.show_api_key)
-                            .hint_text("Jellyfin Dashboard -> API Keys")
-                            .desired_width(206.0),
+                            .hint_text("API Key or sign in below")
+                            .desired_width(176.0),
                     );
                     if ui.small_button(if self.show_api_key { "Hide" } else { "Show" }).clicked() {
                         self.show_api_key = !self.show_api_key;
                     }
                 });
+                egui::CollapsingHeader::new(RichText::new("Sign in with username & password (recommended for watched sync)").small())
+                    .id_salt("jf_user_login")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Username");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.jf_username)
+                                    .hint_text("Jellyfin username")
+                                    .desired_width(180.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Password");
+                            let pw_te = ui.add(
+                                egui::TextEdit::singleline(&mut self.jf_password)
+                                    .password(true)
+                                    .hint_text("Password (not stored)")
+                                    .desired_width(140.0),
+                            );
+                            let submit = ui
+                                .add_enabled(!self.jellyfin.busy, egui::Button::new("Sign in"))
+                                .clicked()
+                                || (pw_te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if submit && !self.jellyfin.busy {
+                                let u = self.jf_username.clone();
+                                let p = std::mem::take(&mut self.jf_password);
+                                self.jellyfin.sign_in_async(u, p);
+                            }
+                        });
+                        ui.label(
+                            RichText::new("Gets a real Jellyfin user session token so watched status & resume progress always save cleanly. Your password is never saved.")
+                                .weak()
+                                .small(),
+                        );
+                    });
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.jellyfin.busy, egui::Button::new("Connect / Fetch Users")).clicked() {
                         let _ = crate::jellyfin::save_config(&self.jellyfin.cfg);
@@ -1069,6 +1109,22 @@ impl CrtApp {
                         self.jellyfin.status.clone()
                     };
                     ui.label(RichText::new(status_line).small().color(col));
+                }
+                if !self.jellyfin.last_error.is_empty() {
+                    let mut clear_err = false;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(&self.jellyfin.last_error)
+                                .small()
+                                .color(Color32::from_rgb(248, 122, 108)),
+                        );
+                        if ui.small_button("×").on_hover_text("Dismiss error").clicked() {
+                            clear_err = true;
+                        }
+                    });
+                    if clear_err {
+                        self.jellyfin.last_error.clear();
+                    }
                 }
 
                 if self.jellyfin.connected {
@@ -2283,7 +2339,11 @@ impl CrtApp {
         }
 
         // Poll background Jellyfin tasks & remote digit-entry commit timer
+        let prev_err = self.jellyfin.last_error.clone();
         let jf_changed = self.jellyfin.poll();
+        if !self.jellyfin.last_error.is_empty() && self.jellyfin.last_error != prev_err {
+            self.osd.show_action("JELLYFIN SYNC ERR");
+        }
         if jf_changed && self.notify_guide_synced && !self.jellyfin.busy {
             self.notify_guide_synced = false;
             if self.jellyfin.connected {
