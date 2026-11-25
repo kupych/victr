@@ -18,6 +18,7 @@ mod settings;
 mod shaders;
 mod sim;
 mod splash;
+mod web_channel;
 
 use crate::app::CrtApp;
 use crate::gpu::Gpu;

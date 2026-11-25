@@ -12,6 +12,7 @@ use crate::provider::{self, ActiveWatch, ArtworkImage, Channel, ChannelKind, Med
 use crate::settings::{self, AppConfig, Input, LastWatched, Mask, Pattern, PhosphorSet, Settings, StartupDestination, StartupPreset, TapeSpeed, UserPreset};
 use crate::sim::Sim;
 use crate::splash::{SplashEvent, SplashState};
+use crate::web_channel::{self, WebPlayer};
 use egui::{Color32, RichText, Slider};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -79,8 +80,9 @@ pub struct CrtApp {
     last_instant: std::time::Instant,
     fps: f32,
     scan_clock: ScanClock,
-    // video through mpv
+    // video through mpv & live web page channels
     player: Option<Player>,
+    web_player: Option<WebPlayer>,
     video_image: Option<(u64, Arc<(usize, usize, Vec<u8>)>)>,
     video_frame_no: u64,
     video_name: String,
@@ -114,6 +116,7 @@ pub struct CrtApp {
     m3u_ch_url: String,
     m3u_ch_group: String,
     m3u_ch_logo: String,
+    m3u_ch_is_web: bool,
     m3u_pl_url: String,
     custom_ep_name: String,
     custom_ep_url: String,
@@ -160,8 +163,9 @@ impl Drop for CrtApp {
                 }
             }
         }
-        // Stop mpv first and guarantee Jellyfin & Plex playback progress is flushed before exiting.
+        // Stop mpv / web browser first and guarantee Jellyfin & Plex playback progress is flushed before exiting.
         self.player = None;
+        self.web_player = None;
         for h in self.shutdown_flushes.drain(..) {
             let _ = h.join();
         }
@@ -372,6 +376,7 @@ impl CrtApp {
             fps: 60.0,
             scan_clock: ScanClock::default(),
             player: None,
+            web_player: None,
             video_image: None,
             video_frame_no: 0,
             video_name: String::new(),
@@ -424,6 +429,7 @@ impl CrtApp {
             m3u_ch_url: String::new(),
             m3u_ch_group: String::new(),
             m3u_ch_logo: String::new(),
+            m3u_ch_is_web: false,
             m3u_pl_url: String::new(),
             custom_ep_name: String::new(),
             custom_ep_url: String::new(),
@@ -765,6 +771,7 @@ impl CrtApp {
                     {
                         self.guide.active = false;
                         self.player = None;
+                        self.web_player = None;
                         self.splash = SplashState::new(true);
                         self.startup_dest_pending =
                             self.app_cfg.startup_dest != StartupDestination::DefaultPattern;
@@ -900,6 +907,7 @@ impl CrtApp {
             return;
         }
         self.player = None;
+        self.web_player = None;
         self.sidebar_open = false;
         self.save_preset_open = false;
         if let Some(w) = self.active_watch.take() {
@@ -2063,17 +2071,38 @@ impl CrtApp {
                     .default_open(m3u_count > 0)
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new("Add arbitrary online .m3u8 live streams (auto-probing HLS metadata) or .m3u/.m3u8 channel playlists onto CH 80+.")
+                            RichText::new("Add arbitrary online .m3u8 live streams (auto-probing HLS metadata), live web channels (like WeatherStar 4000+), or .m3u/.m3u8 playlists onto CH 80+.")
                                 .weak()
                                 .small(),
                         );
                         ui.add_space(3.0);
-                        ui.label(RichText::new("Add a single live channel").small().strong());
+                        ui.horizontal(|ui| {
+                            let has_ws4k = self
+                                .m3u
+                                .cfg
+                                .channels
+                                .iter()
+                                .any(|c| c.url.contains("4000.weatherstar.dev"));
+                            if !has_ws4k
+                                && ui
+                                    .small_button("+ WeatherStar 4000+")
+                                    .on_hover_text("Add the classic 1990s Weather Channel emulator (4000.weatherstar.dev) as a live CRT web channel")
+                                    .clicked()
+                            {
+                                self.m3u.add_channel(
+                                    "WeatherStar 4000+".into(),
+                                    web_channel::WEATHERSTAR_PRESET_URL.into(),
+                                    "Weather".into(),
+                                    String::new(),
+                                );
+                            }
+                        });
+                        ui.label(RichText::new("Add a single live / web channel").small().strong());
                         ui.horizontal(|ui| {
                             ui.label("Name");
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.m3u_ch_name)
-                                    .hint_text("e.g. NASA TV")
+                                    .hint_text("e.g. WeatherStar 4000+")
                                     .desired_width(130.0),
                             );
                             ui.label("Group");
@@ -2084,26 +2113,32 @@ impl CrtApp {
                             );
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Stream");
+                            ui.label("URL");
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.m3u_ch_url)
-                                    .hint_text("https://.../stream.m3u8")
-                                    .desired_width(248.0),
+                                    .hint_text("https://.../stream.m3u8 or 4000.weatherstar.dev")
+                                    .desired_width(256.0),
                             );
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Logo");
+                            ui.checkbox(&mut self.m3u_ch_is_web, "Web page")
+                                .on_hover_text("Render a live web page (e.g. 4000.weatherstar.dev) via headless Chromium at 640×480 straight into the CRT");
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.m3u_ch_logo)
-                                    .hint_text("Optional logo URL or path")
-                                    .desired_width(188.0),
+                                    .hint_text("Optional logo URL")
+                                    .desired_width(134.0),
                             );
                             if ui
                                 .add_enabled(!self.m3u_ch_url.trim().is_empty(), egui::Button::new("Add Ch").small())
                                 .clicked()
                             {
                                 let n = std::mem::take(&mut self.m3u_ch_name);
-                                let u = std::mem::take(&mut self.m3u_ch_url);
+                                let raw_u = std::mem::take(&mut self.m3u_ch_url);
+                                let u = if self.m3u_ch_is_web {
+                                    web_channel::ensure_web_prefix(&raw_u)
+                                } else {
+                                    raw_u
+                                };
                                 let g = std::mem::take(&mut self.m3u_ch_group);
                                 let l = std::mem::take(&mut self.m3u_ch_logo);
                                 self.m3u.add_channel(n, u, g, l);
@@ -2356,13 +2391,22 @@ impl CrtApp {
     }
 
     fn start_video_at(&mut self, src: String, start: f64) {
-        // Stop the previous player FIRST so its teardown cannot race with the new audio session.
+        // Stop any previous player FIRST so teardown cannot race with the new audio/video session.
         self.player = None;
+        self.web_player = None;
         let _ = self.splash.skip();
         self.startup_dest_pending = false;
         if self.current_channel.is_none() && self.screenshot.is_none() {
             self.app_cfg.last_watched = Some(LastWatched::LocalVideo { src: src.clone(), pos_secs: start });
             let _ = settings::save_app_config(&self.app_cfg);
+        }
+        if web_channel::is_web_channel_url(&src) {
+            self.web_player = Some(WebPlayer::start(&src, self.muted || !self.s.sound));
+            self.video_name = web_channel::normalize_web_target_url(&src);
+            self.video_frame_no = 0;
+            self.s.pattern = Pattern::Video;
+            self.reset_trails = true;
+            return;
         }
         let ring = self.audio.as_ref().map(|a| a.ring.clone());
         let opts = StartOpts {
@@ -2402,12 +2446,13 @@ impl CrtApp {
                     if ui.button("Open a video…").clicked() {
                         self.message = "pickvideo".into();
                     }
-                    if self.player.is_some() && ui.button("Stop").clicked() {
+                    if (self.player.is_some() || self.web_player.is_some()) && ui.button("Stop").clicked() {
                         stop = true;
                     }
                 });
                 if stop {
                     self.player.take();
+                    self.web_player.take();
                 }
                 ui.horizontal(|ui| {
                     let te = ui.add(
@@ -2456,6 +2501,10 @@ impl CrtApp {
                             }
                         }
                     }
+                } else if let Some(wp) = &self.web_player {
+                    let st = wp.shared.lock().unwrap().status.clone();
+                    ui.label(RichText::new(format!("{} — {}", self.video_name, st)).small());
+                    ui.label(RichText::new("via headless Chromium CDP (640×480)").weak().small());
                 }
                 if ui.checkbox(&mut self.crop, "Crop widescreen to fill 4:3").changed() {
                     if let Some(p) = &self.player {
@@ -3776,6 +3825,15 @@ impl CrtApp {
                             auto_next_target = ch.next_after(&item_id);
                         }
                     }
+                }
+            }
+        } else if let Some(wp) = &self.web_player {
+            let sh = wp.shared.lock().unwrap();
+            if sh.frame_no != self.video_frame_no {
+                self.video_frame_no = sh.frame_no;
+                if let Some(f) = &sh.frame {
+                    self.image_counter += 1;
+                    self.video_image = Some((self.image_counter, f.clone()));
                 }
             }
         }

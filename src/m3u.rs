@@ -134,7 +134,12 @@ fn fetch_text_source(url_or_path: &str) -> Result<String, String> {
 
 fn resolve_relative_url(base: &str, target: &str) -> String {
     let t = target.trim();
-    if t.starts_with("http://") || t.starts_with("https://") || t.starts_with("rtmp://") || t.starts_with("rtsp://") {
+    if crate::web_channel::is_web_channel_url(t)
+        || t.starts_with("http://")
+        || t.starts_with("https://")
+        || t.starts_with("rtmp://")
+        || t.starts_with("rtsp://")
+    {
         return t.to_string();
     }
     if base.starts_with("http://") || base.starts_with("https://") {
@@ -388,7 +393,14 @@ pub fn parse_m3u_channels(content: &str, source_ref: &str, fallback_label: &str)
         } else if line.starts_with('#') {
             continue;
         } else {
-            let stream_url = resolve_relative_url(source_ref, line);
+            let mut stream_url = resolve_relative_url(source_ref, line);
+            let is_web_attr = pending_attrs
+                .get("type")
+                .or_else(|| pending_attrs.get("kind"))
+                .is_some_and(|v| v.eq_ignore_ascii_case("web"));
+            if is_web_attr {
+                stream_url = crate::web_channel::ensure_web_prefix(&stream_url);
+            }
             let name = if !pending_name.is_empty() {
                 std::mem::take(&mut pending_name)
             } else if let Some(tvg) = pending_attrs.get("tvg-name").filter(|s| !s.is_empty()) {
@@ -448,6 +460,9 @@ pub fn parse_m3u_channels(content: &str, source_ref: &str, fallback_label: &str)
 
 /// Probes an `.m3u8` URL (best-effort) to populate live metadata (`now_title`, `overview`, `logo_url`).
 fn probe_single_channel_m3u8(url: &str) -> Option<HlsMetadata> {
+    if crate::web_channel::is_web_channel_url(url) {
+        return None;
+    }
     let low = url.to_ascii_lowercase();
     if !low.contains(".m3u8") && !low.contains("m3u") {
         return None;
@@ -530,7 +545,13 @@ pub fn load_all_m3u_channels(cfg: &M3uConfig) -> (Vec<Channel>, Vec<String>) {
             .as_ref()
             .filter(|m| !m.overview.is_empty())
             .map(|m| m.overview.clone())
-            .unwrap_or_else(|| format!("{group} · Live stream"));
+            .unwrap_or_else(|| {
+                if crate::web_channel::is_web_channel_url(&url) {
+                    format!("{group} · Live web channel")
+                } else {
+                    format!("{group} · Live stream")
+                }
+            });
 
         channels.push(Channel {
             number: 0,
@@ -802,6 +823,18 @@ live/synth.m3u8
                 assert_eq!(stream_url, "https://tv.example/lists/live/synth.m3u8");
                 assert_eq!(group, "Music");
                 assert_eq!(overview, "24/7 Synthwave");
+            }
+            other => panic!("expected LiveStream, got {other:?}"),
+        }
+
+        // Web channel inside an M3U playlist via `type="web"` or `web://`
+        let web_pl = "#EXTM3U\n#EXTINF:-1 type=\"web\" group-title=\"Weather\" callsign=\"WS4K\",WeatherStar 4000+\nhttps://4000.weatherstar.dev/?kiosk=true\n";
+        let wchs = parse_m3u_channels(web_pl, "local.m3u", "Web");
+        assert_eq!(wchs.len(), 1);
+        assert_eq!(wchs[0].callsign, "WS4K");
+        match &wchs[0].kind {
+            ChannelKind::LiveStream { stream_url, .. } => {
+                assert_eq!(stream_url, "web://https://4000.weatherstar.dev/?kiosk=true");
             }
             other => panic!("expected LiveStream, got {other:?}"),
         }

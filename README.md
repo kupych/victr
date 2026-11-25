@@ -30,7 +30,7 @@ ViCTR models the full analog television pipeline — from NTSC baseband encoding
     - **Jellyfin Server**: Sign in with username/password or API key to sync series, movies, artwork, and watched/resume status.
     - **Plex Media Server**: Connect via Server URL + `X-Plex-Token` to stream TV shows, movie genres, On Deck resume positions, transcoded artwork, and scrobble/timeline watched sync.
     - **Nested Local Folders**: Point at any local folder (`Show/Season 01/S01E01.mkv`, `Movies/Action/...`) to automatically build series & movie channels with local artwork (`poster`/`fanart`/`folder.*`) and local watched/resume tracking.
-    - **Live Streams & M3U / M3U8 Channels**: Add individual arbitrary `.m3u8` live stream URLs (auto-probing `#EXT-X-DATERANGE` / `#EXTINF` live metadata) or `.m3u`/`.m3u8` channel playlists (URL or local file) with `#EXTINF` attributes (`tvg-logo`, `group-title`, `callsign`), rendered as teal `► LIVE` channels on **`CH 80+`**.
+    - **Live Streams, M3U8 & Web Page Channels**: Add individual arbitrary `.m3u8` live stream URLs (auto-probing `#EXT-X-DATERANGE` / `#EXTINF` live metadata), `.m3u`/`.m3u8` playlists (URL or local file), or **live web page channels** (`web://` — e.g. 1-click **WeatherStar 4000+** at `4000.weatherstar.dev` rendered at 640×480 via headless Chromium straight through the CRT pipeline), all appearing as teal `► LIVE` channels on **`CH 80+`**.
     - **Custom Integrators (Plugins & HTTP JSON Feeds)**: Drop any executable script or binary (`.sh`, `.py`, `.js`, compiled binary) into `<config_dir>/victr/providers/` or point at any HTTP JSON feed endpoint using one simple JSON schema to add custom live channels, series, or movie channels with zero recompiling.
   - Automatically builds virtual channels: **`CH 01`** Program Guide, **`CH 02+`** per-series channels (Continue Watching & Favorites first, resuming your next unwatched episode and auto-advancing), **`CH 50+`** 24/7 live-clock movie genre channels (`ACTION`, `COMEDY`, `SCI-FI`, etc.), and **`CH 80+`** live online stream channels.
   - Syncs playback progress & watched status back to Jellyfin (or locally for folder channels) after >20 seconds of viewing (so quick channel-surfing stays clean) and marks items watched at 90% completion.
@@ -155,6 +155,7 @@ src/
 ├── jellyfin.rs         # Jellyfin REST client, auth, hybrid scheduler & watch sync
 ├── plex.rs             # Plex Media Server REST client, On Deck, artwork & scrobble/timeline watch sync
 ├── m3u.rs              # M3U / M3U8 playlist parser, HLS metadata probe & live stream channels (CH 80+)
+├── web_channel.rs      # Live 640×480 web page channel receiver (WeatherStar 4000+, etc.) via Chromium CDP
 ├── custom_provider.rs  # Drop-in script/binary plugins & HTTP JSON feed custom integrators
 ├── guide.rs            # 640×480 classic 1990s Prevue Channel split-screen bitmap renderer
 ├── splash.rs    # Startup RF static -> classic blue screen CRT boot splash renderer

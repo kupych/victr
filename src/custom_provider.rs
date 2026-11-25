@@ -235,10 +235,15 @@ pub fn parse_custom_provider_json(
         };
 
         let ch_kind = match inferred {
-            "live" | "stream" | "livestream" => {
+            "live" | "stream" | "livestream" | "web" => {
                 if dto.stream_url.trim().is_empty() {
                     continue;
                 }
+                let stream_url = if inferred == "web" {
+                    crate::web_channel::ensure_web_prefix(dto.stream_url.trim())
+                } else {
+                    dto.stream_url.trim().to_string()
+                };
                 let group = if !dto.group.trim().is_empty() {
                     dto.group.trim().to_string()
                 } else {
@@ -250,7 +255,7 @@ pub fn parse_custom_provider_json(
                     name.clone()
                 };
                 ChannelKind::LiveStream {
-                    stream_url: dto.stream_url.trim().to_string(),
+                    stream_url,
                     group,
                     now_title,
                     overview: dto.overview.trim().to_string(),
