@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,21 +20,40 @@ const BLOCK: usize = 256;
 pub struct AudioRing {
     buf: Mutex<VecDeque<f32>>,
     cap: usize,
+    session: AtomicU64,
 }
 
 impl AudioRing {
     pub fn new() -> Arc<Self> {
-        // 35 ms stereo ring (3,360 floats = 1,680 frames): enough jitter cushion (~6.5 blocks)
-        // while keeping DSP lip-sync latency tight.
-        let cap = (RATE * 0.035) as usize * 2;
-        Arc::new(AudioRing { buf: Mutex::new(VecDeque::with_capacity(cap + 1024)), cap })
+        // 45 ms stereo ring (4,320 floats = 2,160 frames): generous enough to avoid
+        // startup/HTTP underruns while keeping DSP lip-sync latency tight.
+        let cap = (RATE * 0.045) as usize * 2;
+        Arc::new(AudioRing {
+            buf: Mutex::new(VecDeque::with_capacity(cap + 1024)),
+            cap,
+            session: AtomicU64::new(0),
+        })
+    }
+    /// Claims exclusive ownership of the ring for a new player instance and clears
+    /// any leftover samples from the previous player so teardown can never wipe
+    /// the new stream's audio.
+    pub fn begin_session(&self) -> u64 {
+        let id = self.session.fetch_add(1, Ordering::SeqCst) + 1;
+        self.buf.lock().unwrap().clear();
+        id
     }
     /// Blocks while the ring is full (this is what paces mpv to real time).
+    #[cfg(test)]
     pub fn push_s16(&self, bytes: &[u8], stop: &AtomicBool) {
+        let cur = self.session.load(Ordering::Relaxed);
+        self.push_s16_session(cur, bytes, stop);
+    }
+    /// Like `push_s16`, but aborts immediately if a newer player session has started.
+    pub fn push_s16_session(&self, session: u64, bytes: &[u8], stop: &AtomicBool) {
         let mut i = 0;
         while i + 1 < bytes.len() {
             loop {
-                if stop.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Relaxed) || self.session.load(Ordering::Relaxed) != session {
                     return;
                 }
                 if self.buf.lock().unwrap().len() < self.cap {
@@ -43,6 +62,9 @@ impl AudioRing {
                 std::thread::sleep(Duration::from_millis(1));
             }
             let mut b = self.buf.lock().unwrap();
+            if self.session.load(Ordering::Relaxed) != session {
+                return;
+            }
             while i + 1 < bytes.len() && b.len() < self.cap + 512 {
                 b.push_back(i16::from_le_bytes([bytes[i], bytes[i + 1]]) as f32 / 32768.0);
                 i += 2;
@@ -53,8 +75,11 @@ impl AudioRing {
     pub fn len(&self) -> usize {
         self.buf.lock().unwrap().len()
     }
-    pub fn clear(&self) {
-        self.buf.lock().unwrap().clear();
+    pub fn clear_session(&self, session: u64) {
+        let mut b = self.buf.lock().unwrap();
+        if self.session.load(Ordering::Relaxed) == session {
+            b.clear();
+        }
     }
     fn pop_frame(&self, b: &mut std::sync::MutexGuard<'_, VecDeque<f32>>) -> Option<(f32, f32)> {
         if b.len() >= 2 {
@@ -316,7 +341,7 @@ impl Processor {
         let detune_dist = p.fine_tune * 0.8;
         let track_err = if p.vcr { p.tracking.abs() } else { 0.0 };
         let track_noise = ((track_err - 0.05) * 2.6).clamp(0.0, 1.0);
-        let off_target = if p.power_on && p.enabled { smooth(0.2, 0.45, p.warm) } else { 0.0 };
+        let off_target = if p.power_on && p.enabled { smooth(0.14, 0.38, p.warm) } else { 0.0 };
 
         if !self.inited {
             self.inited = true;
@@ -606,13 +631,12 @@ fn sinks() -> Vec<(&'static str, Vec<&'static str>)> {
                 "--format=s16le",
                 "--rate=48000",
                 "--channels=2",
-                "--latency-msec=25",
-                "--process-time-msec=8",
+                "--latency-msec=35",
                 "--client-name=ViCTR",
             ],
         ),
-        ("pw-cat", vec!["--playback", "--format", "s16", "--rate", "48000", "--channels", "2", "--latency", "25ms", "-"]),
-        ("aplay", vec!["-q", "-f", "S16_LE", "-r", "48000", "-c", "2", "-t", "raw", "--buffer-time=35000", "--period-time=8000"]),
+        ("pw-cat", vec!["--playback", "--format", "s16", "--rate", "48000", "--channels", "2", "--latency", "35ms", "-"]),
+        ("aplay", vec!["-q", "-f", "S16_LE", "-r", "48000", "-c", "2", "-t", "raw", "--buffer-time=40000"]),
         (
             "mpv",
             vec![
@@ -798,6 +822,31 @@ mod tests {
         p.degauss_t = 0.0;
         proc.process(&p, &ring, &mut out);
         assert!(proc.crackle >= 0.7, "degauss should trigger subtle static crackle: {}", proc.crackle);
+    }
+
+    #[test]
+    fn old_session_cannot_wipe_new_session_audio() {
+        let ring = AudioRing::new();
+        let stop = AtomicBool::new(false);
+        let s1 = ring.begin_session();
+        let s2 = ring.begin_session();
+
+        let bytes = [0x10u8, 0x20, 0x30, 0x40].repeat(64);
+        // Stale push from s1 is ignored
+        ring.push_s16_session(s1, &bytes, &stop);
+        assert_eq!(ring.len(), 0);
+
+        // Active push from s2 lands normally
+        ring.push_s16_session(s2, &bytes, &stop);
+        assert_eq!(ring.len(), 128);
+
+        // Stale clear from s1 teardown does NOT wipe s2's buffered audio
+        ring.clear_session(s1);
+        assert_eq!(ring.len(), 128);
+
+        // Clearing s2 itself works
+        ring.clear_session(s2);
+        assert_eq!(ring.len(), 0);
     }
 
     #[test]

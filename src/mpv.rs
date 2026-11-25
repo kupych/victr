@@ -51,6 +51,7 @@ pub struct Player {
 
 struct Audio {
     ring: Option<Arc<AudioRing>>,
+    session: u64,
     stop: Arc<AtomicBool>,
 }
 
@@ -59,6 +60,7 @@ impl Audio {
     fn pump(&self, mut r: impl Read + Send + 'static) {
         if let Some(ring) = self.ring.clone() {
             let stop = self.stop.clone();
+            let session = self.session;
             std::thread::spawn(move || {
                 // 1024 B = 256 stereo frames (~5.3 ms) so samples reach the DSP ring promptly
                 let mut buf = vec![0u8; 1024];
@@ -67,7 +69,7 @@ impl Audio {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             let n = n & !3;
-                            ring.push_s16(&buf[..n], &stop);
+                            ring.push_s16_session(session, &buf[..n], &stop);
                             if stop.load(Ordering::Relaxed) {
                                 break;
                             }
@@ -79,7 +81,7 @@ impl Audio {
     }
     fn clear(&self) {
         if let Some(r) = &self.ring {
-            r.clear();
+            r.clear_session(self.session);
         }
     }
 }
@@ -90,6 +92,7 @@ impl Player {
     /// the simulated TV sound path instead of being played directly.
     pub fn start(source: &str, opts: StartOpts, audio: Option<Arc<AudioRing>>) -> Player {
         let StartOpts { volume, crop, .. } = opts;
+        let session = audio.as_ref().map(|r| r.begin_session()).unwrap_or(0);
         let (tx, rx) = channel();
         let shared = Arc::new(Mutex::new(Shared {
             status: "Starting mpv…".into(),
@@ -101,7 +104,7 @@ impl Player {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         std::thread::spawn(move || {
-            let audio = Audio { ring: audio, stop: stop2 };
+            let audio = Audio { ring: audio, session, stop: stop2 };
             let lib_err = match Lib::load() {
                 Ok(lib) => match run_libmpv(&lib, &src, volume, crop, &opts, &rx, &sh, &audio) {
                     Ok(()) => {
@@ -149,9 +152,9 @@ impl Player {
 }
 
 /// Baseline DSP pipeline latency compensation (in seconds) when routing audio through `AudioRing` + sink:
-/// ~21 ms ao_pcm stdio + ~21 ms 4 KB pcm_pipe + ~35 ms AudioRing + ~5 ms block + ~21 ms out pipe + ~25 ms sink
-/// minus ~28 ms video presentation latency ≈ 100 ms net audio lag -> advance audio by -0.10 s.
-const DSP_AUDIO_DELAY_BASE_SECS: f64 = -0.10;
+/// ~21 ms ao_pcm stdio + ~21 ms 4 KB pcm_pipe + ~45 ms AudioRing + ~5 ms block + ~21 ms out pipe + ~35 ms sink
+/// minus ~28 ms video presentation latency ≈ 120 ms net audio lag -> advance audio by -0.12 s.
+const DSP_AUDIO_DELAY_BASE_SECS: f64 = -0.12;
 
 #[derive(Clone, Copy)]
 pub struct StartOpts {
@@ -394,7 +397,7 @@ fn run_libmpv(
                 set("audio-format", "s16");
                 set("audio-samplerate", "48000");
                 set("audio-channels", "stereo");
-                set("audio-buffer", "0.05");
+                set("audio-buffer", "0.15");
                 // Compensate for the shrunk DSP pipe + ring + sink latency (+ any user nudge)
                 let delay = DSP_AUDIO_DELAY_BASE_SECS + o.audio_delay;
                 set("audio-delay", &format!("{delay:.4}"));
@@ -747,7 +750,7 @@ fn spawn_audio(route: Route, src: &str, start: f64, volume: f64, user_config: bo
             "--audio-format=s16",
             "--audio-samplerate=48000",
             "--audio-channels=stereo",
-            "--audio-buffer=0.05",
+            "--audio-buffer=0.15",
         ])
         .stdout(Stdio::piped());
     } else {
@@ -932,7 +935,8 @@ mod tests {
     fn system_mpv_sound_reaches_the_tv() {
         let Some(route) = find_route() else { return };
         let ring = AudioRing::new();
-        let audio = Audio { ring: Some(ring.clone()), stop: Arc::new(AtomicBool::new(false)) };
+        let session = ring.begin_session();
+        let audio = Audio { ring: Some(ring.clone()), session, stop: Arc::new(AtomicBool::new(false)) };
         let mut child = spawn_audio(route, "av://lavfi:sine=frequency=440:duration=2", 0.0, 100.0, false, &audio);
         assert!(child.is_some(), "mpv should start");
         let t = Instant::now();

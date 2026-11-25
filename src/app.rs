@@ -1257,7 +1257,8 @@ impl CrtApp {
     }
 
     fn start_video_at(&mut self, src: String, start: f64) {
-        // replacing the player stops the previous one
+        // Stop the previous player FIRST so its teardown cannot race with the new audio session.
+        self.player = None;
         let ring = self.audio.as_ref().map(|a| a.ring.clone());
         let opts = StartOpts {
             volume: (self.s.volume * 100.0) as f64,
