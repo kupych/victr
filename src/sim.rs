@@ -303,7 +303,7 @@ impl Sim {
 
         // ---- power & degauss
         if self.power_on {
-            self.warm = (self.warm + fdt / 3.0).min(1.0);
+            self.warm = (self.warm + fdt / 3.8).min(1.0);
         } else if self.off_t >= 0.0 {
             self.off_t += fdt;
         }
@@ -481,18 +481,33 @@ impl Sim {
 
         // ---- power sequencing
         let mut collapse = [1.0, 1.0, 0.0, 0.0];
-        let emission_scale;
+        let emission_rgb: [f32; 3];
+        let warm_size: f32;
+        let warm_focus: f32;
         if !self.power_on {
             let ot = self.off_t.max(0.0);
             let sx = (-ot / 0.10).exp().max(0.003);
             let sy = (-ot / 0.025).exp().max(0.003);
             let glow = (-ot / 1.1).exp() * 0.6;
             collapse = [sx, sy, glow, 1.0];
-            emission_scale = 0.0;
+            emission_rgb = [0.0, 0.0, 0.0];
+            warm_size = 1.0;
+            warm_focus = 0.0;
         } else {
             let w = self.warm;
-            // thermionic emission rises steeply once the heater is warm
-            emission_scale = ((w - 0.15) / 0.85).clamp(0.0, 1.0).powf(2.2);
+            // Thermionic emission rises steeply once the cathode heaters glow up,
+            // with tiny per-gun thermal-mass stagger that settles to exact 1.0 at full warm-up.
+            let warm_curve = |thresh: f32| -> f32 {
+                ((w - thresh) / (1.0 - thresh)).clamp(0.0, 1.0).powf(2.4)
+            };
+            emission_rgb = [warm_curve(0.14), warm_curve(0.165), warm_curve(0.195)];
+            // Deflection & HV expand gently into full raster size and focus locks in as EHT stabilizes.
+            let sz_t = ((w - 0.12) / 0.63).clamp(0.0, 1.0);
+            let sz_s = sz_t * sz_t * (3.0 - 2.0 * sz_t);
+            warm_size = 0.94 + 0.06 * sz_s;
+            let fc_t = ((w - 0.15) / 0.70).clamp(0.0, 1.0);
+            let fc_s = fc_t * fc_t * (3.0 - 2.0 * fc_t);
+            warm_focus = (1.0 - fc_s) * 0.55;
         }
 
         // ---- tube parameters
@@ -501,18 +516,18 @@ impl Sim {
         let ct = colour_temp_gains(s.color_temp);
         let wear = s.wear;
         let emission = [
-            ct[0] * (1.0 - 0.65 * wear[0]) * emission_scale,
-            ct[1] * (1.0 - 0.65 * wear[1]) * emission_scale,
-            ct[2] * (1.0 - 0.65 * wear[2]) * emission_scale,
+            ct[0] * (1.0 - 0.65 * wear[0]) * emission_rgb[0],
+            ct[1] * (1.0 - 0.65 * wear[1]) * emission_rgb[1],
+            ct[2] * (1.0 - 0.65 * wear[2]) * emission_rgb[2],
         ];
         let imax = [
-            8.0 * (1.0 - 0.88 * wear[0]).max(0.05) * emission_scale.max(0.02),
-            8.0 * (1.0 - 0.88 * wear[1]).max(0.05) * emission_scale.max(0.02),
-            8.0 * (1.0 - 0.88 * wear[2]).max(0.05) * emission_scale.max(0.02),
+            8.0 * (1.0 - 0.88 * wear[0]).max(0.05) * emission_rgb[0].max(0.02),
+            8.0 * (1.0 - 0.88 * wear[1]).max(0.05) * emission_rgb[1].max(0.02),
+            8.0 * (1.0 - 0.88 * wear[2]).max(0.05) * emission_rgb[2].max(0.02),
         ];
         let cd = s.cutoff_drift;
         let cutoff = [0.035 * cd, -0.015 * cd, 0.05 * cd];
-        let focus = 1.0 + s.focus_loss * 1.4;
+        let focus = 1.0 + s.focus_loss * 1.4 + warm_focus;
         let focus3 = [focus * 1.03, focus, focus * 1.06];
 
         let decay_t = (s.persistence_ms.max(0.1)) / 1000.0;
@@ -584,8 +599,8 @@ impl Sim {
             view,
             curv: s.curvature,
             corner: s.corner,
-            hsize: s.h_size,
-            vsize: s.v_size,
+            hsize: s.h_size * warm_size,
+            vsize: s.v_size * warm_size,
             hpos: s.h_pos * 0.1 + shake + whack_x,
             vpos: s.v_pos * 0.1 + shake * 0.6 + whack_y,
             pin: s.pincushion,
@@ -717,5 +732,33 @@ mod tests {
         s.chaos = false;
         sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
         assert!(sim.chaos_active_faults().is_empty());
+    }
+
+    #[test]
+    fn cold_power_on_fades_in_from_dark_to_full_emission() {
+        let mut sim = Sim::new();
+        let s = Settings::default();
+        assert_eq!(sim.warm, 0.0);
+
+        // First field from a cold tube: cathode heaters below emission threshold -> dark
+        let first = sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        assert_eq!(first.u.emission, [0.0, 0.0, 0.0]);
+        assert!(first.u.hsize < s.h_size, "cold raster should gently expand into full size");
+
+        // Midway through warm-up (~1.8s): visibly warming up, still below full brightness
+        for _ in 0..108 {
+            sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        }
+        let mid = sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        assert!(mid.u.emission[0] > 0.05 && mid.u.emission[0] < 0.85);
+
+        // After ~4.2s: fully warmed to calibrated 1.0 emission & exact geometry
+        for _ in 0..160 {
+            sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        }
+        let hot = sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        assert!((sim.warm - 1.0).abs() < 1e-5);
+        assert!((hot.u.hsize - s.h_size).abs() < 1e-5);
+        assert!(hot.u.emission[0] > 0.95 && hot.u.emission[1] > 0.95 && hot.u.emission[2] > 0.95);
     }
 }

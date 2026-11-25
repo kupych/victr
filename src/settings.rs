@@ -1,5 +1,7 @@
 //! Every tunable knob of the simulated television, plus presets.
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pattern {
     DemoScene,
@@ -977,6 +979,60 @@ pub fn delete_user_preset(file_name: &str) -> Result<(), String> {
     delete_user_preset_in(&dir, file_name)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value")]
+pub enum StartupPreset {
+    BuiltIn(usize),
+    User(String),
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub default_preset: Option<StartupPreset>,
+    #[serde(default = "default_true")]
+    pub cold_power_on: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            default_preset: None,
+            cold_power_on: true,
+        }
+    }
+}
+
+pub fn app_config_path() -> Option<std::path::PathBuf> {
+    presets_dir().and_then(|d| d.parent().map(|p| p.join("app.json")))
+}
+
+pub fn load_app_config_from(path: &std::path::Path) -> AppConfig {
+    let Ok(text) = std::fs::read_to_string(path) else { return AppConfig::default() };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+pub fn save_app_config_to(path: &std::path::Path, cfg: &AppConfig) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Couldn't create config folder: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| format!("Couldn't save app config: {e}"))
+}
+
+pub fn load_app_config() -> AppConfig {
+    app_config_path().map(|p| load_app_config_from(&p)).unwrap_or_default()
+}
+
+pub fn save_app_config(cfg: &AppConfig) -> Result<(), String> {
+    let path = app_config_path().ok_or_else(|| "Couldn't locate config folder.".to_string())?;
+    save_app_config_to(&path, cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,6 +1107,37 @@ mod tests {
 
         // Reject empty names
         assert!(save_user_preset_in(&dir, "   ", &s1).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_config_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("victr-appcfg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("app.json");
+
+        let def = load_app_config_from(&path);
+        assert!(def.default_preset.is_none());
+        assert!(def.cold_power_on);
+
+        let cfg = AppConfig {
+            default_preset: Some(StartupPreset::User("sony-pvm-warm.preset".into())),
+            cold_power_on: false,
+        };
+        save_app_config_to(&path, &cfg).unwrap();
+        let loaded = load_app_config_from(&path);
+        assert_eq!(loaded.default_preset, Some(StartupPreset::User("sony-pvm-warm.preset".into())));
+        assert!(!loaded.cold_power_on);
+
+        let cfg2 = AppConfig {
+            default_preset: Some(StartupPreset::BuiltIn(4)),
+            cold_power_on: true,
+        };
+        save_app_config_to(&path, &cfg2).unwrap();
+        let loaded2 = load_app_config_from(&path);
+        assert_eq!(loaded2.default_preset, Some(StartupPreset::BuiltIn(4)));
+        assert!(loaded2.cold_power_on);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

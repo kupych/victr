@@ -32,7 +32,7 @@ ViCTR models the full analog television pipeline — from NTSC baseband encoding
   - Injects a classic **phosphor-green/white TV OSD** (`CH 04`, call-sign, episode banner, `VOL |||||||---`, `MUTE`, `STEREO`/`MONO`) post-decoder into the electron guns, paired with a brief RF static burst & tuner click on channel switches.
 - **Slide-in Service Panel & Custom Presets**
   - Retro faux-walnut and brushed-metal slide-in controls drawer accessible in both windowed and fullscreen modes: a subtle low-opacity pull handle rests on the right edge, brightens on hover, and toggles the panel open or closed on click while the CRT glides smoothly alongside it.
-  - Includes 9 built-in presets and lets you **save, overwrite, and delete custom presets** stored in your user config directory.
+  - Includes 9 built-in presets, lets you **save, overwrite, and delete custom presets** stored in your user config directory, choose a **default startup profile**, and toggle the **cold CRT power-on warm-up** fade-in & auto-degauss on launch.
 
 ## Screenshots
 
@@ -106,7 +106,7 @@ cargo test
 | Toggle fullscreen | `F11` (press `F11` or `Esc` to exit) |
 | Open image or video | Drag & drop onto the window, or use **Open a picture…** / **Open a video…** |
 | Control `mpv` playback | Hover the TV and use your `mpv` keys (`Space`, arrow keys, etc.) |
-| 90s Cable Guide & TV Remote (Jellyfin) | `G` (Guide), `E` or right-click row (Episode/Movie Picker, Left/Right jumps seasons), `W` (Mark Watched/Unwatched), `N`/`P` (Next/Prev Episode), Arrows + `Enter`, `0–9` (dial channel), `PgUp`/`PgDn` or `[`/`]` (Ch+/Ch-), `-`/`+` (Vol), `M` (Mute), `R` (Restart 0:00), `I` (Info OSD) |
+| 90s Cable Guide & TV Remote (Jellyfin) | `G` (Guide), `R` in guide or `F5` (Sync/Refresh library; plus configurable auto-sync interval), `E` or right-click row (Episode/Movie Picker, Left/Right jumps seasons), `W` (Mark Watched/Unwatched), `N`/`P` (Next/Prev Episode), Arrows + `Enter`, `0–9` (dial channel), `PgUp`/`PgDn` or `[`/`]` (Ch+/Ch-), `-`/`+` (Vol), `M` (Mute), `R` during playback (Restart 0:00), `I` (Info OSD) |
 
 ## CLI Options
 

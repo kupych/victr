@@ -14,7 +14,11 @@ use std::sync::{Arc, Mutex};
 
 // ------------------------------------------------------------------ Config
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+fn default_auto_refresh_mins() -> u32 {
+    10
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JellyfinConfig {
     pub server_url: String,
     pub api_key: String,
@@ -24,6 +28,23 @@ pub struct JellyfinConfig {
     pub favorites_only: bool,
     #[serde(default)]
     pub filter_text: String,
+    /// Periodic background library sync interval in minutes (0 = manual only).
+    #[serde(default = "default_auto_refresh_mins")]
+    pub auto_refresh_mins: u32,
+}
+
+impl Default for JellyfinConfig {
+    fn default() -> Self {
+        Self {
+            server_url: String::new(),
+            api_key: String::new(),
+            user_id: String::new(),
+            user_name: String::new(),
+            favorites_only: false,
+            filter_text: String::new(),
+            auto_refresh_mins: default_auto_refresh_mins(),
+        }
+    }
 }
 
 impl JellyfinConfig {
@@ -882,6 +903,8 @@ pub struct JellyfinManager {
     pub status: String,
     pub active_watch: Option<ActiveWatch>,
     pub artwork_cache: HashMap<String, Option<ArtworkImage>>,
+    pub last_sync_at: Option<std::time::Instant>,
+    background_refresh: bool,
     episodes_loading: HashMap<String, bool>,
     events: Arc<Mutex<Vec<JellyfinEvent>>>,
 }
@@ -897,6 +920,8 @@ impl JellyfinManager {
             status: String::new(),
             active_watch: None,
             artwork_cache: HashMap::new(),
+            last_sync_at: None,
+            background_refresh: false,
             episodes_loading: HashMap::new(),
             events: Arc::new(Mutex::new(Vec::new())),
         }
@@ -931,13 +956,43 @@ impl JellyfinManager {
         let cfg = self.cfg.clone();
         let ev = self.events.clone();
         self.episodes_loading.clear();
-        self.artwork_cache.clear();
+        self.background_refresh = false;
         self.busy = true;
+        self.last_sync_at = Some(std::time::Instant::now());
         self.status = "Loading Jellyfin channels…".into();
         std::thread::spawn(move || {
             let res = fetch_lineup(&cfg);
             ev.lock().unwrap().push(JellyfinEvent::LineupLoaded(res));
         });
+    }
+
+    /// Quiet periodic background refresh: keeps existing channels & artwork visible
+    /// while fetching updates, and leaves the session connected on transient errors.
+    pub fn refresh_in_background(&mut self) {
+        if self.busy || !self.cfg.is_complete() {
+            return;
+        }
+        let cfg = self.cfg.clone();
+        let ev = self.events.clone();
+        self.background_refresh = true;
+        self.busy = true;
+        self.last_sync_at = Some(std::time::Instant::now());
+        std::thread::spawn(move || {
+            let res = fetch_lineup(&cfg);
+            ev.lock().unwrap().push(JellyfinEvent::LineupLoaded(res));
+        });
+    }
+
+    pub fn last_sync_label(&self) -> Option<String> {
+        let t = self.last_sync_at?;
+        let secs = t.elapsed().as_secs();
+        if secs < 45 {
+            Some("just now".into())
+        } else if secs < 3600 {
+            Some(format!("{}m ago", (secs + 30) / 60))
+        } else {
+            Some(format!("{}h ago", secs / 3600))
+        }
     }
 
     pub fn scan_server_library(&mut self) {
@@ -955,7 +1010,10 @@ impl JellyfinManager {
     pub fn disconnect(&mut self) {
         self.finish_watch();
         self.channels.clear();
+        self.artwork_cache.clear();
         self.connected = false;
+        self.last_sync_at = None;
+        self.background_refresh = false;
         self.status = "Disconnected.".into();
     }
 
@@ -1018,8 +1076,18 @@ impl JellyfinManager {
         None
     }
 
-    /// Drains background worker results. Returns true if lineup or artwork changed.
+    /// Drains background worker results and triggers periodic auto-sync.
+    /// Returns true if lineup or artwork changed.
     pub fn poll(&mut self) -> bool {
+        if self.connected
+            && !self.busy
+            && self.cfg.auto_refresh_mins > 0
+            && self
+                .last_sync_at
+                .is_some_and(|t| t.elapsed().as_secs() >= self.cfg.auto_refresh_mins as u64 * 60)
+        {
+            self.refresh_in_background();
+        }
         let pending: Vec<JellyfinEvent> = std::mem::take(&mut *self.events.lock().unwrap());
         if pending.is_empty() {
             return false;
@@ -1051,6 +1119,7 @@ impl JellyfinManager {
                 }
                 JellyfinEvent::LineupLoaded(res) => {
                     self.busy = false;
+                    let was_bg = std::mem::take(&mut self.background_refresh);
                     match res {
                         Ok(chs) => {
                             let n_series = chs.iter().filter(|c| matches!(c.kind, ChannelKind::Series { .. })).count();
@@ -1058,11 +1127,16 @@ impl JellyfinManager {
                             self.channels = chs;
                             self.connected = true;
                             self.episodes_loading.clear();
+                            self.last_sync_at = Some(std::time::Instant::now());
                             self.status = format!("Connected · {n_series} series, {n_genres} movie genres");
                         }
                         Err(e) => {
-                            self.connected = false;
-                            self.status = e;
+                            if was_bg {
+                                self.status = format!("Auto-sync skipped: {e}");
+                            } else {
+                                self.connected = false;
+                                self.status = e;
+                            }
                         }
                     }
                     changed = true;

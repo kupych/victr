@@ -4,7 +4,7 @@ use crate::guide::{GuideState, GuideView};
 use crate::jellyfin::{ChannelKind, JellyfinManager, MediaItem, TuneTarget};
 use crate::mpv::{Player, StartOpts};
 use crate::osd::TvOsd;
-use crate::settings::{self, Input, Mask, Pattern, PhosphorSet, Settings, TapeSpeed, UserPreset};
+use crate::settings::{self, AppConfig, Input, Mask, Pattern, PhosphorSet, Settings, StartupPreset, TapeSpeed, UserPreset};
 use crate::sim::Sim;
 use egui::{Color32, RichText, Slider};
 use std::path::PathBuf;
@@ -46,8 +46,10 @@ pub struct CrtApp {
     reset_trails: bool,
     preset_sel: PresetSel,
     user_presets: Vec<UserPreset>,
+    app_cfg: AppConfig,
     save_preset_open: bool,
     save_preset_focus: bool,
+    save_as_default: bool,
     preset_name_input: String,
     preset_msg: String,
     confirm_delete_idx: Option<usize>,
@@ -85,6 +87,7 @@ pub struct CrtApp {
     current_channel: Option<u16>,
     pending_tune_channel: Option<u16>,
     open_guide_on_connect: bool,
+    notify_guide_synced: bool,
     last_ended_item: Option<String>,
     muted: bool,
     show_api_key: bool,
@@ -225,17 +228,41 @@ impl CrtApp {
             style.spacing.item_spacing = egui::vec2(8.0, 5.0);
         });
 
-        let mut sim = Sim::new();
-        sim.warm = if screenshot.is_some() { 1.0 } else { 0.35 };
-        if screenshot.is_some() {
-            sim.degauss_t = 10.0;
-        }
-        let preset_idx = preset.unwrap_or(0).min(settings::PRESETS.len() - 1);
-        let mut s = settings::preset(preset_idx);
+        let user_presets = settings::load_user_presets();
+        let app_cfg = settings::load_app_config();
+
+        let (preset_sel, mut s) = if let Some(idx) = preset {
+            let idx = idx.min(settings::PRESETS.len() - 1);
+            (PresetSel::BuiltIn(idx), settings::preset(idx))
+        } else {
+            match &app_cfg.default_preset {
+                Some(StartupPreset::User(file_name)) => {
+                    if let Some((pos, p)) = user_presets.iter().enumerate().find(|(_, p)| p.file_name == *file_name) {
+                        (PresetSel::User(pos), p.settings.clone())
+                    } else {
+                        (PresetSel::BuiltIn(0), settings::preset(0))
+                    }
+                }
+                Some(StartupPreset::BuiltIn(idx)) => {
+                    let idx = (*idx).min(settings::PRESETS.len() - 1);
+                    (PresetSel::BuiltIn(idx), settings::preset(idx))
+                }
+                None => (PresetSel::BuiltIn(0), settings::preset(0)),
+            }
+        };
         if let Some(p) = pattern {
             s.pattern = Pattern::ALL[p.min(Pattern::ALL.len() - 1)];
         }
-        let user_presets = settings::load_user_presets();
+
+        let mut sim = Sim::new();
+        if screenshot.is_some() || !app_cfg.cold_power_on {
+            sim.warm = 1.0;
+            sim.degauss_t = 10.0;
+        } else {
+            // Cold CRT power-on: starts dark, fires auto-degauss & HV crackle, and slowly warms up.
+            sim.warm = 0.0;
+            sim.degauss_t = 0.0;
+        }
         let audio = if screenshot.is_none() { Some(AudioEngine::start()) } else { None };
         let screenshot_mode = screenshot.is_some();
         let mut app = CrtApp {
@@ -252,12 +279,14 @@ impl CrtApp {
             image_name: String::new(),
             image_counter: 0,
             clear_burn: false,
-            burn_now: preset_idx == 2,
+            burn_now: preset_sel == PresetSel::BuiltIn(2),
             reset_trails: true,
-            preset_sel: PresetSel::BuiltIn(preset_idx),
+            preset_sel,
             user_presets,
+            app_cfg,
             save_preset_open: false,
             save_preset_focus: false,
+            save_as_default: false,
             preset_name_input: String::new(),
             preset_msg: String::new(),
             confirm_delete_idx: None,
@@ -296,6 +325,7 @@ impl CrtApp {
             current_channel: None,
             pending_tune_channel: None,
             open_guide_on_connect: false,
+            notify_guide_synced: false,
             last_ended_item: None,
             muted: false,
             show_api_key: false,
@@ -311,6 +341,8 @@ impl CrtApp {
             fs_since: std::time::Instant::now(),
             last_pointer_move: std::time::Instant::now(),
         };
+        // Seed audio parameters immediately so cold power-on crackle & degauss play from frame 0.
+        app.update_audio();
         if let Some((src, start)) = mpv_src {
             app.start_video_at(src, start);
         }
@@ -321,15 +353,20 @@ impl CrtApp {
         if !self.hdr_seeded_peak {
             let os_confirmed_hdr = status.reported_peak_nits.is_some_and(|p| p > 350.0)
                 || status.reported_edr_headroom.is_some_and(|h| h > 1.15);
-            if os_confirmed_hdr && status.supported {
-                self.s.hdr_mode = true;
-            }
-            if let Some(peak) = status.reported_peak_nits {
-                self.s.hdr_peak_nits = peak.clamp(300.0, 2000.0);
+            // Respect explicit HDR preference stored inside a user's default startup profile.
+            if matches!(self.preset_sel, PresetSel::BuiltIn(_)) {
+                if os_confirmed_hdr && status.supported {
+                    self.s.hdr_mode = true;
+                }
+                if let Some(peak) = status.reported_peak_nits {
+                    self.s.hdr_peak_nits = peak.clamp(300.0, 2000.0);
+                    self.hdr_seeded_peak = true;
+                }
+                if let Some(sdr) = status.reported_sdr_nits {
+                    self.s.hdr_ui_nits = sdr.clamp(80.0, 400.0);
+                }
+            } else {
                 self.hdr_seeded_peak = true;
-            }
-            if let Some(sdr) = status.reported_sdr_nits {
-                self.s.hdr_ui_nits = sdr.clamp(80.0, 400.0);
             }
         }
         self.hdr_status = status;
@@ -454,24 +491,75 @@ impl CrtApp {
         }
     }
 
+    fn startup_preset_for(&self, sel: PresetSel) -> Option<StartupPreset> {
+        match sel {
+            PresetSel::BuiltIn(0) => None,
+            PresetSel::BuiltIn(i) => Some(StartupPreset::BuiltIn(i)),
+            PresetSel::User(i) => self.user_presets.get(i).map(|p| StartupPreset::User(p.file_name.clone())),
+        }
+    }
+
+    fn is_startup_default(&self, sel: PresetSel) -> bool {
+        match (&self.app_cfg.default_preset, sel) {
+            (None, PresetSel::BuiltIn(0)) => true,
+            (Some(StartupPreset::BuiltIn(a)), PresetSel::BuiltIn(b)) => *a == b,
+            (Some(StartupPreset::User(fname)), PresetSel::User(i)) => {
+                self.user_presets.get(i).is_some_and(|p| p.file_name == *fname)
+            }
+            _ => false,
+        }
+    }
+
+    fn startup_preset_label(&self) -> String {
+        match &self.app_cfg.default_preset {
+            None => settings::PRESETS[0].to_string(),
+            Some(StartupPreset::BuiltIn(i)) => settings::PRESETS.get(*i).copied().unwrap_or(settings::PRESETS[0]).to_string(),
+            Some(StartupPreset::User(fname)) => self
+                .user_presets
+                .iter()
+                .find(|p| p.file_name == *fname)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| settings::PRESETS[0].to_string()),
+        }
+    }
+
+    fn set_startup_preset(&mut self, target: Option<StartupPreset>) {
+        self.app_cfg.default_preset = target;
+        match settings::save_app_config(&self.app_cfg) {
+            Ok(()) => {
+                self.preset_msg = format!("Startup profile set to \"{}\".", self.startup_preset_label());
+            }
+            Err(e) => {
+                self.preset_msg = e;
+            }
+        }
+    }
+
     fn open_save_preset_dialog(&mut self) {
         self.preset_name_input = match self.preset_sel {
             PresetSel::User(i) => self.user_presets.get(i).map(|p| p.name.clone()).unwrap_or_default(),
             PresetSel::BuiltIn(_) => String::new(),
         };
+        self.save_as_default = self.is_startup_default(self.preset_sel);
         self.preset_msg.clear();
         self.save_preset_open = true;
         self.save_preset_focus = true;
     }
 
-    fn save_current_preset(&mut self, raw_name: &str) -> bool {
+    fn save_current_preset(&mut self, raw_name: &str, make_default: bool) -> bool {
         match settings::save_user_preset(raw_name, &self.s) {
             Ok(saved) => {
                 self.user_presets = settings::load_user_presets();
                 if let Some(pos) = self.user_presets.iter().position(|p| p.file_name == saved.file_name) {
                     self.preset_sel = PresetSel::User(pos);
                 }
-                self.preset_msg = format!("Saved preset \"{}\".", saved.name);
+                if make_default {
+                    self.app_cfg.default_preset = Some(StartupPreset::User(saved.file_name.clone()));
+                    let _ = settings::save_app_config(&self.app_cfg);
+                    self.preset_msg = format!("Saved preset \"{}\" as startup default.", saved.name);
+                } else {
+                    self.preset_msg = format!("Saved preset \"{}\".", saved.name);
+                }
                 self.confirm_delete_idx = None;
                 true
             }
@@ -492,6 +580,10 @@ impl CrtApp {
                     PresetSel::User(cur) if cur > idx => PresetSel::User(cur - 1),
                     other => other,
                 };
+                if self.app_cfg.default_preset == Some(StartupPreset::User(target.file_name.clone())) {
+                    self.app_cfg.default_preset = None;
+                    let _ = settings::save_app_config(&self.app_cfg);
+                }
                 self.confirm_delete_idx = None;
                 self.preset_msg = format!("Deleted preset \"{}\".", target.name);
             }
@@ -502,9 +594,58 @@ impl CrtApp {
     }
 
     fn preset_controls(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new(RichText::new("Presets").strong())
+        egui::CollapsingHeader::new(RichText::new("Presets & Startup").strong())
             .default_open(false)
             .show(ui, |ui| {
+                // Startup profile selector
+                let mut new_startup: Option<Option<StartupPreset>> = None;
+                let cur_startup_lbl = self.startup_preset_label();
+                ui.horizontal(|ui| {
+                    ui.label("Startup profile");
+                    egui::ComboBox::from_id_salt("startup_profile")
+                        .selected_text(&cur_startup_lbl)
+                        .width(178.0)
+                        .show_ui(ui, |ui| {
+                            for (i, n) in settings::PRESETS.iter().enumerate() {
+                                let target = if i == 0 { None } else { Some(StartupPreset::BuiltIn(i)) };
+                                let sel = self.app_cfg.default_preset == target;
+                                if ui.selectable_label(sel, *n).clicked() {
+                                    new_startup = Some(target);
+                                }
+                            }
+                            if !self.user_presets.is_empty() {
+                                ui.separator();
+                                ui.label(RichText::new("Saved presets").weak().small());
+                                for p in &self.user_presets {
+                                    let target = Some(StartupPreset::User(p.file_name.clone()));
+                                    let sel = self.app_cfg.default_preset == target;
+                                    if ui.selectable_label(sel, &p.name).clicked() {
+                                        new_startup = Some(target);
+                                    }
+                                }
+                            }
+                        });
+                    if !self.is_startup_default(self.preset_sel)
+                        && ui
+                            .small_button("Use current")
+                            .on_hover_text("Load the currently active preset whenever ViCTR starts")
+                            .clicked()
+                    {
+                        new_startup = Some(self.startup_preset_for(self.preset_sel));
+                    }
+                });
+                if let Some(target) = new_startup {
+                    self.set_startup_preset(target);
+                }
+                if ui
+                    .checkbox(&mut self.app_cfg.cold_power_on, "Cold CRT power-on warm-up")
+                    .on_hover_text("Start from a cold picture tube with slow filament fade-in, auto-degauss hum, and high-voltage faceplate crackle.")
+                    .changed()
+                {
+                    let _ = settings::save_app_config(&self.app_cfg);
+                }
+                ui.separator();
+
                 let exists = self
                     .user_presets
                     .iter()
@@ -520,7 +661,7 @@ impl CrtApp {
                         || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                     if submit {
                         let name = self.preset_name_input.clone();
-                        if self.save_current_preset(&name) {
+                        if self.save_current_preset(&name, false) {
                             self.preset_name_input.clear();
                         }
                     }
@@ -530,9 +671,12 @@ impl CrtApp {
                     ui.label(RichText::new("Saved presets").weak().small());
                     let mut load_idx = None;
                     let mut delete_idx = None;
+                    let mut toggle_default_fname: Option<(String, bool)> = None;
                     for i in 0..self.user_presets.len() {
                         let name = self.user_presets[i].name.clone();
+                        let fname = self.user_presets[i].file_name.clone();
                         let active = self.preset_sel == PresetSel::User(i);
+                        let is_def = self.app_cfg.default_preset == Some(StartupPreset::User(fname.clone()));
                         ui.horizontal(|ui| {
                             if ui.selectable_label(active, &name).clicked() {
                                 load_idx = Some(i);
@@ -548,8 +692,23 @@ impl CrtApp {
                                     {
                                         delete_idx = Some(i);
                                     }
-                                } else if ui.small_button("×").on_hover_text("Delete this saved preset").clicked() {
-                                    self.confirm_delete_idx = Some(i);
+                                } else {
+                                    if ui.small_button("×").on_hover_text("Delete this saved preset").clicked() {
+                                        self.confirm_delete_idx = Some(i);
+                                    }
+                                    let star_txt = if is_def {
+                                        RichText::new("★").color(Color32::from_rgb(245, 198, 72))
+                                    } else {
+                                        RichText::new("☆").weak()
+                                    };
+                                    let star_tip = if is_def {
+                                        "Startup default profile (click to reset to factory default)"
+                                    } else {
+                                        "Set as default startup profile"
+                                    };
+                                    if ui.add(egui::Button::new(star_txt).small()).on_hover_text(star_tip).clicked() {
+                                        toggle_default_fname = Some((fname, is_def));
+                                    }
                                 }
                             });
                         });
@@ -557,6 +716,13 @@ impl CrtApp {
                     if let Some(i) = load_idx {
                         self.apply_preset(PresetSel::User(i));
                         self.confirm_delete_idx = None;
+                    }
+                    if let Some((fname, was_def)) = toggle_default_fname {
+                        if was_def {
+                            self.set_startup_preset(None);
+                        } else {
+                            self.set_startup_preset(Some(StartupPreset::User(fname)));
+                        }
                     }
                     if let Some(i) = delete_idx {
                         self.delete_user_preset_at(i);
@@ -858,7 +1024,15 @@ impl CrtApp {
                     } else {
                         Color32::from_rgb(235, 175, 100)
                     };
-                    ui.label(RichText::new(&self.jellyfin.status).small().color(col));
+                    let status_line = if self.jellyfin.connected {
+                        match self.jellyfin.last_sync_label() {
+                            Some(ago) => format!("{} (synced {ago})", self.jellyfin.status),
+                            None => self.jellyfin.status.clone(),
+                        }
+                    } else {
+                        self.jellyfin.status.clone()
+                    };
+                    ui.label(RichText::new(status_line).small().color(col));
                 }
 
                 if self.jellyfin.connected {
@@ -876,6 +1050,34 @@ impl CrtApp {
                         }
                     });
                     let mut cfg_changed = false;
+                    ui.horizontal(|ui| {
+                        ui.label("Auto-sync");
+                        let cur_mins = self.jellyfin.cfg.auto_refresh_mins;
+                        let lbl = if cur_mins == 0 {
+                            "Manual only".to_string()
+                        } else {
+                            format!("Every {cur_mins} min")
+                        };
+                        egui::ComboBox::from_id_salt("jf_auto_sync")
+                            .selected_text(lbl)
+                            .width(126.0)
+                            .show_ui(ui, |ui| {
+                                for &(mins, text) in &[
+                                    (0u32, "Manual only"),
+                                    (5, "Every 5 min"),
+                                    (10, "Every 10 min"),
+                                    (15, "Every 15 min"),
+                                    (30, "Every 30 min"),
+                                    (60, "Every 60 min"),
+                                ] {
+                                    if ui.selectable_label(self.jellyfin.cfg.auto_refresh_mins == mins, text).clicked() {
+                                        self.jellyfin.cfg.auto_refresh_mins = mins;
+                                        cfg_changed = true;
+                                    }
+                                }
+                            });
+                        ui.label(RichText::new("(R in guide / F5)").weak().small());
+                    });
                     if ui
                         .checkbox(&mut self.jellyfin.cfg.favorites_only, "Favorites & Continue Watching only")
                         .changed()
@@ -2017,7 +2219,13 @@ impl CrtApp {
         }
 
         // Poll background Jellyfin tasks & remote digit-entry commit timer
-        self.jellyfin.poll();
+        let jf_changed = self.jellyfin.poll();
+        if jf_changed && self.notify_guide_synced && !self.jellyfin.busy {
+            self.notify_guide_synced = false;
+            if self.jellyfin.connected {
+                self.osd.show_action("GUIDE SYNCED");
+            }
+        }
         if self.open_guide_on_connect && self.jellyfin.connected {
             self.open_guide_on_connect = false;
             self.guide.active = true;
@@ -2153,8 +2361,23 @@ impl CrtApp {
                     self.step_episode(-1);
                     remote_consumed = true;
                 }
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
+                    if !self.jellyfin.busy {
+                        self.notify_guide_synced = true;
+                        self.jellyfin.connect_and_load();
+                        self.osd.show_action("SYNCING GUIDE...");
+                    }
+                    remote_consumed = true;
+                }
                 if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R)) {
-                    if let (true, Some((ch_num, idx))) = (self.guide.active, self.guide.picker_selected()) {
+                    if self.guide.active && self.guide.picker_selected().is_none() {
+                        if !self.jellyfin.busy {
+                            self.notify_guide_synced = true;
+                            self.jellyfin.connect_and_load();
+                            self.osd.show_action("SYNCING GUIDE...");
+                        }
+                        remote_consumed = true;
+                    } else if let (true, Some((ch_num, idx))) = (self.guide.active, self.guide.picker_selected()) {
                         if let Some(item) = self.jellyfin.channel_by_number(ch_num).and_then(|c| c.items().get(idx)).cloned() {
                             self.tune_specific(ch_num, item, true);
                             self.osd.show_action("RESTART 0:00");
@@ -3089,6 +3312,8 @@ impl CrtApp {
                     if exists {
                         ui.label(RichText::new("A saved preset with this name already exists and will be updated.").small().color(Color32::from_rgb(235, 175, 100)));
                     }
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut self.save_as_default, "Set as default startup profile");
                     if !self.preset_msg.is_empty() {
                         ui.colored_label(Color32::from_rgb(235, 130, 100), &self.preset_msg);
                     }
@@ -3098,7 +3323,8 @@ impl CrtApp {
                         let save_label = if exists { "Overwrite preset" } else { "Save preset" };
                         if ui.button(save_label).clicked() || enter {
                             let name = self.preset_name_input.clone();
-                            if self.save_current_preset(&name) {
+                            let make_def = self.save_as_default;
+                            if self.save_current_preset(&name, make_def) {
                                 close_now = true;
                             }
                         }

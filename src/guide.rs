@@ -629,7 +629,7 @@ impl GuideState {
             self.canvas.draw_text(
                 SAFE_X + 4,
                 foot_y + 7,
-                "ARROWS:BROWSE  ENTER:TUNE  E:EPISODES  G:EXIT",
+                "ARROWS:BROWSE  ENTER:TUNE  E:EPISODES  R:SYNC  G:EXIT",
                 1,
                 2,
                 [244, 206, 78, 255],
