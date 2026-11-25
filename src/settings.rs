@@ -358,6 +358,7 @@ pub struct Settings {
     pub mono: bool,
     pub whine: f32,
     pub test_tone: bool,
+    pub audio_sync_ms: f32,
 }
 
 impl Default for Settings {
@@ -464,6 +465,7 @@ impl Default for Settings {
             mono: true,
             whine: 0.25,
             test_tone: false,
+            audio_sync_ms: 0.0,
         };
         s.apply_age(2000.0);
         s
@@ -752,6 +754,7 @@ impl Settings {
         let _ = writeln!(out, "mono = {}", self.mono);
         let _ = writeln!(out, "whine = {}", self.whine);
         let _ = writeln!(out, "test_tone = {}", self.test_tone);
+        let _ = writeln!(out, "audio_sync_ms = {}", self.audio_sync_ms);
         out
     }
 
@@ -866,6 +869,7 @@ impl Settings {
                 "mono" => if let Some(x) = parse_bool(v) { s.mono = x; },
                 "whine" => if let Ok(x) = v.parse() { s.whine = x; },
                 "test_tone" => if let Some(x) = parse_bool(v) { s.test_tone = x; },
+                "audio_sync_ms" => if let Ok(x) = v.parse() { s.audio_sync_ms = x; },
                 _ => {}
             }
         }

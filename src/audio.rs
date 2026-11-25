@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const RATE: f32 = 48000.0;
-const BLOCK: usize = 512;
+const BLOCK: usize = 256;
 
 /// Ring buffer that mpv's decoded audio is written into (interleaved stereo f32).
 pub struct AudioRing {
@@ -24,7 +24,10 @@ pub struct AudioRing {
 
 impl AudioRing {
     pub fn new() -> Arc<Self> {
-        Arc::new(AudioRing { buf: Mutex::new(VecDeque::with_capacity(48000)), cap: (RATE * 0.12) as usize * 2 })
+        // 35 ms stereo ring (3,360 floats = 1,680 frames): enough jitter cushion (~6.5 blocks)
+        // while keeping DSP lip-sync latency tight.
+        let cap = (RATE * 0.035) as usize * 2;
+        Arc::new(AudioRing { buf: Mutex::new(VecDeque::with_capacity(cap + 1024)), cap })
     }
     /// Blocks while the ring is full (this is what paces mpv to real time).
     pub fn push_s16(&self, bytes: &[u8], stop: &AtomicBool) {
@@ -37,10 +40,10 @@ impl AudioRing {
                 if self.buf.lock().unwrap().len() < self.cap {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(Duration::from_millis(1));
             }
             let mut b = self.buf.lock().unwrap();
-            while i + 1 < bytes.len() && b.len() < self.cap + 4096 {
+            while i + 1 < bytes.len() && b.len() < self.cap + 512 {
                 b.push_back(i16::from_le_bytes([bytes[i], bytes[i + 1]]) as f32 / 32768.0);
                 i += 2;
             }
@@ -595,9 +598,21 @@ impl Drop for AudioEngine {
 
 fn sinks() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
-        ("pacat", vec!["--playback", "--raw", "--format=s16le", "--rate=48000", "--channels=2", "--latency-msec=60", "--client-name=ViCTR"]),
-        ("pw-cat", vec!["--playback", "--format", "s16", "--rate", "48000", "--channels", "2", "--latency", "60ms", "-"]),
-        ("aplay", vec!["-q", "-f", "S16_LE", "-r", "48000", "-c", "2", "-t", "raw", "--buffer-time=80000"]),
+        (
+            "pacat",
+            vec![
+                "--playback",
+                "--raw",
+                "--format=s16le",
+                "--rate=48000",
+                "--channels=2",
+                "--latency-msec=25",
+                "--process-time-msec=8",
+                "--client-name=ViCTR",
+            ],
+        ),
+        ("pw-cat", vec!["--playback", "--format", "s16", "--rate", "48000", "--channels", "2", "--latency", "25ms", "-"]),
+        ("aplay", vec!["-q", "-f", "S16_LE", "-r", "48000", "-c", "2", "-t", "raw", "--buffer-time=35000", "--period-time=8000"]),
         (
             "mpv",
             vec![
@@ -610,7 +625,7 @@ fn sinks() -> Vec<(&'static str, Vec<&'static str>)> {
                 "--demuxer-rawaudio-rate=48000",
                 "--demuxer-rawaudio-channels=2",
                 "--cache=no",
-                "--audio-buffer=0.05",
+                "--audio-buffer=0.025",
                 "--stream-buffer-size=4k",
                 "--demuxer-readahead-secs=0",
                 "-",
@@ -643,8 +658,8 @@ fn shrink_pipe(child: &Child) {
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     }
     if let Some(stdin) = child.stdin.as_ref() {
-        // F_SETPIPE_SZ: keep the pipe short so knob changes are heard quickly
-        unsafe { fcntl(stdin.as_raw_fd(), 1031, 8192i32) };
+        // F_SETPIPE_SZ: 4096 B (minimum page size = ~21 ms at 48 kHz stereo s16) keeps lip-sync tight
+        unsafe { fcntl(stdin.as_raw_fd(), 1031, 4096i32) };
     }
 }
 #[cfg(not(target_os = "linux"))]

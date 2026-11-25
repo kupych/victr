@@ -37,6 +37,7 @@ enum Cmd {
     Seek(f64),
     SeekAbs(f64),
     Volume(f64),
+    AudioDelay(f64),
     Crop(bool),
     Key(String),
     Stop,
@@ -59,7 +60,8 @@ impl Audio {
         if let Some(ring) = self.ring.clone() {
             let stop = self.stop.clone();
             std::thread::spawn(move || {
-                let mut buf = vec![0u8; 4096];
+                // 1024 B = 256 stereo frames (~5.3 ms) so samples reach the DSP ring promptly
+                let mut buf = vec![0u8; 1024];
                 loop {
                     match r.read(&mut buf) {
                         Ok(0) | Err(_) => break,
@@ -132,6 +134,10 @@ impl Player {
     pub fn volume(&self, v: f64) {
         let _ = self.tx.send(Cmd::Volume(v));
     }
+    /// Adjusts A/V sync offset (in seconds, added on top of automatic DSP pipeline compensation).
+    pub fn audio_delay(&self, offset_secs: f64) {
+        let _ = self.tx.send(Cmd::AudioDelay(offset_secs));
+    }
     pub fn crop(&self, c: bool) {
         let _ = self.tx.send(Cmd::Crop(c));
     }
@@ -142,6 +148,11 @@ impl Player {
     }
 }
 
+/// Baseline DSP pipeline latency compensation (in seconds) when routing audio through `AudioRing` + sink:
+/// ~21 ms ao_pcm stdio + ~21 ms 4 KB pcm_pipe + ~35 ms AudioRing + ~5 ms block + ~21 ms out pipe + ~25 ms sink
+/// minus ~28 ms video presentation latency ≈ 100 ms net audio lag -> advance audio by -0.10 s.
+const DSP_AUDIO_DELAY_BASE_SECS: f64 = -0.10;
+
 #[derive(Clone, Copy)]
 pub struct StartOpts {
     pub volume: f64,
@@ -150,6 +161,8 @@ pub struct StartOpts {
     pub start: f64,
     /// Load the person's own mpv.conf, input.conf and scripts.
     pub user_config: bool,
+    /// Extra user A/V sync nudge in seconds (negative = earlier audio, positive = later audio).
+    pub audio_delay: f64,
 }
 
 impl Drop for Player {
@@ -381,10 +394,13 @@ fn run_libmpv(
                 set("audio-format", "s16");
                 set("audio-samplerate", "48000");
                 set("audio-channels", "stereo");
-                // our sound path adds ~0.2 s of buffering: hold the picture back to match
-                set("audio-delay", "-0.2");
+                set("audio-buffer", "0.05");
+                // Compensate for the shrunk DSP pipe + ring + sink latency (+ any user nudge)
+                let delay = DSP_AUDIO_DELAY_BASE_SECS + o.audio_delay;
+                set("audio-delay", &format!("{delay:.4}"));
                 set("volume", "100");
             } else {
+                set("audio-delay", &format!("{:.4}", o.audio_delay));
                 set("volume", &format!("{volume:.0}"));
             }
         };
@@ -475,6 +491,10 @@ fn run_libmpv(
                             prop("volume", &format!("{v:.0}"));
                         }
                     }
+                    Cmd::AudioDelay(offset) => {
+                        let delay = if pcm_pipe.is_some() { DSP_AUDIO_DELAY_BASE_SECS + offset } else { offset };
+                        prop("audio-delay", &format!("{delay:.4}"));
+                    }
                     Cmd::Crop(c) => {
                         prop("panscan", if c { "1.0" } else { "0.0" });
                     }
@@ -551,12 +571,28 @@ fn run_libmpv(
 unsafe extern "C" {
     fn pipe(fds: *mut c_int) -> c_int;
     fn close(fd: c_int) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
 }
+
+#[cfg(target_os = "linux")]
+fn shrink_pipe_fd(fd: c_int) {
+    // F_SETPIPE_SZ = 1031: shrink Linux's 64 KB default pipe (~341 ms at 48 kHz stereo s16)
+    // down to 1 page (4096 B = ~21 ms) so audio stays tightly lip-synced to video.
+    unsafe { fcntl(fd, 1031, 4096 as c_int) };
+}
+#[cfg(not(target_os = "linux"))]
+fn shrink_pipe_fd(_fd: c_int) {}
 
 #[cfg(unix)]
 fn make_pipe() -> Option<(c_int, c_int)> {
     let mut fds = [0 as c_int; 2];
-    if unsafe { pipe(fds.as_mut_ptr()) } == 0 { Some((fds[0], fds[1])) } else { None }
+    if unsafe { pipe(fds.as_mut_ptr()) } == 0 {
+        shrink_pipe_fd(fds[1]);
+        Some((fds[0], fds[1]))
+    } else {
+        None
+    }
 }
 #[cfg(not(unix))]
 fn make_pipe() -> Option<(c_int, c_int)> {
@@ -711,6 +747,7 @@ fn spawn_audio(route: Route, src: &str, start: f64, volume: f64, user_config: bo
             "--audio-format=s16",
             "--audio-samplerate=48000",
             "--audio-channels=stereo",
+            "--audio-buffer=0.05",
         ])
         .stdout(Stdio::piped());
     } else {
@@ -718,6 +755,11 @@ fn spawn_audio(route: Route, src: &str, start: f64, volume: f64, user_config: bo
     }
     let mut child = c.spawn().ok()?;
     if let Some(out) = child.stdout.take() {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            shrink_pipe_fd(out.as_raw_fd());
+        }
         audio.pump(out);
     }
     Some(child)
@@ -756,6 +798,7 @@ fn run_cli(
                     sh.lock().unwrap().pos = start;
                 }
                 Ok(Cmd::Volume(v)) => volume = v,
+                Ok(Cmd::AudioDelay(_)) => {}
                 Ok(Cmd::Crop(c)) => crop = c,
                 Ok(Cmd::Stop) | Err(_) => return Ok(()),
             }
@@ -838,6 +881,7 @@ fn run_cli(
                         continue 'restart;
                     }
                     Cmd::Volume(v) => volume = v,
+                    Cmd::AudioDelay(_) => {}
                     Cmd::Crop(c) => {
                         crop = c;
                         start = pos;

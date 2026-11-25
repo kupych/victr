@@ -475,6 +475,7 @@ impl CrtApp {
             self.s.mono = old.mono;
             self.s.whine = old.whine;
             self.s.test_tone = old.test_tone;
+            self.s.audio_sync_ms = old.audio_sync_ms;
             self.s.hdr_mode = old.hdr_mode;
             self.s.hdr_paper_white = old.hdr_paper_white;
             self.s.hdr_peak_nits = old.hdr_peak_nits;
@@ -483,6 +484,7 @@ impl CrtApp {
             self.s.chaos_rate = old.chaos_rate;
         } else if let Some(p) = &self.player {
             p.volume((self.s.volume * 100.0) as f64);
+            p.audio_delay(self.s.audio_sync_ms as f64 / 1000.0);
         }
         self.degauss_mag_start = None;
         self.reset_trails = true;
@@ -1257,7 +1259,13 @@ impl CrtApp {
     fn start_video_at(&mut self, src: String, start: f64) {
         // replacing the player stops the previous one
         let ring = self.audio.as_ref().map(|a| a.ring.clone());
-        let opts = StartOpts { volume: (self.s.volume * 100.0) as f64, crop: self.crop, start, user_config: self.use_my_mpv };
+        let opts = StartOpts {
+            volume: (self.s.volume * 100.0) as f64,
+            crop: self.crop,
+            start,
+            user_config: self.use_my_mpv,
+            audio_delay: self.s.audio_sync_ms as f64 / 1000.0,
+        };
         self.player = Some(Player::start(&src, opts, ring));
         self.video_name = if src.contains("://") {
             src.clone()
@@ -1451,6 +1459,19 @@ impl CrtApp {
                     .on_hover_text("Small cabinet speaker: thin bass, boxy resonance, dull treble. Its size follows the screen size.");
                 ui.checkbox(&mut s.mono, "Mono (most CRT TVs)");
                 sl(ui, &mut s.whine, 0.0..=1.0, "Flyback whine", "The 15.7 kHz squeal of the line output transformer (not everyone can hear it).");
+                if sl(
+                    ui,
+                    &mut s.audio_sync_ms,
+                    -250.0..=250.0,
+                    "A/V sync (ms)",
+                    "Fine lip-sync offset on top of automatic DSP latency compensation. Negative makes sound earlier, positive makes sound later.",
+                )
+                .changed()
+                {
+                    if let Some(p) = player {
+                        p.audio_delay(s.audio_sync_ms as f64 / 1000.0);
+                    }
+                }
                 ui.checkbox(&mut s.test_tone, "1 kHz tone with colour bars");
                 if !status.is_empty() {
                     ui.label(RichText::new(status).weak().small());
