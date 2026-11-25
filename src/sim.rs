@@ -114,6 +114,11 @@ pub struct Sim {
     ch_h_pull_init: f32,
     ch_v_pull_init: f32,
     pub whack_t: f32,
+    // VHS FF / RW picture-search & seek shuttle state
+    shuttle_target: f32, // 0 = normal play, +4/+8 = FF, -4/-8 = RW
+    shuttle_vel: f32,    // slewed effective continuous shuttle speed
+    shuttle_pulse: f32,  // transient directional burst on single seek or scrub
+    shuttle_phase: f32,  // integrated helical noise-bar vertical crawl phase
     chaos: ChaosState,
     lines: Vec<f32>,
     pub purity_seed: [f32; 2],
@@ -143,6 +148,10 @@ impl Sim {
             ch_h_pull_init: 0.0,
             ch_v_pull_init: 0.0,
             whack_t: 10.0,
+            shuttle_target: 0.0,
+            shuttle_vel: 0.0,
+            shuttle_pulse: 0.0,
+            shuttle_phase: 0.15,
             chaos: ChaosState { next_glitch_s: 8.0, ..Default::default() },
             lines: vec![0.0; (NL * 2 * 4) as usize],
             purity_seed: [3.7, 11.2],
@@ -228,6 +237,48 @@ impl Sim {
     pub fn channel_aft_offsets(&self) -> (f32, f32) {
         let (ft, tr, _, _) = self.channel_pull_in();
         (ft, tr)
+    }
+
+    /// Sets continuous VCR FF/RW picture-search speed (`0.0` = Play, `+4/+8` = FF, `-4/-8` = RW).
+    pub fn set_vcr_shuttle(&mut self, speed: f32) {
+        self.shuttle_target = speed.clamp(-10.0, 10.0);
+        if speed.abs() > 0.1 {
+            self.shuttle_pulse = 0.0;
+        }
+    }
+
+    /// Triggers a brief directional VHS helical-scan seek burst (e.g. `-10s`/`+10s` or key seek)
+    /// that smoothly pulls back into clean capstan tracking over ~0.4 s.
+    pub fn trigger_seek_shuttle(&mut self, delta_secs: f32) {
+        if delta_secs.abs() < 0.01 {
+            return;
+        }
+        let dir = delta_secs.signum();
+        let mag = if delta_secs.abs() >= 30.0 { 7.5 } else { 4.8 };
+        self.shuttle_pulse = dir * mag;
+    }
+
+    /// Keeps a gentle directional helical-scan shuttle active while dragging a seek slider.
+    pub fn trigger_scrub_shuttle(&mut self, dir: f32) {
+        let sign = if dir >= 0.0 { 1.0 } else { -1.0 };
+        self.shuttle_pulse = sign * 5.2;
+    }
+
+    /// Current effective VHS shuttle state for synchronized audio DSP: `(intensity 0..1, speed_norm 0..1)`.
+    pub fn shuttle_audio_state(&self) -> (f32, f32) {
+        let v = if self.shuttle_vel.abs() >= self.shuttle_pulse.abs() {
+            self.shuttle_vel
+        } else {
+            self.shuttle_pulse
+        };
+        let a = v.abs();
+        if a <= 0.12 {
+            (0.0, 0.0)
+        } else {
+            let intensity = ((a - 0.12) / 3.5).clamp(0.0, 1.0);
+            let speed_norm = (a / 8.0).clamp(0.0, 1.0);
+            (intensity, speed_norm)
+        }
     }
 
     /// Percussive maintenance: slaps the side of the CRT cabinet to knock loose
@@ -425,6 +476,33 @@ impl Sim {
             self.color_on = true;
         }
 
+        // ---- VHS FF / RW helical-scan picture-search & seek shuttle
+        let slew_tau = if self.shuttle_target.abs() > self.shuttle_vel.abs() { 0.065 } else { 0.24 };
+        let slew_k = 1.0 - (-fdt / slew_tau).exp();
+        self.shuttle_vel += (self.shuttle_target - self.shuttle_vel) * slew_k;
+        if self.shuttle_target == 0.0 && self.shuttle_vel.abs() < 0.06 {
+            self.shuttle_vel = 0.0;
+        }
+        self.shuttle_pulse *= (-fdt / 0.22).exp();
+        if self.shuttle_pulse.abs() < 0.08 {
+            self.shuttle_pulse = 0.0;
+        }
+        let sh_v = if self.shuttle_vel.abs() >= self.shuttle_pulse.abs() {
+            self.shuttle_vel
+        } else {
+            self.shuttle_pulse
+        };
+        let sh_abs = sh_v.abs();
+        let sh_mag = if sh_abs > 0.12 { ((sh_abs - 0.12) / 4.2).clamp(0.0, 1.0) } else { 0.0 };
+        let sh_dir = if sh_v >= 0.0 { 1.0 } else { -1.0 };
+        if sh_mag > 0.0 {
+            // FF crawls upward (-phase), RW crawls downward (+phase) across the CRT raster
+            self.shuttle_phase = (self.shuttle_phase - sh_dir * (0.28 + 0.11 * sh_abs) * fdt).rem_euclid(1.0);
+        }
+        let sh_bars: usize = if sh_abs > 5.8 { 4 } else if sh_abs > 2.6 { 3 } else { 2 };
+        let sh_bar_half = 8.5 + 11.5 * sh_mag;
+        let vcr_active = s.vcr || sh_mag > 0.01;
+
         // ---- VCR tracking band
         let track_err = if s.vcr {
             s.tracking + self.chaos.tracking + ch_tr + 0.04 * s.tape_wear * (t * 0.31).sin()
@@ -442,8 +520,9 @@ impl Sim {
         let k_afc = s.afc_speed.clamp(0.02, 1.0);
         let max_corr = 9.0;
         let mut err_acc = 0.0;
-        let jit = (if s.vcr { s.timebase_jitter } else { 0.0 }) + self.chaos.warble;
+        let jit = (if s.vcr { s.timebase_jitter } else { 0.0 }) + self.chaos.warble + sh_mag * 0.65;
         let hs_line = 256.0;
+        let hs_eff = if s.vcr { s.head_switch.max(sh_mag * 0.85) } else { sh_mag * 0.85 };
         let mut v_jit = 0.0;
         for l in 0..NL as usize {
             let lf = l as f32;
@@ -460,8 +539,23 @@ impl Sim {
                     tn = tn.max((1.0 - d2 / (band_half * 0.6)).clamp(0.0, 1.0) * sev);
                 }
             }
-            if s.vcr && (lf - hs_line).abs() < 1.5 {
-                tn = tn.max(0.55 * s.head_switch);
+            // Helical-scan track-crossing snow bars during VHS FF/RW or seeking
+            let mut sh_bar_env = 0.0f32;
+            if sh_mag > 0.01 {
+                for b in 0..sh_bars {
+                    let bc = ((self.shuttle_phase + b as f32 / sh_bars as f32).rem_euclid(1.0)) * NL as f32;
+                    let mut db = (lf - bc).abs();
+                    db = db.min(NL as f32 - db);
+                    let flutter = 1.0 + 0.20 * (lf * 0.31 + t * 23.0 + b as f32 * 1.9).sin();
+                    let env = (1.0 - (db / (sh_bar_half * flutter))).clamp(0.0, 1.0).powf(0.65);
+                    if env > sh_bar_env {
+                        sh_bar_env = env;
+                    }
+                }
+                tn = tn.max(sh_bar_env * (0.42 + 0.58 * sh_mag));
+            }
+            if vcr_active && (lf - hs_line).abs() < 1.5 {
+                tn = tn.max(0.55 * hs_eff);
             }
             // where the sync (and the picture) actually arrives on this line
             let mut e = 0.0f32;
@@ -469,9 +563,13 @@ impl Sim {
                 e += jit * (2.5 * (lf * 0.071 + t * 2.3).sin() + 1.2 * (lf * 0.29 + t * 6.1).sin());
                 e += jit * 0.6 * self.gauss();
             }
-            if s.vcr {
+            if vcr_active {
                 if lf >= hs_line {
-                    e += 16.0 * s.head_switch;
+                    e += 16.0 * hs_eff;
+                }
+                if sh_bar_env > 0.01 {
+                    // Coherent helical-scan tearing shear right across each guard-band crossing
+                    e += sh_dir * sh_bar_env * 13.0 * sh_mag;
                 }
                 e += tn * 30.0 * self.gauss();
             }
@@ -495,7 +593,7 @@ impl Sim {
             self.lines[i0 + 3] = 1.0;
             let i1 = (NL as usize + l) * 4;
             // burst phase noise (degrees of hue wobble per line)
-            let burst_noise = sigma * 0.9 + if s.vcr { 0.03 * s.tape_wear } else { 0.0 };
+            let burst_noise = sigma * 0.9 + if s.vcr { 0.03 * s.tape_wear } else { 0.0 } + sh_mag * 0.14;
             self.lines[i1] = self.gauss() * burst_noise;
             self.lines[i1 + 1] = tn * 6.0;
             self.lines[i1 + 2] = 0.0;
@@ -517,8 +615,9 @@ impl Sim {
         self.v_phase = (self.v_phase + half).rem_euclid(NL as f32) - half;
         self.v_locked = self.v_phase.abs() < 0.6;
         let mut vphase = self.v_phase;
-        if s.vcr {
-            vphase += self.gauss() * 0.06 * s.tape_wear + (v_jit / NL as f32) * self.gauss() * 4.0;
+        if vcr_active {
+            let wear_v = if s.vcr { s.tape_wear } else { 0.0 };
+            vphase += self.gauss() * (0.06 * wear_v + 0.22 * sh_mag) + (v_jit / NL as f32) * self.gauss() * 4.0;
         }
 
         // ---- degauss coil (AC perimeter coil driven through a PTC thermistor)
@@ -620,20 +719,24 @@ impl Sim {
             field,
             interlaced: interlaced as i32,
             field_phase,
-            vcr: s.vcr as i32,
+            vcr: vcr_active as i32,
             luma_sigma: gs(luma_bw),
             i_sigma: gs(i_bw),
             q_sigma: gs(q_bw),
-            chroma_delay: if s.vcr { s.chroma_delay } else { 0.0 },
-            vcr_sharp: s.edge_enhance,
-            tape_noise: s.tape_wear
-                * match s.tape_speed {
-                    TapeSpeed::Sp => 0.6,
-                    TapeSpeed::Lp => 0.9,
-                    TapeSpeed::Ep => 1.3,
-                },
-            chroma_noise: s.tape_wear * 0.9,
-            dropout: s.dropouts,
+            chroma_delay: if s.vcr { s.chroma_delay } else { sh_mag * 1.4 },
+            vcr_sharp: if s.vcr { s.edge_enhance } else { 0.0 },
+            tape_noise: (if s.vcr {
+                s.tape_wear
+                    * match s.tape_speed {
+                        TapeSpeed::Sp => 0.6,
+                        TapeSpeed::Lp => 0.9,
+                        TapeSpeed::Ep => 1.3,
+                    }
+            } else {
+                0.0
+            }) + sh_mag * 0.32,
+            chroma_noise: (if s.vcr { s.tape_wear * 0.9 } else { 0.0 }) + sh_mag * 0.42,
+            dropout: ((if s.vcr { s.dropouts } else { 0.0 }) + sh_mag * 0.55).min(1.0),
             input: s.input.id(),
             snow: rf_sigma,
             noise: extra_noise_eff,
@@ -849,5 +952,36 @@ mod tests {
         assert_eq!(tr_end, 0.0);
         let f_end = sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
         assert_eq!(f_end.u.fine_tune, 0.0);
+    }
+
+    #[test]
+    fn vhs_shuttle_creates_helical_tracking_bars_even_when_vcr_off_and_settles_cleanly() {
+        let mut sim = Sim::new();
+        sim.warm = 1.0;
+        let mut s = Settings::default();
+        s.vcr = false; // broadcast profile — shuttle should still engage helical bars during seek/FF/RW
+
+        // Idle broadcast: no tracking noise and vcr flag off
+        let idle = sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        assert_eq!(idle.u.vcr, 0);
+        let idle_max_tn = idle.lines.chunks_exact(4).take(NL as usize).map(|c| c[1]).fold(0.0f32, f32::max);
+        assert_eq!(idle_max_tn, 0.0);
+
+        // Trigger a +10s FF seek burst
+        sim.trigger_seek_shuttle(10.0);
+        let (sh_amt, sh_spd) = sim.shuttle_audio_state();
+        assert!(sh_amt > 0.5 && sh_spd > 0.4);
+        let ff = sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        assert_eq!(ff.u.vcr, 1, "shuttle should engage helical tracking pass while seeking");
+        let ff_max_tn = ff.lines.chunks_exact(4).take(NL as usize).map(|c| c[1]).fold(0.0f32, f32::max);
+        assert!(ff_max_tn > 0.5, "expected helical noise bars during FF seek, got {ff_max_tn}");
+
+        // After ~1.5s, pulse should decay completely back to clean broadcast
+        for _ in 0..90 {
+            sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        }
+        let settled = sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        assert_eq!(settled.u.vcr, 0);
+        assert_eq!(sim.shuttle_audio_state(), (0.0, 0.0));
     }
 }

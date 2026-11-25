@@ -34,8 +34,10 @@ pub struct Shared {
 
 enum Cmd {
     TogglePause,
+    SetPaused(bool),
     Seek(f64),
     SeekAbs(f64),
+    Speed(f64),
     Volume(f64),
     AudioDelay(f64),
     Crop(bool),
@@ -128,11 +130,17 @@ impl Player {
     pub fn toggle_pause(&self) {
         let _ = self.tx.send(Cmd::TogglePause);
     }
+    pub fn set_paused(&self, paused: bool) {
+        let _ = self.tx.send(Cmd::SetPaused(paused));
+    }
     pub fn seek(&self, secs: f64) {
         let _ = self.tx.send(Cmd::Seek(secs));
     }
     pub fn seek_abs(&self, secs: f64) {
         let _ = self.tx.send(Cmd::SeekAbs(secs));
+    }
+    pub fn set_speed(&self, speed: f64) {
+        let _ = self.tx.send(Cmd::Speed(speed));
     }
     pub fn volume(&self, v: f64) {
         let _ = self.tx.send(Cmd::Volume(v));
@@ -481,6 +489,9 @@ fn run_libmpv(
                     Cmd::TogglePause => {
                         cmd(&["cycle", "pause"]);
                     }
+                    Cmd::SetPaused(p) => {
+                        prop("pause", if p { "yes" } else { "no" });
+                    }
                     Cmd::Seek(s) => {
                         cmd(&["seek", &format!("{s}"), "relative"]);
                         audio.clear();
@@ -488,6 +499,13 @@ fn run_libmpv(
                     Cmd::SeekAbs(s) => {
                         cmd(&["seek", &format!("{s}"), "absolute"]);
                         audio.clear();
+                    }
+                    Cmd::Speed(sp) => {
+                        let clamped = sp.clamp(0.25, 16.0);
+                        prop("speed", &format!("{clamped:.2}"));
+                        if clamped > 1.05 {
+                            audio.clear();
+                        }
                     }
                     Cmd::Volume(v) => {
                         if pcm_pipe.is_none() {
@@ -792,6 +810,7 @@ fn run_cli(
             sh.lock().unwrap().paused = true;
             match rx.recv() {
                 Ok(Cmd::TogglePause) | Ok(Cmd::Key(_)) => paused = false,
+                Ok(Cmd::SetPaused(p)) => paused = p,
                 Ok(Cmd::Seek(d)) => {
                     start = (start + d).max(0.0);
                     sh.lock().unwrap().pos = start;
@@ -800,6 +819,7 @@ fn run_cli(
                     start = t.max(0.0);
                     sh.lock().unwrap().pos = start;
                 }
+                Ok(Cmd::Speed(_)) => {}
                 Ok(Cmd::Volume(v)) => volume = v,
                 Ok(Cmd::AudioDelay(_)) => {}
                 Ok(Cmd::Crop(c)) => crop = c,
@@ -871,6 +891,17 @@ fn run_cli(
                         audio.clear();
                         continue 'restart;
                     }
+                    Cmd::SetPaused(p) => {
+                        if p {
+                            start = pos;
+                            paused = true;
+                            kill_child(&mut video);
+                            kill_child(&mut audio_p);
+                            audio.clear();
+                            continue 'restart;
+                        }
+                    }
+                    Cmd::Speed(_) => {}
                     Cmd::Seek(d) => {
                         start = (pos + d).max(0.0);
                         kill_child(&mut video);

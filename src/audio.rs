@@ -142,6 +142,8 @@ pub struct AudioParams {
     pub dropouts: f32,
     pub wow: f32,
     pub head_switch: f32,
+    pub shuttle: f32,       // 0..1 VHS FF/RW picture-search active intensity
+    pub shuttle_speed: f32, // 0..1 normalized shuttle speed for capstan/motor pitch
     // aging
     pub age: f32,
     pub ripple: f32,
@@ -177,6 +179,8 @@ impl Default for AudioParams {
             dropouts: 0.0,
             wow: 0.0,
             head_switch: 0.0,
+            shuttle: 0.0,
+            shuttle_speed: 0.0,
             age: 0.0,
             ripple: 0.0,
         }
@@ -443,6 +447,25 @@ impl Processor {
                 }
                 l = x;
                 r = x;
+            }
+
+            // ---- VHS FF / RW shuttle audio (works on all profiles):
+            // Real VCRs mute linear/Hi-Fi program audio during picture search while a soft
+            // capstan/head-drum whirr and rhythmic guard-band noise bursts bleed through.
+            if p.shuttle > 0.005 {
+                let s_amt = p.shuttle.clamp(0.0, 1.0);
+                let duck = (1.0 - s_amt * 0.92).max(0.0);
+                l *= duck;
+                r *= duck;
+                let motor_hz = 118.0 + 96.0 * p.shuttle_speed;
+                let whirr = (std::f32::consts::TAU * motor_hz * t).sin() * 0.014
+                    + (std::f32::consts::TAU * motor_hz * 2.02 * t).sin() * 0.007;
+                let bar_hz = 12.0 + 18.0 * p.shuttle_speed;
+                let bar_gate = ((std::f32::consts::TAU * bar_hz * t).sin() * 0.5 + 0.5).powf(3.0);
+                let rasp = self.noise() * (0.012 + 0.032 * bar_gate);
+                let shuttle_sig = (whirr + rasp) * s_amt;
+                l += shuttle_sig;
+                r += shuttle_sig;
             }
 
             // ---- RF: FM sound carrier
