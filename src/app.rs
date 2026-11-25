@@ -38,6 +38,35 @@ enum PresetSel {
     User(usize),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettingsTab {
+    Channels,
+    Games,
+    Picture,
+    CrtTube,
+    Sound,
+}
+
+impl SettingsTab {
+    const ALL: [SettingsTab; 5] = [
+        SettingsTab::Channels,
+        SettingsTab::Games,
+        SettingsTab::Picture,
+        SettingsTab::CrtTube,
+        SettingsTab::Sound,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Channels => "Channels & Sources",
+            SettingsTab::Games => "Games & Capture",
+            SettingsTab::Picture => "Picture & Signal",
+            SettingsTab::CrtTube => "CRT Tube & Room",
+            SettingsTab::Sound => "Sound & System",
+        }
+    }
+}
+
 pub struct CrtApp {
     s: Settings,
     sim: Sim,
@@ -65,13 +94,16 @@ pub struct CrtApp {
     confirm_delete_idx: Option<usize>,
     degauss_mag_start: Option<f32>,
     degauss_pinned_t: Option<f32>,
-    // slide-in right sidebar (click handle or Controls button to toggle open/closed)
+    // slide-in right quick menu & floating tabbed full-settings window
     sidebar_open: bool,
     sidebar_anim: f32,
     handle_anim: f32,
     handle_vis: f32,
     sidebar_width: f32,
     sidebar_resizing: bool,
+    settings_open: bool,
+    settings_tab: SettingsTab,
+    settings_rect: Option<egui::Rect>,
     pixel_perfect_req: bool,
     last_vis_rect: egui::Rect,
     last_full_h_px: f32,
@@ -378,8 +410,11 @@ impl CrtApp {
             sidebar_anim: 0.0,
             handle_anim: 0.0,
             handle_vis: 1.0,
-            sidebar_width: 440.0,
+            sidebar_width: 310.0,
             sidebar_resizing: false,
+            settings_open: false,
+            settings_tab: SettingsTab::Channels,
+            settings_rect: None,
             pixel_perfect_req: false,
             last_vis_rect: egui::Rect::NOTHING,
             last_full_h_px: 0.0,
@@ -1614,9 +1649,10 @@ impl CrtApp {
         let mut refresh = false;
         ui.horizontal(|ui| {
             ui.label("Controller");
+            let cb_w = (ui.available_width() - 34.0).clamp(115.0, 260.0);
             egui::ComboBox::from_id_salt(id_salt)
                 .selected_text(cur_label)
-                .width(195.0)
+                .width(cb_w)
                 .show_ui(ui, |ui| {
                     if ui
                         .selectable_label(cur.is_empty(), "Auto (all gamepads)")
@@ -1748,18 +1784,20 @@ impl CrtApp {
         ui.separator();
     }
 
-    fn channels_controls(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new(RichText::new("Channels & Sources").strong())
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("Combine Jellyfin, Plex, nested local folders, M3U8 live streams, and custom integrators into one 90s Prevue Cable Guide.")
-                        .weak()
-                        .small(),
-                );
+    fn open_settings_tab(&mut self, tab: SettingsTab) {
+        self.settings_tab = tab;
+        self.settings_open = true;
+    }
 
-                // ---- Unified Guide & On-Air controls (shown whenever any source has channels)
-                if self.has_channels() {
+    fn channels_sources_controls(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new("Combine Jellyfin, Plex, nested local folders, M3U8 live streams, live web pages, and custom integrators into one 90s Prevue Cable Guide.")
+                .weak()
+                .small(),
+        );
+
+        // ---- Unified Guide & On-Air controls (shown whenever any source has channels)
+        if self.has_channels() {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         let lbl = if self.guide.active { "Exit Cable Guide (G)" } else { "Open Cable Guide (G)" };
@@ -2167,272 +2205,6 @@ impl CrtApp {
                                 self.channels_file.last_error.clear();
                             }
                         }
-                    });
-
-                // ---- Source 0: Game Console Input (CH 03 / Native libretro)
-                let game_hdr = format!("Game Console (CH {:02} / libretro)", self.retro.cfg.channel_number.max(2));
-                egui::CollapsingHeader::new(RichText::new(game_hdr).strong().small())
-                    .id_salt("src_retro_console")
-                    .default_open(self.retro_player.is_some())
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new("Play NES, SNES, Genesis, GB/GBA, PC Engine & Arcade ROMs directly on CH 03 using your installed libretro cores — zero-lag 240p + analog CRT sound.")
-                                .weak()
-                                .small(),
-                        );
-                        ui.add_space(3.0);
-                        let mut retro_cfg_changed = false;
-                        ui.horizontal(|ui| {
-                            if ui.checkbox(&mut self.retro.cfg.enabled, "Enable CH").changed() {
-                                retro_cfg_changed = true;
-                            }
-                            let mut ch_n = self.retro.cfg.channel_number.max(2) as i32;
-                            if ui.add(egui::DragValue::new(&mut ch_n).range(2..=99)).changed() {
-                                self.retro.cfg.channel_number = ch_n as u16;
-                                retro_cfg_changed = true;
-                            }
-                            if ui.small_button("Tune Now").clicked() {
-                                let n = self.retro.cfg.channel_number.max(2);
-                                self.tune_channel(n);
-                            }
-                        });
-                        if retro_cfg_changed {
-                            let _ = retro::save_config(&self.retro.cfg);
-                            self.retro.rescan();
-                            self.rebuild_lineup();
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.button("Load ROM…").clicked() {
-                                self.message = "pickrom".into();
-                            }
-                            if ui.button("Add ROM Folder…").clicked() {
-                                self.message = "pickromdir".into();
-                            }
-                            if ui.small_button("Rescan").clicked() {
-                                self.retro.rescan();
-                                self.rebuild_lineup();
-                            }
-                        });
-                        if !self.retro.cores.is_empty() {
-                            let cur_core_lbl = if self.retro_selected_core.is_empty() {
-                                "Auto-detect by ROM extension".to_string()
-                            } else {
-                                self.retro_selected_core.clone()
-                            };
-                            ui.horizontal(|ui| {
-                                ui.label("Core");
-                                egui::ComboBox::from_id_salt("retro_core_sel")
-                                    .selected_text(cur_core_lbl)
-                                    .width(210.0)
-                                    .show_ui(ui, |ui| {
-                                        if ui
-                                            .selectable_label(self.retro_selected_core.is_empty(), "Auto-detect by ROM extension")
-                                            .clicked()
-                                        {
-                                            self.retro_selected_core.clear();
-                                        }
-                                        for c in &self.retro.cores {
-                                            if ui
-                                                .selectable_label(self.retro_selected_core == c.name, &c.name)
-                                                .clicked()
-                                            {
-                                                self.retro_selected_core = c.name.clone();
-                                            }
-                                        }
-                                    });
-                            });
-                        }
-                        self.retro_gamepad_selector(ui, "retro_gp_src");
-                        if let Some(rp) = &self.retro_player {
-                            let (gname, cname, status, active_gp, paused, running) = {
-                                let sh = rp.shared.lock().unwrap();
-                                (
-                                    sh.game_name.clone(),
-                                    sh.core_name.clone(),
-                                    sh.status.clone(),
-                                    sh.active_gamepad.clone(),
-                                    sh.paused,
-                                    sh.running,
-                                )
-                            };
-                            ui.separator();
-                            let title_line = if cname.is_empty() {
-                                format!("Cartridge: {gname}")
-                            } else {
-                                format!("Cartridge: {gname} ({cname})")
-                            };
-                            ui.label(RichText::new(title_line).strong().small().color(Color32::from_rgb(138, 240, 178)));
-                            ui.label(RichText::new(status).weak().small());
-                            if running && !active_gp.is_empty() {
-                                ui.label(RichText::new(format!("Active pad: {active_gp}")).weak().small());
-                            }
-                            let mut eject = false;
-                            if running {
-                                ui.horizontal(|ui| {
-                                    if ui.small_button(if paused { "Resume" } else { "Pause" }).clicked() {
-                                        rp.toggle_pause();
-                                    }
-                                    if ui.small_button("Reset (F1)").clicked() {
-                                        rp.reset();
-                                        self.osd.show_action("CONSOLE RESET");
-                                    }
-                                    if ui.small_button("Save (F2)").clicked() {
-                                        rp.save_state();
-                                        self.osd.show_action("STATE SAVED");
-                                    }
-                                    if ui.small_button("Load (F4)").clicked() {
-                                        rp.load_state();
-                                        self.osd.show_action("STATE LOADED");
-                                    }
-                                    if ui.small_button("Eject").clicked() {
-                                        eject = true;
-                                    }
-                                });
-                            }
-                            if eject {
-                                self.retro_player = None;
-                            }
-                        }
-                        if !self.retro.cfg.rom_dirs.is_empty() {
-                            let mut rm_dir: Option<usize> = None;
-                            for (i, d) in self.retro.cfg.rom_dirs.iter().enumerate() {
-                                ui.horizontal(|ui| {
-                                    let lbl = std::path::Path::new(d)
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or(d);
-                                    ui.label(RichText::new(lbl).small()).on_hover_text(d);
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.small_button("×").on_hover_text("Remove ROM folder").clicked() {
-                                            rm_dir = Some(i);
-                                        }
-                                    });
-                                });
-                            }
-                            if let Some(idx) = rm_dir {
-                                self.retro.remove_rom_dir(idx);
-                                self.rebuild_lineup();
-                            }
-                        }
-                        if !self.retro.status.is_empty() {
-                            ui.label(RichText::new(&self.retro.status).small().color(Color32::from_rgb(112, 236, 184)));
-                        }
-                        ui.label(
-                            RichText::new("Controls: Arrows=D-Pad · Z/X=B/A · A/S=Y/X · Q/W=L/R · Enter=Start · Backspace=Select · USB/BT Gamepad auto-detected.")
-                                .weak()
-                                .small(),
-                        );
-                    });
-
-                // ---- Source 0b: External Emulator Window / Monitor / USB Capture Card (AV 1)
-                let cap_hdr = if self.capture_player.is_some() {
-                    "External Input / Capture (LIVE)".to_string()
-                } else {
-                    "External Input / Capture (Dolphin, PCSX2…)".to_string()
-                };
-                egui::CollapsingHeader::new(RichText::new(cap_hdr).strong().small())
-                    .id_salt("src_capture_input")
-                    .default_open(self.capture_player.is_some())
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new("Mirror any running emulator window (Dolphin, PCSX2, RetroArch, etc.), Wayland monitor, or USB HDMI/Composite capture card (/dev/video0) directly into the CRT.")
-                                .weak()
-                                .small(),
-                        );
-                        ui.add_space(3.0);
-                        ui.horizontal(|ui| {
-                            if ui.small_button("Scan Windows & Devices").clicked() {
-                                self.capture_windows = capture::list_open_windows();
-                                self.capture_monitors = capture::list_monitors();
-                                self.capture_v4l2 = capture::list_v4l2_devices();
-                            }
-                            if self.capture_player.is_some() && ui.small_button("Stop Capture").clicked() {
-                                self.capture_player = None;
-                            }
-                        });
-                        // Quick 1-click emulator window presets (auto-connect as soon as the window opens!)
-                        let mut cap_start: Option<(String, String)> = None;
-                        ui.horizontal_wrapped(|ui| {
-                            for (lbl, q) in [
-                                ("Dolphin", "capture://window/dolphin"),
-                                ("PCSX2", "capture://window/pcsx2"),
-                                ("RetroArch", "capture://window/retroarch"),
-                            ] {
-                                if ui
-                                    .small_button(lbl)
-                                    .on_hover_text(format!("Mirror any open {lbl} window onto the CRT (auto-waits until launched)"))
-                                    .clicked()
-                                {
-                                    cap_start = Some((lbl.to_string(), q.to_string()));
-                                }
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            let te = ui.add(
-                                egui::TextEdit::singleline(&mut self.capture_custom_query)
-                                    .hint_text("Window title/class or capture:// URL")
-                                    .desired_width(214.0),
-                            );
-                            let go = ui.small_button("Mirror").clicked()
-                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                            if go && !self.capture_custom_query.trim().is_empty() {
-                                let raw = self.capture_custom_query.trim().to_string();
-                                let url = if capture::is_capture_url(&raw) {
-                                    raw.clone()
-                                } else {
-                                    format!("capture://window/{raw}")
-                                };
-                                cap_start = Some((raw, url));
-                            }
-                        });
-                        if !self.capture_windows.is_empty() {
-                            ui.label(RichText::new("Open windows (click to mirror)").small().strong());
-                            let wins = self.capture_windows.clone();
-                            for w in wins {
-                                let lbl = w.label();
-                                let url = format!("capture://window/{}", w.match_key());
-                                if ui.selectable_label(false, &lbl).clicked() {
-                                    cap_start = Some((lbl, url));
-                                }
-                            }
-                        }
-                        if !self.capture_monitors.is_empty() {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new("Displays:").weak().small());
-                                for m in self.capture_monitors.clone() {
-                                    if ui.small_button(&m).clicked() {
-                                        cap_start = Some((m.clone(), format!("capture://output/{m}")));
-                                    }
-                                }
-                            });
-                        }
-                        if !self.capture_v4l2.is_empty() {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new("Capture cards:").weak().small());
-                                for d in self.capture_v4l2.clone() {
-                                    if ui.small_button(&d).clicked() {
-                                        cap_start = Some((d.clone(), format!("capture://v4l2{d}")));
-                                    }
-                                }
-                            });
-                        }
-                        if let Some((lbl, url)) = cap_start {
-                            self.guide.active = false;
-                            self.sim.switch_channel();
-                            self.apply_channel_profile("game", None);
-                            self.start_video_at(url, 0.0);
-                            self.video_name = format!("AV 1 · {lbl}");
-                            self.osd.show_channel(0, "AV1", &lbl, self.s.mono);
-                        }
-                        if let Some(cp) = &self.capture_player {
-                            let st = cp.shared.lock().unwrap().status.clone();
-                            ui.label(RichText::new(st).small().color(Color32::from_rgb(112, 236, 184)));
-                        }
-                        ui.label(
-                            RichText::new("Tip: Pin Dolphin/PCSX2 to a channel in channels.json with kind:\"capture\" and stream_url:\"capture://window/dolphin\".")
-                                .weak()
-                                .small(),
-                        );
                     });
 
                 // ---- Source 1: Local Nested Folders
@@ -3162,6 +2934,277 @@ impl CrtApp {
                             }
                         }
                     });
+    }
+
+    fn games_capture_controls(&mut self, ui: &mut egui::Ui) {
+        // ---- Native libretro Game Console Input (CH 03)
+        let game_hdr = format!("Game Console (CH {:02} / libretro)", self.retro.cfg.channel_number.max(2));
+        egui::CollapsingHeader::new(RichText::new(game_hdr).strong())
+            .id_salt("tab_retro_console")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Play NES, SNES, Genesis, GB/GBA, PC Engine & Arcade ROMs directly on CH 03 using your installed libretro cores — zero-lag 240p + analog CRT sound.")
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(4.0);
+                let mut retro_cfg_changed = false;
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut self.retro.cfg.enabled, "Enable CH").changed() {
+                        retro_cfg_changed = true;
+                    }
+                    let mut ch_n = self.retro.cfg.channel_number.max(2) as i32;
+                    if ui.add(egui::DragValue::new(&mut ch_n).range(2..=99)).changed() {
+                        self.retro.cfg.channel_number = ch_n as u16;
+                        retro_cfg_changed = true;
+                    }
+                    if ui.small_button("Tune Now").clicked() {
+                        let n = self.retro.cfg.channel_number.max(2);
+                        self.tune_channel(n);
+                    }
+                });
+                if retro_cfg_changed {
+                    let _ = retro::save_config(&self.retro.cfg);
+                    self.retro.rescan();
+                    self.rebuild_lineup();
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Load ROM…").clicked() {
+                        self.message = "pickrom".into();
+                    }
+                    if ui.button("Add ROM Folder…").clicked() {
+                        self.message = "pickromdir".into();
+                    }
+                    if ui.small_button("Rescan").clicked() {
+                        self.retro.rescan();
+                        self.rebuild_lineup();
+                    }
+                });
+                if !self.retro.cores.is_empty() {
+                    let cur_core_lbl = if self.retro_selected_core.is_empty() {
+                        "Auto-detect by ROM extension".to_string()
+                    } else {
+                        self.retro_selected_core.clone()
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label("Core");
+                        egui::ComboBox::from_id_salt("retro_core_sel")
+                            .selected_text(cur_core_lbl)
+                            .width(240.0)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(self.retro_selected_core.is_empty(), "Auto-detect by ROM extension")
+                                    .clicked()
+                                {
+                                    self.retro_selected_core.clear();
+                                }
+                                for c in &self.retro.cores {
+                                    if ui
+                                        .selectable_label(self.retro_selected_core == c.name, &c.name)
+                                        .clicked()
+                                    {
+                                        self.retro_selected_core = c.name.clone();
+                                    }
+                                }
+                            });
+                    });
+                }
+                self.retro_gamepad_selector(ui, "retro_gp_tab");
+                if let Some(rp) = &self.retro_player {
+                    let (gname, cname, status, active_gp, paused, running) = {
+                        let sh = rp.shared.lock().unwrap();
+                        (
+                            sh.game_name.clone(),
+                            sh.core_name.clone(),
+                            sh.status.clone(),
+                            sh.active_gamepad.clone(),
+                            sh.paused,
+                            sh.running,
+                        )
+                    };
+                    ui.separator();
+                    let title_line = if cname.is_empty() {
+                        format!("Cartridge: {gname}")
+                    } else {
+                        format!("Cartridge: {gname} ({cname})")
+                    };
+                    ui.label(RichText::new(title_line).strong().color(Color32::from_rgb(138, 240, 178)));
+                    ui.label(RichText::new(status).weak().small());
+                    if running && !active_gp.is_empty() {
+                        ui.label(RichText::new(format!("Active pad: {active_gp}")).small().color(Color32::from_rgb(156, 224, 186)));
+                    }
+                    let mut eject = false;
+                    if running {
+                        ui.horizontal(|ui| {
+                            if ui.small_button(if paused { "Resume" } else { "Pause" }).clicked() {
+                                rp.toggle_pause();
+                            }
+                            if ui.small_button("Reset (F1)").clicked() {
+                                rp.reset();
+                                self.osd.show_action("CONSOLE RESET");
+                            }
+                            if ui.small_button("Save (F2)").clicked() {
+                                rp.save_state();
+                                self.osd.show_action("STATE SAVED");
+                            }
+                            if ui.small_button("Load (F4)").clicked() {
+                                rp.load_state();
+                                self.osd.show_action("STATE LOADED");
+                            }
+                            if ui.small_button("Eject").clicked() {
+                                eject = true;
+                            }
+                        });
+                    }
+                    if eject {
+                        self.retro_player = None;
+                    }
+                }
+                if !self.retro.cfg.rom_dirs.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("ROM Folders").strong().small());
+                    let mut rm_dir: Option<usize> = None;
+                    for (i, d) in self.retro.cfg.rom_dirs.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let lbl = std::path::Path::new(d)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(d);
+                            ui.label(RichText::new(lbl).small()).on_hover_text(d);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("×").on_hover_text("Remove ROM folder").clicked() {
+                                    rm_dir = Some(i);
+                                }
+                            });
+                        });
+                    }
+                    if let Some(idx) = rm_dir {
+                        self.retro.remove_rom_dir(idx);
+                        self.rebuild_lineup();
+                    }
+                }
+                if !self.retro.status.is_empty() {
+                    ui.label(RichText::new(&self.retro.status).small().color(Color32::from_rgb(112, 236, 184)));
+                }
+                ui.label(
+                    RichText::new("Keyboard: Arrows=D-Pad · Z/X=B/A · A/S=Y/X · Q/W=L/R · Enter=Start · Backspace=Select · F1=Reset · F2/F4=Save/Load.")
+                        .weak()
+                        .small(),
+                );
+            });
+
+        ui.add_space(6.0);
+
+        // ---- External Emulator Window / Monitor / USB Capture Card (AV 1)
+        let cap_hdr = if self.capture_player.is_some() {
+            "External Input / Capture (LIVE)".to_string()
+        } else {
+            "External Input / Capture (Dolphin, PCSX2, RetroArch…)".to_string()
+        };
+        egui::CollapsingHeader::new(RichText::new(cap_hdr).strong())
+            .id_salt("tab_capture_input")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Mirror any running emulator window (Dolphin, PCSX2, RetroArch, etc.), Wayland monitor, or USB HDMI/Composite capture card (/dev/video0) directly into the CRT.")
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Scan Windows & Devices").clicked() {
+                        self.capture_windows = capture::list_open_windows();
+                        self.capture_monitors = capture::list_monitors();
+                        self.capture_v4l2 = capture::list_v4l2_devices();
+                    }
+                    if self.capture_player.is_some() && ui.button("Stop Capture").clicked() {
+                        self.capture_player = None;
+                    }
+                });
+                let mut cap_start: Option<(String, String)> = None;
+                ui.horizontal_wrapped(|ui| {
+                    for (lbl, q) in [
+                        ("Dolphin", "capture://window/dolphin"),
+                        ("PCSX2", "capture://window/pcsx2"),
+                        ("RetroArch", "capture://window/retroarch"),
+                    ] {
+                        if ui
+                            .button(lbl)
+                            .on_hover_text(format!("Mirror any open {lbl} window onto the CRT (auto-waits until launched)"))
+                            .clicked()
+                        {
+                            cap_start = Some((lbl.to_string(), q.to_string()));
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let te = ui.add(
+                        egui::TextEdit::singleline(&mut self.capture_custom_query)
+                            .hint_text("Window title/class or capture:// URL")
+                            .desired_width(280.0),
+                    );
+                    let go = ui.button("Mirror").clicked()
+                        || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    if go && !self.capture_custom_query.trim().is_empty() {
+                        let raw = self.capture_custom_query.trim().to_string();
+                        let url = if capture::is_capture_url(&raw) {
+                            raw.clone()
+                        } else {
+                            format!("capture://window/{raw}")
+                        };
+                        cap_start = Some((raw, url));
+                    }
+                });
+                if !self.capture_windows.is_empty() {
+                    ui.add_space(3.0);
+                    ui.label(RichText::new("Open windows (click to mirror)").small().strong());
+                    let wins = self.capture_windows.clone();
+                    for w in wins {
+                        let lbl = w.label();
+                        let url = format!("capture://window/{}", w.match_key());
+                        if ui.selectable_label(false, &lbl).clicked() {
+                            cap_start = Some((lbl, url));
+                        }
+                    }
+                }
+                if !self.capture_monitors.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Displays:").weak().small());
+                        for m in self.capture_monitors.clone() {
+                            if ui.small_button(&m).clicked() {
+                                cap_start = Some((m.clone(), format!("capture://output/{m}")));
+                            }
+                        }
+                    });
+                }
+                if !self.capture_v4l2.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Capture cards:").weak().small());
+                        for d in self.capture_v4l2.clone() {
+                            if ui.small_button(&d).clicked() {
+                                cap_start = Some((d.clone(), format!("capture://v4l2{d}")));
+                            }
+                        }
+                    });
+                }
+                if let Some((lbl, url)) = cap_start {
+                    self.guide.active = false;
+                    self.sim.switch_channel();
+                    self.apply_channel_profile("game", None);
+                    self.start_video_at(url, 0.0);
+                    self.video_name = format!("AV 1 · {lbl}");
+                    self.osd.show_channel(0, "AV1", &lbl, self.s.mono);
+                }
+                if let Some(cp) = &self.capture_player {
+                    let st = cp.shared.lock().unwrap().status.clone();
+                    ui.label(RichText::new(st).small().color(Color32::from_rgb(112, 236, 184)));
+                }
+                ui.label(
+                    RichText::new("Tip: Pin Dolphin/PCSX2 to a channel in channels.json with kind:\"capture\" and stream_url:\"capture://window/dolphin\".")
+                        .weak()
+                        .small(),
+                );
             });
     }
 
@@ -3542,7 +3585,7 @@ impl CrtApp {
         ));
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui) {
+    fn picture_signal_controls(&mut self, ui: &mut egui::Ui) {
         let s = &mut self.s;
         egui::CollapsingHeader::new(RichText::new("Picture source").strong())
             .default_open(true)
@@ -3651,7 +3694,10 @@ impl CrtApp {
                 sl(ui, &mut s.v_hold, -1.0..=1.0, "Vertical hold", "Free-running frequency of the field oscillator. Too far and the picture rolls.");
                 sl(ui, &mut s.afc_speed, 0.02..=1.0, "AFC speed", "How fast the line oscillator follows the incoming sync: slow = stable on noise but bends with VCR jumps.");
             });
+    }
 
+    fn crt_tube_controls(&mut self, ui: &mut egui::Ui) {
+        let s = &mut self.s;
         egui::CollapsingHeader::new(RichText::new("Picture tube").strong())
             .default_open(true)
             .show(ui, |ui| {
@@ -3906,11 +3952,15 @@ impl CrtApp {
         paint_screw(ui.painter(), metal_rect.left_bottom() + egui::vec2(7.0, -7.0), 2.5);
         paint_screw(ui.painter(), metal_rect.right_bottom() + egui::vec2(-7.0, -7.0), 2.5);
 
-        let inner_frame = egui::Frame::NONE.inner_margin(egui::Margin { left: 16, right: 18, top: 10, bottom: 10 });
+        let inner_frame = egui::Frame::NONE.inner_margin(egui::Margin { left: 14, right: 14, top: 10, bottom: 10 });
         inner_frame.show(ui, |ui| {
+            let content_w = (full_rect.width() - 28.0).max(200.0);
+            ui.set_max_width(content_w);
+
+            // Header row
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("SERVICE PANEL")
+                    RichText::new("QUICK MENU")
                         .strong()
                         .size(12.5)
                         .color(Color32::from_rgb(242, 184, 96)),
@@ -3918,14 +3968,14 @@ impl CrtApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .small_button("Close >")
-                        .on_hover_text("Slide the service panel closed")
+                        .on_hover_text("Slide the quick menu closed")
                         .clicked()
                     {
                         self.sidebar_open = false;
                     }
                     if ui
                         .add(egui::Button::new(RichText::new("Quit").color(Color32::from_rgb(236, 152, 132))).small())
-                        .on_hover_text("Power down the CRT, save watch progress to Jellyfin, and quit (Ctrl+Q)")
+                        .on_hover_text("Power down the CRT, save watch progress, and quit (Ctrl+Q)")
                         .clicked()
                     {
                         self.begin_quit();
@@ -3940,9 +3990,32 @@ impl CrtApp {
                     }
                 });
             });
-            if self.fullscreen {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
+            ui.separator();
+
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_width((content_w - 6.0).max(190.0));
+                ui.add_space(2.0);
+
+                // ---- Active Game Console (when running on CH 03)
+                self.retro_running_controls(ui);
+
+                // ---- Active External Capture badge (when mirroring Dolphin/PCSX2/etc.)
+                if let Some(cp) = &self.capture_player {
+                    let st = cp.shared.lock().unwrap().status.clone();
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("AV 1 · Live Capture").strong().color(Color32::from_rgb(138, 240, 178)));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Stop").clicked() {
+                                self.capture_player = None;
+                            }
+                        });
+                    });
+                    ui.label(RichText::new(st).weak().small());
+                    ui.separator();
+                }
+
+                // ---- Receiver quick actions
+                ui.horizontal_wrapped(|ui| {
                     let pwr_label = if self.sim.power_on {
                         RichText::new("Power").color(Color32::WHITE).strong()
                     } else {
@@ -3958,27 +4031,150 @@ impl CrtApp {
                             self.degauss_mag_start = Some(self.s.magnetization);
                         }
                     }
-                    if ui.small_button("Save preset…").clicked() {
-                        self.open_save_preset_dialog();
+                    if self.s.chaos && ui.small_button("Whack!").clicked() {
+                        self.sim.whack();
                     }
                     if ui.small_button("Reset view").clicked() {
                         self.zoom = 1.0;
                         self.pan = [0.0, 0.0];
                         self.reset_trails = true;
                     }
+                    if !self.fullscreen && ui.small_button("Fullscreen").clicked() {
+                        self.set_fullscreen(true);
+                    }
                 });
-            }
-            ui.separator();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.set_width((ui.available_width() - 6.0).max(200.0));
-                ui.add_space(2.0);
-                self.retro_running_controls(ui);
-                self.preset_controls(ui);
-                self.channels_controls(ui);
-                self.video_controls(ui);
-                self.controls(ui);
-                self.sound_controls(ui);
-                self.about_controls(ui);
+
+                ui.add_space(4.0);
+
+                // ---- Quick TV Preset switcher
+                let mut sel = self.preset_sel;
+                let selected_label = self.current_preset_label();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Preset").small().weak());
+                    egui::ComboBox::from_id_salt("quick_preset_sel")
+                        .selected_text(selected_label)
+                        .width((content_w - 110.0).max(110.0))
+                        .show_ui(ui, |ui| {
+                            for (i, n) in settings::PRESETS.iter().enumerate() {
+                                ui.selectable_value(&mut sel, PresetSel::BuiltIn(i), *n);
+                            }
+                            if !self.user_presets.is_empty() {
+                                ui.separator();
+                                ui.label(RichText::new("Saved presets").weak().small());
+                                for (i, p) in self.user_presets.iter().enumerate() {
+                                    ui.selectable_value(&mut sel, PresetSel::User(i), &p.name);
+                                }
+                            }
+                        });
+                    if ui.small_button("Save…").clicked() {
+                        self.open_save_preset_dialog();
+                    }
+                });
+                if sel != self.preset_sel {
+                    self.apply_preset(sel);
+                }
+
+                // ---- Quick Volume, Mute & HDR
+                ui.horizontal(|ui| {
+                    let mute_lbl = if self.muted { "Unmute" } else { "Mute" };
+                    if ui.small_button(mute_lbl).clicked() {
+                        self.toggle_mute();
+                    }
+                    if ui
+                        .add(
+                            Slider::new(&mut self.s.volume, 0.0..=1.0)
+                                .show_value(false)
+                                .text("Vol"),
+                        )
+                        .changed()
+                    {
+                        if let Some(p) = &self.player {
+                            p.volume(if self.muted { 0.0 } else { (self.s.volume * 100.0) as f64 });
+                        }
+                    }
+                    if self.hdr_status.supported {
+                        let hdr_on = self.hdr_status.active_mode.is_hdr();
+                        let hdr_lbl = if hdr_on {
+                            RichText::new("HDR").color(Color32::from_rgb(255, 214, 96)).strong()
+                        } else {
+                            RichText::new("HDR").weak()
+                        };
+                        if ui.add(egui::Button::new(hdr_lbl).selected(hdr_on).small()).clicked() {
+                            self.s.hdr_mode = !self.s.hdr_mode;
+                        }
+                    }
+                });
+
+                // ---- Quick Cable Remote (when any channel source is active)
+                if self.has_channels() {
+                    ui.separator();
+                    if let Some(w) = &self.active_watch {
+                        ui.label(
+                            RichText::new(format!("CH {:02} {} · {}", w.channel_number, w.callsign, w.title))
+                                .small()
+                                .color(Color32::from_rgb(138, 240, 178)),
+                        );
+                    } else if let Some(ch) = self.current_channel {
+                        ui.label(
+                            RichText::new(format!("CH {:02}", ch))
+                                .small()
+                                .color(Color32::from_rgb(138, 240, 178)),
+                        );
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let glbl = if self.guide.active { "Exit Guide (G)" } else { "Cable Guide (G)" };
+                        if ui.add(egui::Button::new(glbl).selected(self.guide.active).small()).clicked() {
+                            self.toggle_guide();
+                        }
+                        if ui.small_button("Ch -").clicked() {
+                            self.surf_channel(-1);
+                        }
+                        if ui.small_button("Ch +").clicked() {
+                            self.surf_channel(1);
+                        }
+                        if self.active_watch.is_some() {
+                            if ui.small_button("Prev").clicked() {
+                                self.step_episode(-1);
+                            }
+                            if ui.small_button("Next").clicked() {
+                                self.step_episode(1);
+                            }
+                        }
+                    });
+                }
+
+                // ---- Full Tabbed Settings Window Launchers
+                ui.separator();
+                ui.label(
+                    RichText::new("FULL CONTROLS (TABBED WINDOW)")
+                        .strong()
+                        .small()
+                        .color(Color32::from_rgb(232, 186, 102)),
+                );
+                ui.add_space(3.0);
+                let btn_w = (content_w - 10.0).max(180.0);
+                for (tab, subtitle) in [
+                    (SettingsTab::Channels, "Guide, channels.json, Profiles, Jellyfin, Plex, M3U8, Web"),
+                    (SettingsTab::Games, "CH 03 libretro ROMs, Gamepads, Dolphin/PCSX2 Capture"),
+                    (SettingsTab::Picture, "Presets, Video, 240p/480i, RF/Composite/S-Video, VCR"),
+                    (SettingsTab::CrtTube, "Mask, Phosphors, Rolling Scan, Burn-in, Chaos, Room/HDR"),
+                    (SettingsTab::Sound, "Analog TV Speaker/Hum/Flyback DSP & App Info"),
+                ] {
+                    let active = self.settings_open && self.settings_tab == tab;
+                    let label = if active {
+                        RichText::new(format!("{}  (Open)", tab.label())).strong().color(Color32::from_rgb(255, 214, 112))
+                    } else {
+                        RichText::new(format!("{}…", tab.label()))
+                    };
+                    if ui
+                        .add_sized([btn_w, 26.0], egui::Button::new(label).selected(active))
+                        .on_hover_text(subtitle)
+                        .clicked()
+                    {
+                        self.open_settings_tab(tab);
+                    }
+                }
+
                 if !self.message.is_empty()
                     && self.message != "pick"
                     && self.message != "pickvideo"
@@ -3986,14 +4182,85 @@ impl CrtApp {
                     && self.message != "pickm3u"
                     && self.message != "pickrom"
                     && self.message != "pickromdir"
+                    && self.message != "exitfs"
                 {
+                    ui.add_space(6.0);
                     ui.colored_label(Color32::from_rgb(230, 120, 90), &self.message);
                 }
+
                 ui.add_space(8.0);
-                ui.label(RichText::new("Scroll on the screen to zoom into the phosphors, drag to pan, double-click to reset.").weak().small());
-                ui.add_space(12.0);
+                ui.label(
+                    RichText::new("Scroll to zoom · Drag to pan · Double-click to reset · G for Cable Guide.")
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(8.0);
             });
         });
+    }
+
+    fn show_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            self.settings_rect = None;
+            return;
+        }
+        let mut open = self.settings_open;
+        let win_resp = egui::Window::new("ViCTR Service & Settings")
+            .id(egui::Id::unique("victr_full_settings_win"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([660.0, 620.0])
+            .min_size([460.0, 360.0])
+            .default_pos([64.0, 56.0])
+            .show(ctx, |ui| {
+                // Top horizontal tab bar
+                ui.horizontal_wrapped(|ui| {
+                    for tab in SettingsTab::ALL {
+                        let sel = self.settings_tab == tab;
+                        let lbl = if sel {
+                            RichText::new(tab.label()).strong().color(Color32::from_rgb(255, 214, 112))
+                        } else {
+                            RichText::new(tab.label())
+                        };
+                        if ui.selectable_label(sel, lbl).clicked() {
+                            self.settings_tab = tab;
+                        }
+                    }
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .id_salt(("settings_tab_scroll", self.settings_tab as u8))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let w = (ui.available_width() - 8.0).max(320.0);
+                        ui.set_width(w);
+                        match self.settings_tab {
+                            SettingsTab::Channels => {
+                                self.channels_sources_controls(ui);
+                            }
+                            SettingsTab::Games => {
+                                self.games_capture_controls(ui);
+                            }
+                            SettingsTab::Picture => {
+                                self.preset_controls(ui);
+                                self.video_controls(ui);
+                                self.picture_signal_controls(ui);
+                            }
+                            SettingsTab::CrtTube => {
+                                self.crt_tube_controls(ui);
+                            }
+                            SettingsTab::Sound => {
+                                self.sound_controls(ui);
+                                self.about_controls(ui);
+                            }
+                        }
+                        ui.add_space(12.0);
+                    });
+            });
+        self.settings_rect = win_resp.map(|r| r.response.rect);
+        self.settings_open = open;
     }
 }
 
@@ -4336,7 +4603,7 @@ impl CrtApp {
 
         // fullscreen: F11 toggles, Esc leaves; Ctrl+1 snaps screen size; Ctrl+Q cleanly saves progress & quits
         let f11 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11));
-        let esc = (self.fullscreen || self.save_preset_open || self.guide.active)
+        let esc = (self.fullscreen || self.save_preset_open || self.settings_open || self.guide.active)
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let ctrl_1 = !ctx.egui_wants_keyboard_input()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num1));
@@ -4355,6 +4622,8 @@ impl CrtApp {
         } else if esc {
             if self.save_preset_open {
                 self.save_preset_open = false;
+            } else if self.settings_open {
+                self.settings_open = false;
             } else if self.guide.active {
                 if self.guide.picker_channel().is_some() {
                     self.guide.close_picker();
@@ -4931,17 +5200,29 @@ impl CrtApp {
                                         }
                                     }
                                     let btn_label = if self.sidebar_open {
-                                        RichText::new("Controls >").color(Color32::WHITE).strong()
+                                        RichText::new("Quick >").color(Color32::WHITE).strong()
                                     } else {
-                                        RichText::new("< Controls")
+                                        RichText::new("< Quick")
                                     };
                                     let btn = egui::Button::new(btn_label).selected(self.sidebar_open);
                                     if ui
                                         .add(btn)
-                                        .on_hover_text("Toggle the right-side service panel open or closed (you can also click the right-edge handle).")
+                                        .on_hover_text("Toggle the slim Quick Menu drawer (or click the right-edge pull handle).")
                                         .clicked()
                                     {
                                         self.sidebar_open = !self.sidebar_open;
+                                    }
+                                    let set_lbl = if self.settings_open {
+                                        RichText::new("Settings").color(Color32::from_rgb(255, 214, 112)).strong()
+                                    } else {
+                                        RichText::new("Settings")
+                                    };
+                                    if ui
+                                        .add(egui::Button::new(set_lbl).selected(self.settings_open))
+                                        .on_hover_text("Open the full tabbed Service & Settings window")
+                                        .clicked()
+                                    {
+                                        self.settings_open = !self.settings_open;
                                     }
                                 });
                             });
@@ -5006,8 +5287,8 @@ impl CrtApp {
             .show(ui, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 central_rect = rect;
-                let max_w = (rect.width() - 260.0).max(380.0).min(620.0);
-                let drawer_w = self.sidebar_width.clamp(380.0, max_w);
+                let max_w = (rect.width() - 260.0).max(270.0).min(420.0);
+                let drawer_w = self.sidebar_width.clamp(270.0, max_w);
                 let drawer_vis_w = drawer_w * eased;
                 let drawer_x = rect.right() - drawer_vis_w;
                 let tab_w = 24.0;
@@ -5018,7 +5299,11 @@ impl CrtApp {
                 });
                 let over_drawer = self.sidebar_anim > 0.01
                     && ptr_pos.is_some_and(|p| p.x >= drawer_x - 6.0 && p.y >= rect.top());
-                let overlay_active = over_drawer || over_handle || self.sidebar_resizing || self.save_preset_open;
+                let over_settings = self.settings_open
+                    && self
+                        .settings_rect
+                        .is_some_and(|r| ptr_pos.is_some_and(|p| r.expand(6.0).contains(p)));
+                let overlay_active = over_drawer || over_handle || self.sidebar_resizing || self.save_preset_open || over_settings;
 
                 let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
                 self.tv_hovered = resp.hovered() && !overlay_active;
@@ -5374,10 +5659,10 @@ impl CrtApp {
                 }
             });
 
-        // Slide-in right service panel & translucent pull handle (works in both windowed and fullscreen)
+        // Slide-in right quick menu & translucent pull handle (works in both windowed and fullscreen)
         if central_rect.width() > 0.0 && central_rect.height() > 0.0 {
-            let max_w = (central_rect.width() - 260.0).max(380.0).min(620.0);
-            let drawer_w = self.sidebar_width.clamp(380.0, max_w);
+            let max_w = (central_rect.width() - 260.0).max(270.0).min(420.0);
+            let drawer_w = self.sidebar_width.clamp(270.0, max_w);
             let drawer_x = central_rect.right() - drawer_w * eased;
 
             let tab_w = 24.0;
@@ -5450,7 +5735,7 @@ impl CrtApp {
                                 }
                                 if rresp.dragged() {
                                     resizing = true;
-                                    self.sidebar_width = (self.sidebar_width - rresp.drag_delta().x).clamp(380.0, max_w);
+                                    self.sidebar_width = (self.sidebar_width - rresp.drag_delta().x).clamp(270.0, max_w);
                                     self.reset_trails = true;
                                 }
                             });
@@ -5458,15 +5743,15 @@ impl CrtApp {
                 }
                 self.sidebar_resizing = resizing;
 
+                let visible_drawer_rect = drawer_rect.intersect(central_rect);
                 egui::Area::new(egui::Id::unique("controls_drawer"))
                     .order(egui::Order::Foreground)
                     .fixed_pos(drawer_rect.min)
+                    .constrain(false)
                     .interactable(true)
                     .show(&ctx, |ui| {
-                        ui.set_clip_rect(central_rect);
-                        egui::Frame::NONE.show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(drawer_w, central_rect.height()));
-                            ui.set_max_size(egui::vec2(drawer_w, central_rect.height()));
+                        ui.set_clip_rect(visible_drawer_rect);
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(drawer_rect), |ui| {
                             self.sidebar_contents(ui);
                         });
                     });
@@ -5476,12 +5761,14 @@ impl CrtApp {
 
             // Retro walnut & brushed-metal pull handle: fades in on mouse movement or while open,
             // and melts completely away once the mouse idles; clicking toggles open/closed.
+            // Drawn on Order::Tooltip so clicking inside the drawer can never occlude the handle!
             if vis_eased > 0.004 {
                 let tab_x = (drawer_x - tab_w).max(central_rect.left());
                 let tab_pos = egui::pos2(tab_x, tab_top);
                 egui::Area::new(egui::Id::unique("controls_pull_tab"))
-                    .order(egui::Order::Foreground)
+                    .order(egui::Order::Tooltip)
                     .fixed_pos(tab_pos)
+                    .constrain(false)
                     .interactable(true)
                     .show(&ctx, |ui| {
                         ui.set_clip_rect(central_rect);
@@ -5548,6 +5835,9 @@ impl CrtApp {
         } else {
             self.sidebar_resizing = false;
         }
+
+        // Floating tabbed full-controls window
+        self.show_settings_window(&ctx);
 
         // Save-preset modal dialog
         if self.save_preset_open {
