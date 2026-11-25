@@ -25,10 +25,12 @@ ViCTR models the full analog television pipeline — from NTSC baseband encoding
   - Routes video audio (or 1 kHz colour-bars test tone) through VCR tape wow/flutter/hiss, RF FM sound hiss/static/clicks/intercarrier buzz, cabinet speaker frequency response (scaled to screen size), 15.7 kHz flyback whine, power crackle, and degauss coil buzz.
 - **Video & Image Playback**
   - Play local video files or URLs (via `mpv` / `yt-dlp`), drag and drop images or videos onto the window, forward your own `mpv` key bindings while hovering the screen, or install the built-in `Ctrl+T` mpv script to hand off playback from mpv directly to ViCTR.
-- **90s Prevue Cable Guide & Jellyfin Integration**
-  - Connect to your **Jellyfin** server (Server URL + API Key + User selector) to unlock a classic 1990s **Prevue Channel** split-screen cable guide rendered straight through the NTSC signal path (live video preview + Jellyfin artwork/synopsis + 30-minute scrolling grid).
+- **90s Prevue Cable Guide & Multi-Source Channels**
+  - Combine multiple sources into one seamless 1990s **Prevue Channel** split-screen cable guide rendered straight through the NTSC signal path (live video preview + artwork/synopsis + 30-minute scrolling grid):
+    - **Jellyfin Server**: Sign in with username/password or API key to sync series, movies, artwork, and watched/resume status.
+    - **Nested Local Folders**: Point at any local folder (`Show/Season 01/S01E01.mkv`, `Movies/Action/...`) to automatically build series & movie channels with local artwork (`poster`/`fanart`/`folder.*`) and local watched/resume tracking.
   - Automatically builds virtual channels: **`CH 01`** Program Guide, **`CH 02+`** per-series channels (Continue Watching & Favorites first, resuming your next unwatched episode and auto-advancing), and **`CH 50+`** 24/7 live-clock movie genre channels (`ACTION`, `COMEDY`, `SCI-FI`, etc.).
-  - Syncs playback progress & watched status back to Jellyfin after >20 seconds of viewing (so quick channel-surfing stays clean) and marks items watched at 90% completion.
+  - Syncs playback progress & watched status back to Jellyfin (or locally for folder channels) after >20 seconds of viewing (so quick channel-surfing stays clean) and marks items watched at 90% completion.
   - Injects a classic **phosphor-green/white TV OSD** (`CH 04`, call-sign, episode banner, `VOL |||||||---`, `MUTE`, `STEREO`/`MONO`) post-decoder into the electron guns, paired with a brief RF static burst & tuner click on channel switches.
 - **Slide-in Service Panel & Custom Presets**
   - Retro faux-walnut and brushed-metal slide-in controls drawer accessible in both windowed and fullscreen modes: a subtle low-opacity pull handle rests on the right edge, brightens on hover, and toggles the panel open or closed on click while the CRT glides smoothly alongside it.
@@ -145,8 +147,11 @@ src/
 ├── shaders.rs   # WGSL shader loader
 ├── shaders.wgsl # WGSL shaders (source, baseband, RF channel, decode, beam/mask, scan, glass, HDR present)
 ├── audio.rs     # Real-time analog TV/RF/VCR/cabinet audio DSP engine
-├── jellyfin.rs  # Jellyfin REST client, virtual channel builder, hybrid scheduler & watch sync
+├── provider.rs  # Provider-agnostic virtual TV channel domain & unified cable lineup builder
+├── folders.rs   # Recursive nested local folders provider, episode parser & local watch tracking
+├── jellyfin.rs  # Jellyfin REST client, auth, hybrid scheduler & watch sync
 ├── guide.rs     # 640×480 classic 1990s Prevue Channel split-screen bitmap renderer
+├── splash.rs    # Startup RF static -> classic blue screen CRT boot splash renderer
 ├── osd.rs       # 8×8 pixel font & post-decoder phosphor-green/white TV OSD
 ├── mpv.rs       # Video playback via dynamically loaded libmpv or mpv CLI fallback
 ├── link.rs      # Local IPC socket and mpv Ctrl+T handoff script installer

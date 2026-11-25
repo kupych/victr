@@ -4,8 +4,8 @@
 //! yellow cursor highlight, live preview window, and show info pass through
 //! real composite chroma bleed, dot crawl, scanlines, shadow mask, and halation.
 
-use crate::jellyfin::{ArtworkImage, Channel, ChannelKind, MediaItem};
 use crate::osd::Canvas;
+use crate::provider::{ArtworkImage, Channel, ChannelKind, MediaItem};
 use chrono::{Local, TimeZone, Utc};
 use std::sync::Arc;
 
@@ -562,9 +562,12 @@ impl GuideState {
                 };
                 let is_sel = idx == self.selected_idx;
                 let is_movie = matches!(ch.kind, ChannelKind::MovieGenre { .. });
+                let is_live = matches!(ch.kind, ChannelKind::LiveStream { .. });
 
                 let (c_fill, c_hi, c_lo, c_fg) = if is_sel {
                     ([244, 198, 52, 255], [255, 236, 148, 255], [154, 112, 16, 255], [10, 18, 44, 255])
+                } else if is_live {
+                    ([18, 92, 76, 255], [76, 188, 156, 255], [8, 44, 36, 255], [250, 224, 96, 255])
                 } else if is_movie {
                     ([34, 72, 128, 255], [96, 154, 220, 255], [14, 34, 68, 255], [248, 214, 96, 255])
                 } else {
@@ -591,6 +594,8 @@ impl GuideState {
 
                     let (fill, hi, lo, fg) = if is_sel {
                         ([246, 202, 58, 255], [255, 240, 162, 255], [156, 116, 18, 255], [10, 18, 44, 255])
+                    } else if is_live {
+                        ([14, 72, 62, 255], [64, 164, 140, 255], [8, 36, 30, 255], [234, 252, 246, 255])
                     } else if is_movie {
                         ([22, 60, 108, 255], [76, 134, 198, 255], [10, 28, 56, 255], [234, 246, 255, 255])
                     } else {
@@ -601,6 +606,8 @@ impl GuideState {
                     let mut label = String::new();
                     if entry.start_unix < win_start {
                         label.push_str("< ");
+                    } else if is_live {
+                        label.push_str("► LIVE ");
                     } else if entry.is_live_in_progress && is_movie {
                         label.push_str("► ");
                     }
@@ -679,12 +686,14 @@ fn wrap_text(text: &str, max_cols: usize, max_lines: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jellyfin::MediaItem;
+    use crate::provider::MediaItem;
 
     #[test]
     fn guide_renders_and_hit_tests_rows() {
         let ch1 = Channel {
             number: 1,
+            provider_id: "guide".into(),
+            source_key: "guide".into(),
             callsign: "GUIDE".into(),
             name: "Program Guide".into(),
             artwork_id: String::new(),
@@ -692,6 +701,8 @@ mod tests {
         };
         let ch2 = Channel {
             number: 2,
+            provider_id: "jellyfin".into(),
+            source_key: "s1".into(),
             callsign: "SEINF".into(),
             name: "Seinfeld".into(),
             artwork_id: String::new(),
@@ -710,6 +721,7 @@ mod tests {
                     played: false,
                     resume_secs: 0.0,
                     artwork_id: "s1".into(),
+                    stream_url: "http://example/e1".into(),
                 }],
                 next_up_episode_id: Some("e1".into()),
                 loaded_episodes: true,

@@ -1021,6 +1021,11 @@ impl StartupDestination {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum LastWatched {
+    Channel {
+        provider_id: String,
+        source_key: String,
+        channel_name: String,
+    },
     JellyfinSeries {
         series_id: String,
         channel_name: String,
@@ -1040,6 +1045,7 @@ pub enum LastWatched {
 impl LastWatched {
     pub fn label(&self) -> String {
         match self {
+            LastWatched::Channel { channel_name, .. } => channel_name.clone(),
             LastWatched::JellyfinSeries { channel_name, .. } => channel_name.clone(),
             LastWatched::JellyfinGenre { genre } => format!("{genre} Movies"),
             LastWatched::LocalVideo { src, .. } => std::path::Path::new(src)

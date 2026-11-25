@@ -3,12 +3,14 @@
 mod about;
 mod app;
 mod audio;
+mod folders;
 mod gpu;
 mod guide;
 mod jellyfin;
 mod link;
 mod mpv;
 mod osd;
+mod provider;
 mod settings;
 mod shaders;
 mod sim;
