@@ -206,7 +206,7 @@ impl Runtime {
         if let Some(t) = cli.degauss_at {
             app.set_degauss_time(t);
         }
-        if cli.fullscreen {
+        if cli.fullscreen || (!shot && app.wants_start_fullscreen()) {
             app.start_fullscreen(!shot);
         }
 

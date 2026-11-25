@@ -590,7 +590,11 @@ impl CrtApp {
         self.pending_fullscreen = Some(on);
     }
 
-    /// Starts in fullscreen (the --fullscreen option).
+    pub fn wants_start_fullscreen(&self) -> bool {
+        self.app_cfg.start_fullscreen
+    }
+
+    /// Starts in fullscreen (the --fullscreen option or Start in fullscreen preference).
     pub fn start_fullscreen(&mut self, real_window: bool) {
         if real_window {
             self.set_fullscreen(true);
@@ -912,6 +916,13 @@ impl CrtApp {
                         self.reset_trails = true;
                     }
                 });
+                if ui
+                    .checkbox(&mut self.app_cfg.start_fullscreen, "Start in fullscreen")
+                    .on_hover_text("Automatically launch ViCTR in borderless fullscreen (F11 or Esc to exit).")
+                    .changed()
+                {
+                    let _ = settings::save_app_config(&self.app_cfg);
+                }
                 let mut dest = self.app_cfg.startup_dest;
                 ui.horizontal(|ui| {
                     ui.label("On startup open");
@@ -4151,6 +4162,14 @@ impl CrtApp {
                 });
                 if !self.about_msg.is_empty() {
                     ui.label(RichText::new(&self.about_msg).small());
+                }
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.app_cfg.start_fullscreen, "Start in fullscreen")
+                    .on_hover_text("Automatically launch ViCTR in borderless fullscreen (F11 or Esc to exit).")
+                    .changed()
+                {
+                    let _ = settings::save_app_config(&self.app_cfg);
                 }
             });
     }

@@ -1069,6 +1069,8 @@ pub struct AppConfig {
     #[serde(default = "default_true")]
     pub splash_screen: bool,
     #[serde(default)]
+    pub start_fullscreen: bool,
+    #[serde(default)]
     pub startup_dest: StartupDestination,
     #[serde(default)]
     pub last_watched: Option<LastWatched>,
@@ -1080,6 +1082,7 @@ impl Default for AppConfig {
             default_preset: None,
             cold_power_on: true,
             splash_screen: true,
+            start_fullscreen: false,
             startup_dest: StartupDestination::Guide,
             last_watched: None,
         }
@@ -1204,6 +1207,7 @@ mod tests {
             default_preset: Some(StartupPreset::User("sony-pvm-warm.preset".into())),
             cold_power_on: false,
             splash_screen: true,
+            start_fullscreen: true,
             startup_dest: StartupDestination::LastWatched,
             last_watched: Some(LastWatched::JellyfinSeries {
                 series_id: "simpsons-id".into(),
@@ -1216,6 +1220,7 @@ mod tests {
         assert_eq!(loaded.default_preset, Some(StartupPreset::User("sony-pvm-warm.preset".into())));
         assert!(!loaded.cold_power_on);
         assert!(loaded.splash_screen);
+        assert!(loaded.start_fullscreen);
         assert_eq!(loaded.startup_dest, StartupDestination::LastWatched);
         assert_eq!(loaded.last_watched.as_ref().map(|w| w.label()), Some("The Simpsons".into()));
 
@@ -1223,6 +1228,7 @@ mod tests {
             default_preset: Some(StartupPreset::BuiltIn(4)),
             cold_power_on: true,
             splash_screen: false,
+            start_fullscreen: false,
             startup_dest: StartupDestination::DefaultPattern,
             last_watched: None,
         };
@@ -1231,6 +1237,7 @@ mod tests {
         assert_eq!(loaded2.default_preset, Some(StartupPreset::BuiltIn(4)));
         assert!(loaded2.cold_power_on);
         assert!(!loaded2.splash_screen);
+        assert!(!loaded2.start_fullscreen);
         assert_eq!(loaded2.startup_dest, StartupDestination::DefaultPattern);
 
         let _ = std::fs::remove_dir_all(&dir);
