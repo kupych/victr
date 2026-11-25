@@ -1598,6 +1598,156 @@ impl CrtApp {
         self.osd.show_channel(ch_num, "GAME", &title, self.s.mono);
     }
 
+    fn retro_gamepad_selector(&mut self, ui: &mut egui::Ui, id_salt: &str) {
+        let cur = self.retro.cfg.gamepad_device.clone();
+        let cur_label = if cur.is_empty() {
+            "Auto (all gamepads)".to_string()
+        } else {
+            self.retro
+                .gamepads
+                .iter()
+                .find(|g| g.id == cur || g.path == cur)
+                .map(|g| g.display_label())
+                .unwrap_or_else(|| format!("{cur} (disconnected)"))
+        };
+        let mut chosen: Option<String> = None;
+        let mut refresh = false;
+        ui.horizontal(|ui| {
+            ui.label("Controller");
+            egui::ComboBox::from_id_salt(id_salt)
+                .selected_text(cur_label)
+                .width(195.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(cur.is_empty(), "Auto (all gamepads)")
+                        .on_hover_text("Automatically uses all connected gamepads and skips RGB/LED/mouse HID devices.")
+                        .clicked()
+                    {
+                        chosen = Some(String::new());
+                    }
+                    let real_gps: Vec<_> = self.retro.gamepads.iter().filter(|g| g.is_gamepad).cloned().collect();
+                    let other_gps: Vec<_> = self.retro.gamepads.iter().filter(|g| !g.is_gamepad).cloned().collect();
+                    if !real_gps.is_empty() {
+                        ui.separator();
+                        ui.label(RichText::new("Detected gamepads").weak().small());
+                        for g in &real_gps {
+                            let sel = cur == g.id || cur == g.path;
+                            if ui.selectable_label(sel, g.display_label()).clicked() {
+                                chosen = Some(g.id.clone());
+                            }
+                        }
+                    }
+                    if !other_gps.is_empty() {
+                        ui.separator();
+                        ui.label(RichText::new("Other js* devices (non-gamepad)").weak().small());
+                        for g in &other_gps {
+                            let sel = cur == g.id || cur == g.path;
+                            if ui.selectable_label(sel, g.display_label()).clicked() {
+                                chosen = Some(g.id.clone());
+                            }
+                        }
+                    }
+                });
+            if ui
+                .small_button("↻")
+                .on_hover_text("Rescan connected USB/Bluetooth controllers")
+                .clicked()
+            {
+                refresh = true;
+            }
+        });
+        if refresh {
+            self.retro.refresh_gamepads();
+        }
+        if let Some(dev) = chosen {
+            let osd_name = if dev.is_empty() {
+                "AUTO GAMEPADS".to_string()
+            } else {
+                self.retro
+                    .gamepads
+                    .iter()
+                    .find(|g| g.id == dev)
+                    .map(|g| if g.name.is_empty() { g.id.clone() } else { g.name.clone() })
+                    .unwrap_or_else(|| dev.clone())
+            };
+            self.retro.set_gamepad_device(dev.clone());
+            if let Some(rp) = &self.retro_player {
+                rp.set_gamepad(dev);
+            }
+            self.osd.show_action(&format!("PAD: {osd_name}"));
+        }
+    }
+
+    fn retro_running_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(rp) = &self.retro_player else { return };
+        let (gname, cname, status, active_gp, paused, running) = {
+            let sh = rp.shared.lock().unwrap();
+            (
+                sh.game_name.clone(),
+                sh.core_name.clone(),
+                sh.status.clone(),
+                sh.active_gamepad.clone(),
+                sh.paused,
+                sh.running,
+            )
+        };
+        let hdr = if running {
+            format!("Game Console · {gname}")
+        } else {
+            format!("Game Console (CH {:02})", self.retro.cfg.channel_number.max(2))
+        };
+        egui::CollapsingHeader::new(RichText::new(hdr).strong().color(Color32::from_rgb(138, 240, 178)))
+            .id_salt("retro_running_menu")
+            .default_open(true)
+            .show(ui, |ui| {
+                if !cname.is_empty() {
+                    ui.label(RichText::new(format!("{status}")).weak().small());
+                } else if !status.is_empty() {
+                    ui.label(RichText::new(status).weak().small());
+                }
+                self.retro_gamepad_selector(ui, "retro_gp_running");
+                if running && !active_gp.is_empty() {
+                    ui.label(
+                        RichText::new(format!("Active: {active_gp}"))
+                            .small()
+                            .color(Color32::from_rgb(156, 224, 186)),
+                    );
+                }
+                let mut eject = false;
+                if let Some(rp) = &self.retro_player {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        if running {
+                            if ui.small_button(if paused { "Resume" } else { "Pause" }).clicked() {
+                                rp.toggle_pause();
+                            }
+                            if ui.small_button("Reset (F1)").clicked() {
+                                rp.reset();
+                                self.osd.show_action("CONSOLE RESET");
+                            }
+                            if ui.small_button("Save (F2)").clicked() {
+                                rp.save_state();
+                                self.osd.show_action("STATE SAVED");
+                            }
+                            if ui.small_button("Load (F4)").clicked() {
+                                rp.load_state();
+                                self.osd.show_action("STATE LOADED");
+                            }
+                            if ui.small_button("Eject").clicked() {
+                                eject = true;
+                            }
+                        } else if ui.small_button("Load ROM…").clicked() {
+                            self.message = "pickrom".into();
+                        }
+                    });
+                }
+                if eject {
+                    self.retro_player = None;
+                }
+            });
+        ui.separator();
+    }
+
     fn channels_controls(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new(RichText::new("Channels & Sources").strong())
             .default_open(false)
@@ -2092,10 +2242,18 @@ impl CrtApp {
                                     });
                             });
                         }
+                        self.retro_gamepad_selector(ui, "retro_gp_src");
                         if let Some(rp) = &self.retro_player {
-                            let (gname, cname, status, paused, running) = {
+                            let (gname, cname, status, active_gp, paused, running) = {
                                 let sh = rp.shared.lock().unwrap();
-                                (sh.game_name.clone(), sh.core_name.clone(), sh.status.clone(), sh.paused, sh.running)
+                                (
+                                    sh.game_name.clone(),
+                                    sh.core_name.clone(),
+                                    sh.status.clone(),
+                                    sh.active_gamepad.clone(),
+                                    sh.paused,
+                                    sh.running,
+                                )
                             };
                             ui.separator();
                             let title_line = if cname.is_empty() {
@@ -2105,6 +2263,9 @@ impl CrtApp {
                             };
                             ui.label(RichText::new(title_line).strong().small().color(Color32::from_rgb(138, 240, 178)));
                             ui.label(RichText::new(status).weak().small());
+                            if running && !active_gp.is_empty() {
+                                ui.label(RichText::new(format!("Active pad: {active_gp}")).weak().small());
+                            }
                             let mut eject = false;
                             if running {
                                 ui.horizontal(|ui| {
@@ -3051,10 +3212,12 @@ impl CrtApp {
                 .cloned()
                 {
                     let ring = self.audio.as_ref().map(|a| a.ring.clone());
+                    let gamepad_dev = self.retro.cfg.gamepad_device.clone();
                     self.retro_player = Some(RetroPlayer::start(
                         core.path,
                         std::path::PathBuf::from(&rom_path),
                         ring,
+                        gamepad_dev,
                     ));
                     self.retro.set_last_rom(&rom_path);
                     self.rebuild_lineup();
@@ -3809,6 +3972,7 @@ impl CrtApp {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.set_width((ui.available_width() - 6.0).max(200.0));
                 ui.add_space(2.0);
+                self.retro_running_controls(ui);
                 self.preset_controls(ui);
                 self.channels_controls(ui);
                 self.video_controls(ui);

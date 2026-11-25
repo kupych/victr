@@ -97,6 +97,9 @@ pub struct RetroConfig {
     pub preferred_cores: HashMap<String, String>,
     #[serde(default)]
     pub last_rom: String,
+    /// Selected Linux joystick device (`""` = Auto all real gamepads, or `"js1"` / `"/dev/input/js1"`).
+    #[serde(default)]
+    pub gamepad_device: String,
 }
 
 impl Default for RetroConfig {
@@ -108,6 +111,7 @@ impl Default for RetroConfig {
             custom_core_dir: String::new(),
             preferred_cores: HashMap::new(),
             last_rom: String::new(),
+            gamepad_device: String::new(),
         }
     }
 }
@@ -480,96 +484,270 @@ pub const BTN_X: u16 = 1 << 9;
 pub const BTN_L: u16 = 1 << 10;
 pub const BTN_R: u16 = 1 << 11;
 
-// ------------------------------------------------------------------ Native Linux `/dev/input/js0` Gamepad Reader
+// ------------------------------------------------------------------ Native Linux `/dev/input/js*` Gamepad Discovery & Reader
 
-#[cfg(target_os = "linux")]
-struct LinuxGamepad {
-    file: Option<std::fs::File>,
-    last_probe: Instant,
-    buttons: u16,
-    axis_bits: u16,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GamepadInfo {
+    pub id: String,
+    pub path: String,
+    pub name: String,
+    pub is_gamepad: bool,
+}
+
+impl GamepadInfo {
+    pub fn display_label(&self) -> String {
+        if self.name.is_empty() {
+            self.id.clone()
+        } else {
+            format!("{} — {}", self.id, self.name)
+        }
+    }
+}
+
+fn parse_sysfs_bitset(raw: &str) -> Vec<u64> {
+    raw.split_whitespace()
+        .rev()
+        .map(|w| u64::from_str_radix(w, 16).unwrap_or(0))
+        .collect()
+}
+
+fn bitset_has(words: &[u64], bit: usize) -> bool {
+    let wi = bit / 64;
+    let bi = bit % 64;
+    words.get(wi).is_some_and(|w| (w & (1u64 << bi)) != 0)
+}
+
+fn looks_like_non_gamepad(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    [
+        "led controller",
+        "rgb",
+        "aura",
+        "mystic light",
+        "keyboard",
+        "mouse",
+        "touchpad",
+        "trackpad",
+        "accelerometer",
+        "gyro",
+        "sensor",
+        "consumer control",
+        "system control",
+    ]
+    .iter()
+    .any(|kw| low.contains(kw))
+}
+
+fn classify_gamepad(name: &str, key_words: &[u64]) -> bool {
+    if looks_like_non_gamepad(name) {
+        return false;
+    }
+    // BTN_SOUTH / BTN_GAMEPAD (0x130) or BTN_JOYSTICK (0x120)
+    bitset_has(key_words, 0x130) || bitset_has(key_words, 0x120)
+}
+
+fn is_nintendo_layout(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    low.contains("nintendo") || low.contains("pro controller") || low.contains("joy-con") || low.contains("switch")
+}
+
+/// Replicates Linux `drivers/input/joydev.c` button numbering from `capabilities/key`.
+fn build_joydev_button_map(key_words: &[u64], nintendo_layout: bool) -> Vec<u16> {
+    if key_words.is_empty() {
+        return vec![BTN_B, BTN_A, BTN_Y, BTN_X, BTN_L, BTN_R, BTN_SELECT, BTN_START];
+    }
+    let map_code = |code: usize| -> u16 {
+        match code {
+            0x130 => BTN_B, // BTN_SOUTH
+            0x131 => BTN_A, // BTN_EAST
+            0x133 => {
+                if nintendo_layout { BTN_X } else { BTN_Y } // BTN_NORTH (Nintendo X / Xbox X)
+            }
+            0x134 => {
+                if nintendo_layout { BTN_Y } else { BTN_X } // BTN_WEST (Nintendo Y / Xbox Y)
+            }
+            0x136 | 0x138 => BTN_L, // BTN_TL / BTN_TL2
+            0x137 | 0x139 => BTN_R, // BTN_TR / BTN_TR2
+            0x13a => BTN_SELECT,    // BTN_SELECT
+            0x13b => BTN_START,     // BTN_START
+            0x220 => BTN_UP,        // BTN_DPAD_UP
+            0x221 => BTN_DOWN,      // BTN_DPAD_DOWN
+            0x222 => BTN_LEFT,      // BTN_DPAD_LEFT
+            0x223 => BTN_RIGHT,     // BTN_DPAD_RIGHT
+            _ => 0,
+        }
+    };
+    let max_bit = (key_words.len() * 64).min(0x300);
+    let mut out = Vec::new();
+    for code in 0x120..max_bit {
+        if bitset_has(key_words, code) {
+            out.push(map_code(code));
+        }
+    }
+    for code in 0x100..0x120.min(max_bit) {
+        if bitset_has(key_words, code) {
+            out.push(map_code(code));
+        }
+    }
+    out
+}
+
+/// Replicates Linux `drivers/input/joydev.c` axis numbering from `capabilities/abs`.
+fn build_joydev_axis_map(abs_words: &[u64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let max_bit = (abs_words.len() * 64).min(64);
+    for code in 0..max_bit {
+        if bitset_has(abs_words, code) {
+            out.push(code as u8);
+        }
+    }
+    out
 }
 
 #[cfg(target_os = "linux")]
-impl LinuxGamepad {
-    fn new() -> Self {
-        let mut gp = Self {
-            file: None,
-            last_probe: Instant::now() - Duration::from_secs(5),
-            buttons: 0,
-            axis_bits: 0,
-        };
-        gp.try_open();
-        gp
+pub fn discover_gamepads() -> Vec<GamepadInfo> {
+    let mut found: Vec<(u32, GamepadInfo)> = Vec::new();
+    let Ok(rd) = std::fs::read_dir("/sys/class/input") else {
+        return Vec::new();
+    };
+    for entry in rd.flatten() {
+        let id = entry.file_name().to_string_lossy().into_owned();
+        let Some(num_str) = id.strip_prefix("js") else { continue };
+        let Ok(idx) = num_str.parse::<u32>() else { continue };
+        let dev_path = format!("/dev/input/{id}");
+        if !Path::new(&dev_path).exists() {
+            continue;
+        }
+        let sys_dev = entry.path().join("device");
+        let name = std::fs::read_to_string(sys_dev.join("name"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let key_words = std::fs::read_to_string(sys_dev.join("capabilities/key"))
+            .map(|s| parse_sysfs_bitset(&s))
+            .unwrap_or_default();
+        let is_gamepad = classify_gamepad(&name, &key_words);
+        found.push((
+            idx,
+            GamepadInfo {
+                id,
+                path: dev_path,
+                name,
+                is_gamepad,
+            },
+        ));
     }
+    found.sort_by_key(|(idx, _)| *idx);
+    found.into_iter().map(|(_, info)| info).collect()
+}
 
-    fn try_open(&mut self) {
+#[cfg(not(target_os = "linux"))]
+pub fn discover_gamepads() -> Vec<GamepadInfo> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+struct OpenGamepad {
+    id: String,
+    name: String,
+    file: std::fs::File,
+    btn_map: Vec<u16>,
+    axis_map: Vec<u8>,
+    buttons: u16,
+    stick_bits: u16,
+    hat_bits: u16,
+}
+
+#[cfg(target_os = "linux")]
+impl OpenGamepad {
+    fn open(info: &GamepadInfo) -> Option<Self> {
         use std::os::unix::fs::OpenOptionsExt;
-        if self.file.is_some() || self.last_probe.elapsed() < Duration::from_secs(2) {
-            return;
-        }
-        self.last_probe = Instant::now();
-        for idx in 0..4 {
-            let p = format!("/dev/input/js{idx}");
-            if let Ok(f) = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(0x800) // O_NONBLOCK
-                .open(&p)
-            {
-                self.file = Some(f);
-                return;
-            }
-        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x800) // O_NONBLOCK
+            .open(&info.path)
+            .ok()?;
+        let sys_dev = PathBuf::from("/sys/class/input").join(&info.id).join("device");
+        let key_words = std::fs::read_to_string(sys_dev.join("capabilities/key"))
+            .map(|s| parse_sysfs_bitset(&s))
+            .unwrap_or_default();
+        let abs_words = std::fs::read_to_string(sys_dev.join("capabilities/abs"))
+            .map(|s| parse_sysfs_bitset(&s))
+            .unwrap_or_default();
+        let btn_map = build_joydev_button_map(&key_words, is_nintendo_layout(&info.name));
+        let axis_map = build_joydev_axis_map(&abs_words);
+        Some(Self {
+            id: info.id.clone(),
+            name: if info.name.is_empty() { info.id.clone() } else { info.name.clone() },
+            file,
+            btn_map,
+            axis_map,
+            buttons: 0,
+            stick_bits: 0,
+            hat_bits: 0,
+        })
     }
 
-    fn poll_mask(&mut self) -> u16 {
+    fn poll(&mut self) -> Result<u16, ()> {
         use std::io::Read;
-        self.try_open();
-        let Some(ref mut f) = self.file else { return 0 };
         let mut ev = [0u8; 8];
         loop {
-            match f.read(&mut ev) {
+            match self.file.read(&mut ev) {
                 Ok(8) => {
                     let value = i16::from_le_bytes([ev[4], ev[5]]);
                     let kind = ev[6] & !0x80; // strip JS_EVENT_INIT
-                    let number = ev[7];
+                    let number = ev[7] as usize;
                     if kind == 1 {
-                        // Standard Linux gamepad button order (Xbox / DualSense / 8BitDo):
-                        // 0=A(south->B), 1=B(east->A), 2=X(west->Y), 3=Y(north->X), 4=L, 5=R, 6=Select, 7=Start
-                        let bit = match number {
-                            0 => BTN_B,
-                            1 => BTN_A,
-                            2 => BTN_Y,
-                            3 => BTN_X,
-                            4 => BTN_L,
-                            5 => BTN_R,
-                            6 | 8 => BTN_SELECT,
-                            7 | 9 => BTN_START,
-                            _ => 0,
-                        };
+                        let bit = self.btn_map.get(number).copied().unwrap_or(0);
                         if value != 0 {
                             self.buttons |= bit;
                         } else {
                             self.buttons &= !bit;
                         }
                     } else if kind == 2 {
-                        // Axes: 0/6 = X (left stick / D-pad), 1/7 = Y (left stick / D-pad)
                         const DEAD: i16 = 12000;
-                        match number {
-                            0 | 6 => {
-                                self.axis_bits &= !(BTN_LEFT | BTN_RIGHT);
+                        let abs_code = self.axis_map.get(number).copied().unwrap_or_else(|| match number {
+                            0 => 0,
+                            1 => 1,
+                            6 => 16,
+                            7 => 17,
+                            _ => 255,
+                        });
+                        match abs_code {
+                            0 => {
+                                // ABS_X (left stick horizontal)
+                                self.stick_bits &= !(BTN_LEFT | BTN_RIGHT);
                                 if value < -DEAD {
-                                    self.axis_bits |= BTN_LEFT;
+                                    self.stick_bits |= BTN_LEFT;
                                 } else if value > DEAD {
-                                    self.axis_bits |= BTN_RIGHT;
+                                    self.stick_bits |= BTN_RIGHT;
                                 }
                             }
-                            1 | 7 => {
-                                self.axis_bits &= !(BTN_UP | BTN_DOWN);
+                            1 => {
+                                // ABS_Y (left stick vertical)
+                                self.stick_bits &= !(BTN_UP | BTN_DOWN);
                                 if value < -DEAD {
-                                    self.axis_bits |= BTN_UP;
+                                    self.stick_bits |= BTN_UP;
                                 } else if value > DEAD {
-                                    self.axis_bits |= BTN_DOWN;
+                                    self.stick_bits |= BTN_DOWN;
+                                }
+                            }
+                            16 => {
+                                // ABS_HAT0X (D-pad horizontal)
+                                self.hat_bits &= !(BTN_LEFT | BTN_RIGHT);
+                                if value < -DEAD {
+                                    self.hat_bits |= BTN_LEFT;
+                                } else if value > DEAD {
+                                    self.hat_bits |= BTN_RIGHT;
+                                }
+                            }
+                            17 => {
+                                // ABS_HAT0Y (D-pad vertical)
+                                self.hat_bits &= !(BTN_UP | BTN_DOWN);
+                                if value < -DEAD {
+                                    self.hat_bits |= BTN_UP;
+                                } else if value > DEAD {
+                                    self.hat_bits |= BTN_DOWN;
                                 }
                             }
                             _ => {}
@@ -578,15 +756,114 @@ impl LinuxGamepad {
                 }
                 Ok(_) => break,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => {
-                    self.file = None;
-                    self.buttons = 0;
-                    self.axis_bits = 0;
-                    break;
+                Err(_) => return Err(()),
+            }
+        }
+        Ok(self.buttons | self.stick_bits | self.hat_bits)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxGamepad {
+    selected: String, // "" = auto (all real gamepads), or "js1" / "/dev/input/js1"
+    devices: Vec<OpenGamepad>,
+    last_probe: Instant,
+    changed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxGamepad {
+    fn new(selected: String) -> Self {
+        let mut gp = Self {
+            selected,
+            devices: Vec::new(),
+            last_probe: Instant::now() - Duration::from_secs(5),
+            changed: true,
+        };
+        gp.refresh_devices();
+        gp
+    }
+
+    fn set_selected(&mut self, selected: String) {
+        self.selected = selected;
+        self.devices.clear();
+        self.last_probe = Instant::now() - Duration::from_secs(5);
+        self.changed = true;
+        self.refresh_devices();
+    }
+
+    fn active_summary(&self) -> String {
+        if self.devices.is_empty() {
+            if self.selected.is_empty() {
+                "None (keyboard only)".into()
+            } else {
+                format!("{} not connected (keyboard only)", self.selected)
+            }
+        } else {
+            self.devices
+                .iter()
+                .map(|d| format!("{} ({})", d.name, d.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+
+    fn take_changed_summary(&mut self) -> Option<String> {
+        if self.changed {
+            self.changed = false;
+            Some(self.active_summary())
+        } else {
+            None
+        }
+    }
+
+    fn refresh_devices(&mut self) {
+        if self.last_probe.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.last_probe = Instant::now();
+        let all = discover_gamepads();
+        let sel = self.selected.trim();
+        let wanted: Vec<&GamepadInfo> = if sel.is_empty() {
+            all.iter().filter(|g| g.is_gamepad).collect()
+        } else {
+            all.iter().filter(|g| g.id == sel || g.path == sel).collect()
+        };
+
+        // Remove any currently-open devices no longer in `wanted`
+        let before = self.devices.len();
+        self.devices.retain(|d| wanted.iter().any(|w| w.id == d.id));
+        if self.devices.len() != before {
+            self.changed = true;
+        }
+        // Open any newly attached wanted devices
+        for info in wanted {
+            if !self.devices.iter().any(|d| d.id == info.id) {
+                if let Some(opened) = OpenGamepad::open(info) {
+                    self.devices.push(opened);
+                    self.changed = true;
                 }
             }
         }
-        self.buttons | self.axis_bits
+    }
+
+    fn poll_mask(&mut self) -> u16 {
+        self.refresh_devices();
+        let mut mask = 0u16;
+        let mut i = 0;
+        while i < self.devices.len() {
+            match self.devices[i].poll() {
+                Ok(m) => {
+                    mask |= m;
+                    i += 1;
+                }
+                Err(()) => {
+                    self.devices.remove(i);
+                    self.changed = true;
+                }
+            }
+        }
+        mask
     }
 }
 
@@ -595,7 +872,10 @@ struct LinuxGamepad;
 
 #[cfg(not(target_os = "linux"))]
 impl LinuxGamepad {
-    fn new() -> Self { Self }
+    fn new(_selected: String) -> Self { Self }
+    fn set_selected(&mut self, _selected: String) {}
+    fn active_summary(&self) -> String { "Keyboard only".into() }
+    fn take_changed_summary(&mut self) -> Option<String> { None }
     fn poll_mask(&mut self) -> u16 { 0 }
 }
 
@@ -1031,6 +1311,7 @@ pub struct RetroShared {
     pub core_name: String,
     pub game_name: String,
     pub status: String,
+    pub active_gamepad: String,
     pub paused: bool,
     pub running: bool,
 }
@@ -1040,6 +1321,7 @@ enum RetroCmd {
     Reset,
     SaveState,
     LoadState,
+    SetGamepad(String),
     Stop,
 }
 
@@ -1074,6 +1356,7 @@ impl RetroPlayer {
             } else {
                 msg.to_string()
             },
+            active_gamepad: String::new(),
             paused: false,
             running: false,
         }));
@@ -1090,6 +1373,7 @@ impl RetroPlayer {
         core_path: PathBuf,
         rom_path: PathBuf,
         ring: Option<Arc<AudioRing>>,
+        gamepad_device: String,
     ) -> Self {
         let game_name = rom_path
             .file_stem()
@@ -1108,6 +1392,7 @@ impl RetroPlayer {
             core_name: core_name.clone(),
             game_name: game_name.clone(),
             status: format!("Booting {game_name} ({core_name})…"),
+            active_gamepad: "Detecting…".into(),
             paused: false,
             running: true,
         }));
@@ -1120,7 +1405,7 @@ impl RetroPlayer {
         let stop_bg = stop.clone();
 
         let join = std::thread::spawn(move || {
-            if let Err(err) = run_core_loop(&core_path, &rom_path, ring, &sh_bg, km_bg, &stop_bg, rx) {
+            if let Err(err) = run_core_loop(&core_path, &rom_path, ring, gamepad_device, &sh_bg, km_bg, &stop_bg, rx) {
                 let mut g = sh_bg.lock().unwrap();
                 g.status = err.clone();
                 g.running = false;
@@ -1153,6 +1438,10 @@ impl RetroPlayer {
     pub fn load_state(&self) {
         let _ = self.tx.send(RetroCmd::LoadState);
     }
+
+    pub fn set_gamepad(&self, device: String) {
+        let _ = self.tx.send(RetroCmd::SetGamepad(device));
+    }
 }
 
 fn srm_path_for(rom_path: &Path) -> PathBuf {
@@ -1173,6 +1462,7 @@ fn run_core_loop(
     core_path: &Path,
     rom_path: &Path,
     ring: Option<Arc<AudioRing>>,
+    gamepad_device: String,
     shared: &Arc<Mutex<RetroShared>>,
     key_mask: Arc<AtomicU16>,
     stop: &Arc<AtomicBool>,
@@ -1221,8 +1511,11 @@ fn run_core_loop(
         shared: shared.clone(),
         input_mask: 0,
         key_mask,
-        gamepad: LinuxGamepad::new(),
+        gamepad: LinuxGamepad::new(gamepad_device),
     });
+    if let Some(summary) = ctx.gamepad.take_changed_summary() {
+        shared.lock().unwrap().active_gamepad = summary;
+    }
 
     let ctx_raw: *mut CoreRuntime = &mut *ctx;
     TLS_CTX.with(|c| *c.borrow_mut() = ctx_raw);
@@ -1365,6 +1658,10 @@ fn run_core_loop(
                         }
                     }
                 }
+                RetroCmd::SetGamepad(dev) => {
+                    ctx.gamepad.set_selected(dev);
+                    shared.lock().unwrap().active_gamepad = ctx.gamepad.active_summary();
+                }
             }
         }
         if stop.load(Ordering::Relaxed) {
@@ -1376,6 +1673,9 @@ fn run_core_loop(
         }
 
         unsafe { f_run() };
+        if let Some(summary) = ctx.gamepad.take_changed_summary() {
+            shared.lock().unwrap().active_gamepad = summary;
+        }
 
         next_tick += frame_dur;
         let now = Instant::now();
@@ -1411,6 +1711,7 @@ fn run_core_loop(
 pub struct RetroManager {
     pub cfg: RetroConfig,
     pub cores: Vec<CoreInfo>,
+    pub gamepads: Vec<GamepadInfo>,
     pub channel: Option<Channel>,
     pub status: String,
 }
@@ -1420,6 +1721,7 @@ impl RetroManager {
         Self {
             cfg: RetroConfig::default(),
             cores: Vec::new(),
+            gamepads: Vec::new(),
             channel: None,
             status: String::new(),
         }
@@ -1435,8 +1737,20 @@ impl RetroManager {
         mgr
     }
 
+    pub fn refresh_gamepads(&mut self) {
+        self.gamepads = discover_gamepads();
+    }
+
+    pub fn set_gamepad_device(&mut self, device: String) {
+        if self.cfg.gamepad_device != device {
+            self.cfg.gamepad_device = device;
+            let _ = save_config(&self.cfg);
+        }
+    }
+
     pub fn rescan(&mut self) {
         self.cores = discover_cores(&self.cfg.custom_core_dir);
+        self.gamepads = discover_gamepads();
         self.channel = build_console_channel(&self.cfg, &self.cores);
         let n_roms = self
             .channel
@@ -1516,5 +1830,50 @@ mod tests {
         assert_eq!(f.0, 640);
         assert_eq!(f.1, 480);
         assert_eq!(f.2.len(), 640 * 480 * 4);
+    }
+
+    #[test]
+    fn gamepad_classification_and_dynamic_mapping_match_real_devices() {
+        // Real sysfs capabilities captured from Linux:
+        // 1. ASRock LED Controller (bogus js0 HID device -> must NOT classify as gamepad)
+        let led_keys = parse_sysfs_bitset(
+            "c000 0 0 40000001000000 1200000000 c00000000000000 100000800000000 40000010cc00 10168000000000 0",
+        );
+        assert!(!classify_gamepad("ASRock LED Controller", &led_keys));
+
+        // 2. Razer Wolverine V3 Pro (Xbox layout: D-pad on abs 6,7; L/R on 4,5; Select/Start on 6,7)
+        let razer_keys = parse_sysfs_bitset("7cdb000000000000 0 0 0 0");
+        let razer_abs = parse_sysfs_bitset("3003f");
+        assert!(classify_gamepad("Razer Wolverine V3 Pro (2.4 GHz Dongle)", &razer_keys));
+        let razer_btns = build_joydev_button_map(&razer_keys, is_nintendo_layout("Razer Wolverine V3 Pro"));
+        assert_eq!(razer_btns[0], BTN_B);
+        assert_eq!(razer_btns[1], BTN_A);
+        assert_eq!(razer_btns[2], BTN_Y);
+        assert_eq!(razer_btns[3], BTN_X);
+        assert_eq!(razer_btns[4], BTN_L);
+        assert_eq!(razer_btns[5], BTN_R);
+        assert_eq!(razer_btns[6], BTN_SELECT);
+        assert_eq!(razer_btns[7], BTN_START);
+        let razer_axes = build_joydev_axis_map(&razer_abs);
+        assert_eq!(razer_axes[6], 16); // ABS_HAT0X
+        assert_eq!(razer_axes[7], 17); // ABS_HAT0Y
+
+        // 3. Nintendo Switch Pro Controller (hid-nintendo: Capture at btn 4, L/R at 5/6, Select/Start at 9/10, D-pad at abs 4/5)
+        let pro_keys = parse_sysfs_bitset("7ffb000000000000 0 0 0 0");
+        let pro_abs = parse_sysfs_bitset("3001b");
+        assert!(classify_gamepad("Nintendo Co., Ltd. Pro Controller", &pro_keys));
+        let pro_btns = build_joydev_button_map(&pro_keys, is_nintendo_layout("Nintendo Co., Ltd. Pro Controller"));
+        assert_eq!(pro_btns[0], BTN_B);      // South (B)
+        assert_eq!(pro_btns[1], BTN_A);      // East (A)
+        assert_eq!(pro_btns[2], BTN_X);      // North (X)
+        assert_eq!(pro_btns[3], BTN_Y);      // West (Y)
+        assert_eq!(pro_btns[4], 0);          // Capture (ignored)
+        assert_eq!(pro_btns[5], BTN_L);      // L
+        assert_eq!(pro_btns[6], BTN_R);      // R
+        assert_eq!(pro_btns[9], BTN_SELECT); // Minus
+        assert_eq!(pro_btns[10], BTN_START); // Plus
+        let pro_axes = build_joydev_axis_map(&pro_abs);
+        assert_eq!(pro_axes[4], 16); // ABS_HAT0X
+        assert_eq!(pro_axes[5], 17); // ABS_HAT0Y
     }
 }
