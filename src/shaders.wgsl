@@ -1120,10 +1120,29 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
 
         var cab = mix(plastic, walnut, woodMask);
         cab = mix(cab, chrome, chromeMask);
-        // Scale cabinet ambient lighting down to true dark when Room light approaches 0,
-        // leaving only subtle CRT screen spill on the inner bevel and brushed metal trim.
+        // Ambient room lighting scales smoothly down to true dark when Room light -> 0.
         cab *= amb * 2.6;
-        cab += lin * (0.035 * bevel + 0.012 * chromeMask + 0.0025 * (1.0 - outer));
+
+        // Real CRT phosphor screen spill (independent of Room light!):
+        // Sample the glowing picture just inside the nearest glass edge so the inner plastic
+        // bevel, brushed metal trim, and satin walnut catch true color-accurate reflections.
+        let duv_scale = vec2<f32>(vpx.y / vpx.x, 1.0) / max(2.0 * view.z * (1.0 + curv * r2), 0.001);
+        let uv_near = clamp(uv - n2 * (d * 1.15 + 0.045) * duv_scale, vec2<f32>(0.005), vec2<f32>(0.995));
+        let uv_far = clamp(uv - n2 * (d * 0.75 + 0.085) * duv_scale, vec2<f32>(0.005), vec2<f32>(0.995));
+        let spill_tight = max(m_phos * textureSampleLevel(t1, s_linear, uv_near, 0.0).rgb, vec3<f32>(0.0)) * U.glass2.rgb;
+        let spill_wide = max(m_phos * textureSampleLevel(t2, s_linear, uv_far, 0.0).rgb, vec3<f32>(0.0)) * U.glass2.rgb;
+
+        // Glossy mirror-like reflection along the angled inner bezel lip
+        let bevel_refl = spill_tight * bevel * (0.05 + 0.15 * (0.45 + 0.55 * lightBevel));
+        // Soft matte bounce across the dark plastic surround
+        let plastic_spill = spill_wide * vec3<f32>(0.032, 0.030, 0.028) * (1.0 - woodMask) * exp(-d * 9.0);
+        // Brushed aluminum / chrome strip specular catchlight
+        let chrome_spill = spill_wide * vec3<f32>(0.15, 0.142, 0.128) * brush * chromeMask * (0.65 + 0.55 * lightOuter);
+        // Warm diffuse bounce + satin lacquer sheen on the walnut frame (fades cleanly toward outer edge)
+        let wood_falloff = exp(-max(d - 0.095, 0.0) * 7.5);
+        let wood_spill = spill_wide * (walnut * 1.65 + vec3<f32>(0.011, 0.008, 0.005)) * woodMask * wood_falloff;
+
+        cab += bevel_refl + plastic_spill + chrome_spill + wood_spill;
         let bz_lin = cab * U.glass1.y;
         let a = smoothstep(0.07 - pxw, 0.07 + pxw, sdf);
         let outside = smoothstep(bw - pxw, bw + pxw, d);
