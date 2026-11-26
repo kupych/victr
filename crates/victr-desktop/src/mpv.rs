@@ -517,6 +517,10 @@ fn run_libmpv(
         opt("config", if o.user_config { "yes" } else { "no" });
         opt("input-default-bindings", "yes");
         opt("ytdl", "yes");
+        // CRT raster is 640x480 (480i/480p): cap YouTube/HLS streams to 480p (~1.8 Mbps)
+        // so mpv doesn't waste bandwidth & CPU decoding 1080p/4K only to downscale to 480 lines.
+        opt("ytdl-format", "bestvideo[height<=480][fps<=60]+bestaudio/best[height<=480]/best[height<=720]/best");
+        opt("hls-bitrate", "1800000");
         opt("hwdec", "auto-copy-safe");
         // Keep generous forward & back cache in RAM + auto-reconnect on HTTP/HTTPS streams
         // so pausing, rewinding, and fast-forwarding over Jellyfin/Plex never stall on dropped sockets.
