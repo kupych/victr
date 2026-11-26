@@ -150,14 +150,19 @@ fn desktop_entry(exe: &std::path::Path, icon: &std::path::Path) -> String {
 #[cfg(target_os = "linux")]
 pub fn install_menu_entry() -> Result<String, String> {
     let exe = launcher_path().or_else(exe_path).ok_or("Couldn't find where this program is.")?;
-    let icon = app_dir().map(|d| d.join("victr.png")).unwrap_or_else(|| exe.with_file_name("victr.png"));
-    if !icon.exists() {
-        let rgba = icon_rgba(256);
-        image::save_buffer(&icon, &rgba, 256, 256, image::ColorType::Rgba8).map_err(|e| format!("Couldn't save the icon: {e}"))?;
-    }
-    let entry = desktop_entry(&exe, &icon);
     let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("No home folder found.")?;
-    let apps = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share")).join("applications");
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    let icon_dir = data_home.join("icons/hicolor/256x256/apps");
+    let icon = icon_dir.join("victr.png");
+    let _ = std::fs::create_dir_all(&icon_dir);
+    let rgba = icon_rgba(256);
+    image::save_buffer(&icon, &rgba, 256, 256, image::ColorType::Rgba8)
+        .map_err(|e| format!("Couldn't save the icon: {e}"))?;
+    let entry = desktop_entry(&exe, &icon);
+    let apps = data_home.join("applications");
     let file = apps.join("victr.desktop");
     let direct = std::fs::create_dir_all(&apps).and_then(|_| std::fs::write(&file, &entry));
     if direct.is_err() && std::path::Path::new("/.flatpak-info").exists() {

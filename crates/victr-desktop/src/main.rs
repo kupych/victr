@@ -508,6 +508,19 @@ impl ApplicationHandler for Host {
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--install-desktop") {
+        match about::install_menu_entry() {
+            Ok(msg) => {
+                println!("{msg}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let cli = parse_args();
 
     // Launched from the mpv shortcut while the TV is already open: hand it over.
