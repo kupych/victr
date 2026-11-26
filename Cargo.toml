@@ -1,27 +1,15 @@
-[package]
-name = "victr"
+[workspace]
+resolver = "2"
+members = [
+    "crates/victr-core",
+    "crates/victr-desktop",
+]
+default-members = ["crates/victr-desktop"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "ViCTR (Virtual CRT Television Receiver) — a physically based CRT simulator with full NTSC signal chain, electron optics, phosphor persistence, rolling scan, native HDR wgpu renderer, and analog audio DSP."
 license = "MIT"
-readme = "README.md"
-keywords = ["crt", "retro", "physics", "shader", "simulator"]
-categories = ["multimedia::video", "simulation", "graphics"]
-
-[dependencies]
-bytemuck = { version = "1.25.2", features = ["derive"] }
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-egui = { version = "0.37.0", default-features = false, features = ["default_fonts", "bytemuck"] }
-egui-wgpu = { version = "0.37.0", default-features = false, features = ["winit", "wayland", "x11"] }
-egui-winit = { version = "0.37.0", default-features = false, features = ["clipboard", "wayland", "x11"] }
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
-pollster = "1.0.3"
-rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal", "pollster"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-ureq = { version = "2.12", default-features = false, features = ["tls", "native-certs", "json"] }
-wgpu = { version = "30.0.2", default-features = false, features = ["std", "parking_lot", "vulkan", "dx12", "metal", "gles", "wgsl"] }
-winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen", "wayland-csd-adwaita", "x11"] }
 
 [profile.release]
 opt-level = 3

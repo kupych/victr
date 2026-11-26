@@ -1,0 +1,13 @@
+[package]
+name = "victr-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Platform-agnostic CRT physics engine, WGSL shader pipeline, analog audio DSP, 90s Prevue Cable Guide, TV OSD, and channel lineup domain model for ViCTR."
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wgpu = { version = "30.0.2", default-features = false, features = ["std", "wgsl"] }

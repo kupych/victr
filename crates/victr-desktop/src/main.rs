@@ -1,5 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// Platform-agnostic CRT core re-exported at the desktop crate root so all
+// desktop backends and UI modules can reference `crate::sim`, `crate::gpu`, etc.
+pub use victr_core::{gpu, guide, osd, provider, settings, shaders, sim, splash};
+
 mod about;
 mod app;
 mod audio;
@@ -7,20 +11,12 @@ mod capture;
 mod channels_file;
 mod custom_provider;
 mod folders;
-mod gpu;
-mod guide;
 mod jellyfin;
 mod link;
 mod m3u;
 mod mpv;
-mod osd;
 mod plex;
-mod provider;
 mod retro;
-mod settings;
-mod shaders;
-mod sim;
-mod splash;
 mod web_channel;
 
 use crate::app::CrtApp;
