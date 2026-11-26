@@ -195,23 +195,26 @@ impl Sim {
     pub fn switch_channel(&mut self) {
         self.channel_switch_t = 0.0;
         // Classic analog tuner AFT (Automatic Fine Tuning) & sync pull-in:
-        // start slightly off-frequency/off-tracking and smoothly drift to zero.
+        // start subtly off-frequency/off-tracking and smoothly drift to zero.
         let sign_ft = if self.next() > 0.5 { 1.0 } else { -1.0 };
         let sign_tr = if self.next() > 0.5 { 1.0 } else { -1.0 };
         let sign_h = if self.next() > 0.5 { 1.0 } else { -1.0 };
         let sign_v = if self.next() > 0.5 { 1.0 } else { -1.0 };
-        self.ch_fine_tune_init = sign_ft * (0.48 + 0.36 * self.next());
-        self.ch_tracking_init = sign_tr * (0.24 + 0.20 * self.next());
-        self.ch_h_pull_init = sign_h * (0.028 + 0.028 * self.next());
-        self.ch_v_pull_init = sign_v * (0.012 + 0.016 * self.next());
+        self.ch_fine_tune_init = sign_ft * (0.26 + 0.20 * self.next());
+        self.ch_tracking_init = sign_tr * (0.11 + 0.09 * self.next());
+        self.ch_h_pull_init = sign_h * (0.015 + 0.014 * self.next());
+        self.ch_v_pull_init = sign_v * (0.004 + 0.004 * self.next());
     }
 
     /// Holds authentic untuned CRT static snow on screen while a new channel/stream is
     /// still connecting and buffering its first frame, then cleanly pulls into lock on arrival.
     pub fn set_tuning_static(&mut self, active: bool) {
         if self.tuning_static && !active {
-            // Transitioning from static placeholder -> first real frame: trigger crisp lock-in fade
+            // Transitioning from static placeholder -> first real frame: trigger crisp lock-in
+            // with only a subtle vertical offset so sync settles quickly instead of rolling far.
             self.channel_switch_t = 0.04;
+            let sign = if self.v_phase >= 0.0 { 1.0 } else { -1.0 };
+            self.v_phase = sign * (12.0 + (self.v_phase.abs() * 0.08).min(10.0));
         }
         self.tuning_static = active;
     }
@@ -622,13 +625,20 @@ impl Sim {
 
         // ---- vertical oscillator
         let half = NL as f32 * 0.5;
+        let v_hold_err = s.v_hold + self.chaos.v_hold;
         // the field oscillator free-runs slightly slow; a sync pulse inside the
         // pull-in window triggers the retrace early and locks the picture
-        self.v_phase += (s.v_hold + self.chaos.v_hold + ch_v_pull) * 25.0 + 0.4;
+        self.v_phase += (v_hold_err + ch_v_pull) * 25.0 + 0.4;
         if self.next() < p_v {
             let w = (self.v_phase + half).rem_euclid(NL as f32) - half;
             if w.abs() < 10.0 {
                 self.v_phase = w * 0.05;
+            } else if v_hold_err.abs() < 0.05 {
+                // With V-hold centered and a clean V-sync pulse present, pull back
+                // toward 0 along the shortest wrap-around path instead of drifting
+                // slowly all the way around the frame for ~8 seconds.
+                let step = (1.5 + w.abs() * 0.035).min(w.abs());
+                self.v_phase = w - w.signum() * step;
             }
         }
         self.v_phase = (self.v_phase + half).rem_euclid(NL as f32) - half;
@@ -948,11 +958,11 @@ mod tests {
 
         sim.switch_channel();
         let (ft0, tr0) = sim.channel_aft_offsets();
-        assert!(ft0.abs() > 0.4, "channel switch should start fine tuning off-center: {ft0}");
-        assert!(tr0.abs() > 0.2, "channel switch should start tracking off-center: {tr0}");
+        assert!(ft0.abs() > 0.2, "channel switch should start fine tuning off-center: {ft0}");
+        assert!(tr0.abs() > 0.1, "channel switch should start tracking off-center: {tr0}");
 
         let f0 = sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
-        assert!(f0.u.fine_tune.abs() > 0.4);
+        assert!(f0.u.fine_tune.abs() > 0.2);
 
         // Midway (~0.45s): pulled noticeably closer to zero
         for _ in 0..27 {
@@ -971,6 +981,34 @@ mod tests {
         assert_eq!(tr_end, 0.0);
         let f_end = sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
         assert_eq!(f_end.u.fine_tune, 0.0);
+    }
+
+    #[test]
+    fn channel_switch_vertical_sync_pulls_short_way_and_locks_quickly() {
+        let mut sim = Sim::new();
+        sim.warm = 1.0;
+        let s = Settings::default();
+
+        // Simulate 1.2s of tuning static while connecting to a stream
+        sim.switch_channel();
+        sim.set_tuning_static(true);
+        for _ in 0..72 {
+            sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+        }
+        // First real frame arrives: offset should be modest and lock within 0.5s (30 fields)
+        // moving strictly toward 0 along the shortest path, never cycling all the way around.
+        sim.set_tuning_static(false);
+        assert!(sim.v_phase.abs() <= 23.0, "initial v_phase offset should be modest: {}", sim.v_phase);
+        let mut locked = false;
+        for _ in 0..30 {
+            sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
+            assert!(sim.v_phase.abs() < 30.0, "v_phase should pull short way, not wrap around: {}", sim.v_phase);
+            if sim.v_locked {
+                locked = true;
+                break;
+            }
+        }
+        assert!(locked, "vertical sync should lock cleanly within 0.5s after static clears");
     }
 
     #[test]
