@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 pub type ArtworkImage = Arc<(usize, usize, Vec<u8>)>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MediaItem {
     pub id: String,
     pub title: String,

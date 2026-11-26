@@ -168,17 +168,25 @@ fn is_puzzlescript_def(def: &FileChannelDef) -> bool {
             && crate::web_channel::is_puzzlescript_gallery_url(&def.stream_url))
 }
 
+fn is_pico8_def(def: &FileChannelDef) -> bool {
+    let kind_norm = def.kind.trim().to_ascii_lowercase();
+    matches!(kind_norm.as_str(), "pico8" | "pico-8" | "pico8_bbs" | "splore")
+        || (!def.stream_url.trim().is_empty()
+            && crate::web_channel::is_pico8_gallery_url(&def.stream_url))
+}
+
 /// Builds inline `Channel` records from `cfg.channels`.
 #[allow(dead_code)]
 pub fn build_inline_channels(cfg: &ChannelsFileConfig) -> Vec<Channel> {
-    build_inline_channels_with_galleries(cfg, &HashMap::new())
+    build_inline_channels_with_galleries(cfg, &HashMap::new(), &HashMap::new())
 }
 
 /// Builds inline `Channel` records from `cfg.channels`, populating any `kind: "puzzlescript"`
-/// (or PuzzleScript Gallery URL) entries from `puzzlescript_cache`.
+/// or `kind: "pico8"` gallery entries from their respective caches.
 pub fn build_inline_channels_with_galleries(
     cfg: &ChannelsFileConfig,
     puzzlescript_cache: &HashMap<String, Vec<MediaItem>>,
+    pico8_cache: &HashMap<String, Vec<MediaItem>>,
 ) -> Vec<Channel> {
     let mut out = Vec::new();
     for (idx, def) in cfg.channels.iter().enumerate() {
@@ -259,6 +267,73 @@ pub fn build_inline_channels_with_galleries(
                 source_key: ch_id,
                 callsign,
                 name: ps_name,
+                artwork_id: def.artwork_url.trim().to_string(),
+                channel_type: ch_type,
+                profile_override: def.profile.clone().filter(|s| !s.trim().is_empty()),
+                kind: ch_kind,
+            });
+            continue;
+        }
+
+        // Special case: PICO-8 BBS Gallery channel (`kind: "pico8"` / `"splore"` or Lexaloffle BBS URL)
+        if is_pico8_def(def) {
+            let p8_name = if name.is_empty() { "PICO-8 BBS".to_string() } else { name };
+            let callsign = if !def.callsign.trim().is_empty() {
+                def.callsign.trim().chars().take(5).collect::<String>().to_ascii_uppercase()
+            } else {
+                "PICO8".to_string()
+            };
+            let lister_url = crate::web_channel::pico8_lister_url_for(&def.stream_url, &def.mode);
+            let ch_kind = if let Some(cached) = pico8_cache.get(&lister_url).filter(|v| !v.is_empty()) {
+                let mut episodes = cached.clone();
+                if def.mode.trim().eq_ignore_ascii_case("shuffle") {
+                    episodes.sort_by_key(|m| {
+                        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                        for b in m.id.bytes().chain(p8_name.bytes()) {
+                            h ^= b as u64;
+                            h = h.wrapping_mul(0x0100_0000_01b3);
+                        }
+                        h
+                    });
+                }
+                let next_up = episodes.first().map(|m| m.id.clone());
+                ChannelKind::Series {
+                    series_id: ch_id.clone(),
+                    overview: if def.overview.trim().is_empty() {
+                        format!(
+                            "Interactive PICO-8 BBS Arcade ({} carts) · Press E to browse · / search · * favorite · Arrows + Z/X + Gamepad to play",
+                            episodes.len()
+                        )
+                    } else {
+                        def.overview.trim().to_string()
+                    },
+                    is_continue: false,
+                    is_favorite: def.is_favorite,
+                    episodes,
+                    next_up_episode_id: next_up,
+                    loaded_episodes: true,
+                }
+            } else {
+                ChannelKind::LiveStream {
+                    stream_url: crate::web_channel::ensure_web_prefix(
+                        "https://www.lexaloffle.com/bbs/?cat=7#sub=2&mode=carts&orderby=featured",
+                    ),
+                    group: "Games".into(),
+                    now_title: "Loading PICO-8 BBS…".into(),
+                    overview: "Fetching featured PICO-8 carts from lexaloffle.com/bbs…".into(),
+                }
+            };
+            let ch_type = if def.channel_type.trim().is_empty() {
+                "web".to_string()
+            } else {
+                def.channel_type.trim().to_string()
+            };
+            out.push(Channel {
+                number: def.number.filter(|&n| n >= 2).unwrap_or(0),
+                provider_id: "channels".into(),
+                source_key: ch_id,
+                callsign,
+                name: p8_name,
                 artwork_id: def.artwork_url.trim().to_string(),
                 channel_type: ch_type,
                 profile_override: def.profile.clone().filter(|s| !s.trim().is_empty()),
@@ -821,6 +896,7 @@ pub fn resolve_profile_name(
 enum FileEvent {
     ArtworkLoaded(String, ArtworkImage),
     PuzzleScriptLoaded(String, Vec<MediaItem>),
+    Pico8Loaded(String, Vec<MediaItem>),
 }
 
 pub struct ChannelsFileManager {
@@ -834,6 +910,8 @@ pub struct ChannelsFileManager {
     artwork_cache: HashMap<String, Option<ArtworkImage>>,
     puzzlescript_cache: HashMap<String, Vec<MediaItem>>,
     puzzlescript_fetching: HashSet<String>,
+    pico8_cache: HashMap<String, Vec<MediaItem>>,
+    pico8_fetching: HashSet<String>,
     events: Arc<Mutex<Vec<FileEvent>>>,
 }
 
@@ -850,6 +928,8 @@ impl ChannelsFileManager {
             artwork_cache: HashMap::new(),
             puzzlescript_cache: HashMap::new(),
             puzzlescript_fetching: HashSet::new(),
+            pico8_cache: HashMap::new(),
+            pico8_fetching: HashSet::new(),
             events: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -860,20 +940,29 @@ impl ChannelsFileManager {
         mgr
     }
 
-    fn ensure_puzzlescript_galleries(&mut self) {
-        let mut wanted: Vec<String> = Vec::new();
+    fn ensure_web_galleries(&mut self) {
+        let mut wanted_ps: Vec<String> = Vec::new();
+        let mut wanted_p8: Vec<String> = Vec::new();
         for def in &self.cfg.channels {
-            if def.enabled && is_puzzlescript_def(def) {
+            if !def.enabled {
+                continue;
+            }
+            if is_puzzlescript_def(def) {
                 let url = crate::web_channel::puzzlescript_dat_url_for(&def.stream_url);
-                if !wanted.contains(&url) {
-                    wanted.push(url);
+                if !wanted_ps.contains(&url) {
+                    wanted_ps.push(url);
+                }
+            } else if is_pico8_def(def) {
+                let url = crate::web_channel::pico8_lister_url_for(&def.stream_url, &def.mode);
+                if !wanted_p8.contains(&url) {
+                    wanted_p8.push(url);
                 }
             }
         }
-        let cache_path = crate::web_channel::puzzlescript_cache_path();
-        for dat_url in wanted {
+        let ps_cache_path = crate::web_channel::puzzlescript_cache_path();
+        for dat_url in wanted_ps {
             if !self.puzzlescript_cache.contains_key(&dat_url) {
-                if let Some(cp) = cache_path.as_deref() {
+                if let Some(cp) = ps_cache_path.as_deref() {
                     if let Some(cached) = crate::web_channel::load_cached_puzzlescript_gallery(&dat_url, cp) {
                         self.puzzlescript_cache.insert(dat_url.clone(), cached);
                     }
@@ -881,10 +970,29 @@ impl ChannelsFileManager {
             }
             if self.puzzlescript_fetching.insert(dat_url.clone()) {
                 let ev = self.events.clone();
-                let cp = cache_path.clone();
+                let cp = ps_cache_path.clone();
                 std::thread::spawn(move || {
                     if let Ok(items) = crate::web_channel::fetch_puzzlescript_gallery(&dat_url, cp.as_deref()) {
                         ev.lock().unwrap().push(FileEvent::PuzzleScriptLoaded(dat_url, items));
+                    }
+                });
+            }
+        }
+        let p8_cache_path = crate::web_channel::pico8_cache_path();
+        for lister_url in wanted_p8 {
+            if !self.pico8_cache.contains_key(&lister_url) {
+                if let Some(cp) = p8_cache_path.as_deref() {
+                    if let Some(cached) = crate::web_channel::load_cached_pico8_gallery(cp) {
+                        self.pico8_cache.insert(lister_url.clone(), cached);
+                    }
+                }
+            }
+            if self.pico8_fetching.insert(lister_url.clone()) {
+                let ev = self.events.clone();
+                let cp = p8_cache_path.clone();
+                std::thread::spawn(move || {
+                    if let Ok(items) = crate::web_channel::fetch_pico8_gallery(&lister_url, cp.as_deref()) {
+                        ev.lock().unwrap().push(FileEvent::Pico8Loaded(lister_url, items));
                     }
                 });
             }
@@ -902,8 +1010,12 @@ impl ChannelsFileManager {
         match load_config_from(&path) {
             Ok(cfg) => {
                 self.cfg = cfg;
-                self.ensure_puzzlescript_galleries();
-                self.channels = build_inline_channels_with_galleries(&self.cfg, &self.puzzlescript_cache);
+                self.ensure_web_galleries();
+                self.channels = build_inline_channels_with_galleries(
+                    &self.cfg,
+                    &self.puzzlescript_cache,
+                    &self.pico8_cache,
+                );
                 let n_ch = self.channels.len();
                 let n_ov = self.cfg.overrides.len();
                 let n_tp = self.cfg.type_profiles.len();
@@ -923,8 +1035,12 @@ impl ChannelsFileManager {
         save_config_to(&path, &self.cfg)?;
         self.file_exists = true;
         self.last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-        self.ensure_puzzlescript_galleries();
-        self.channels = build_inline_channels_with_galleries(&self.cfg, &self.puzzlescript_cache);
+        self.ensure_web_galleries();
+        self.channels = build_inline_channels_with_galleries(
+            &self.cfg,
+            &self.puzzlescript_cache,
+            &self.pico8_cache,
+        );
         let n_ch = self.channels.len();
         let n_ov = self.cfg.overrides.len();
         let n_tp = self.cfg.type_profiles.len();
@@ -1038,7 +1154,20 @@ impl ChannelsFileManager {
                 }
                 FileEvent::PuzzleScriptLoaded(url, items) => {
                     self.puzzlescript_cache.insert(url, items);
-                    self.channels = build_inline_channels_with_galleries(&self.cfg, &self.puzzlescript_cache);
+                    self.channels = build_inline_channels_with_galleries(
+                        &self.cfg,
+                        &self.puzzlescript_cache,
+                        &self.pico8_cache,
+                    );
+                    changed = true;
+                }
+                FileEvent::Pico8Loaded(url, items) => {
+                    self.pico8_cache.insert(url, items);
+                    self.channels = build_inline_channels_with_galleries(
+                        &self.cfg,
+                        &self.puzzlescript_cache,
+                        &self.pico8_cache,
+                    );
                     changed = true;
                 }
             }

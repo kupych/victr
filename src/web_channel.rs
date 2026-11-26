@@ -25,9 +25,40 @@ pub const WEATHERSTAR_PRESET_URL: &str =
 
 pub const PUZZLESCRIPT_GALLERY_DAT_URL: &str = "https://www.puzzlescript.net/games_dat.js";
 
+pub const PICO8_BBS_FEATURED_URL: &str =
+    "https://www.lexaloffle.com/bbs/lister.php?use_hurl=1&cat=7&sub=2&mode=carts&orderby=featured";
+
 pub fn is_web_channel_url(src: &str) -> bool {
     let s = src.trim();
     s.len() >= 6 && s[..6].eq_ignore_ascii_case("web://")
+}
+
+/// Returns `true` when `raw` refers to the Lexaloffle PICO-8 BBS cart listing
+/// (as opposed to an individual cart `?pid=...` or `widget.php` URL).
+pub fn is_pico8_gallery_url(raw: &str) -> bool {
+    let norm = normalize_web_target_url(raw).to_ascii_lowercase();
+    if norm.contains("pid=") || norm.contains("widget.php") {
+        return false;
+    }
+    norm.contains("lexaloffle.com/bbs")
+        && (norm.contains("cat=7") || norm.contains("lister.php") || norm.ends_with("/bbs") || norm.ends_with("/bbs/"))
+}
+
+/// Resolves a PICO-8 BBS gallery URL & optional mode (`"featured"`, `"new"`, `"lucky"`) to its `lister.php` URL.
+pub fn pico8_lister_url_for(raw: &str, mode: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() && trimmed.to_ascii_lowercase().contains("lister.php") {
+        return normalize_web_target_url(trimmed);
+    }
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "new" | "latest" | "recent" => {
+            "https://www.lexaloffle.com/bbs/lister.php?use_hurl=1&cat=7&sub=2&mode=carts&orderby=ts".to_string()
+        }
+        "lucky" | "random" => {
+            "https://www.lexaloffle.com/bbs/lister.php?use_hurl=1&cat=7&sub=2&mode=carts&orderby=lucky".to_string()
+        }
+        _ => PICO8_BBS_FEATURED_URL.to_string(),
+    }
 }
 
 /// Returns `true` when `raw` refers to the PuzzleScript Gallery index or `games_dat.js`
@@ -398,13 +429,32 @@ fn run_web_channel(
         let _ = ws.send_text(&msg.to_string());
     };
 
+    let is_pico8_page = target_url.to_ascii_lowercase().contains("lexaloffle.com/bbs/");
     let focus_page = |ws: &mut WsConn, next_id: &mut u64| {
+        let expr = if is_pico8_page {
+            // Auto-boot the Lexaloffle PICO-8 WASM player and center its 128×128 canvas cleanly
+            // at crisp 480×480 pixelated scale on pure black inside our 640×480 CRT frame.
+            r#"(() => {
+                const d = document.getElementById('dormant_label_container') || document.querySelector('.dormant_player');
+                const c = document.getElementById('p8_container');
+                if (d) d.click();
+                if (c) c.click();
+                if (!document.getElementById('victr-p8-style')) {
+                    const st = document.createElement('style');
+                    st.id = 'victr-p8-style';
+                    st.textContent = 'html,body{margin:0!important;padding:0!important;overflow:hidden!important;background:#000!important;width:640px!important;height:480px!important;} #p8_frame_0,#p8_frame,#p8_container{position:fixed!important;inset:0!important;width:640px!important;height:480px!important;max-width:none!important;max-height:none!important;margin:0!important;background:#000!important;display:flex!important;align-items:center!important;justify-content:center!important;z-index:99999!important;} #p8_menu_buttons,.p8_menu_buttons,.dormant_player{display:none!important;} #canvas{width:480px!important;height:480px!important;image-rendering:pixelated!important;}';
+                    document.head.appendChild(st);
+                }
+                window.focus();
+                (document.getElementById('canvas') || document.querySelector('canvas') || document.body)?.focus?.();
+            })()"#
+        } else {
+            "window.focus(); (document.querySelector('canvas') || document.body)?.focus?.();"
+        };
         let msg = serde_json::json!({
             "id": *next_id,
             "method": "Runtime.evaluate",
-            "params": {
-                "expression": "window.focus(); (document.querySelector('canvas') || document.body)?.focus?.();"
-            }
+            "params": { "expression": expr }
         });
         *next_id += 1;
         let _ = ws.send_text(&msg.to_string());
@@ -957,6 +1007,211 @@ pub fn fetch_puzzlescript_gallery(dat_url: &str, cache_path: Option<&Path>) -> R
     Ok(items)
 }
 
+// ------------------------------------------------------------------ PICO-8 BBS Carts Loader
+
+#[derive(Debug, Clone)]
+enum JsVal {
+    Str(String),
+    Arr(Vec<JsVal>),
+    Other,
+}
+
+fn parse_js_string(bytes: &[u8], i: &mut usize, quote: u8) -> String {
+    *i += 1; // skip opening quote
+    let mut out = Vec::new();
+    while *i < bytes.len() {
+        let b = bytes[*i];
+        *i += 1;
+        if b == b'\\' && *i < bytes.len() {
+            let next = bytes[*i];
+            *i += 1;
+            match next {
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                other => out.push(other),
+            }
+            continue;
+        }
+        if b == quote {
+            break;
+        }
+        out.push(b);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_js_array(bytes: &[u8], i: &mut usize) -> Vec<JsVal> {
+    let mut items = Vec::new();
+    if *i >= bytes.len() || bytes[*i] != b'[' {
+        return items;
+    }
+    *i += 1; // skip '['
+    loop {
+        while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+        if *i >= bytes.len() || bytes[*i] == b']' {
+            if *i < bytes.len() {
+                *i += 1;
+            }
+            break;
+        }
+        if bytes[*i] == b',' {
+            *i += 1;
+            continue;
+        }
+        let val = match bytes[*i] {
+            q @ (b'\'' | b'"' | b'`') => JsVal::Str(parse_js_string(bytes, i, q)),
+            b'[' => JsVal::Arr(parse_js_array(bytes, i)),
+            _ => {
+                while *i < bytes.len() && bytes[*i] != b',' && bytes[*i] != b']' {
+                    *i += 1;
+                }
+                JsVal::Other
+            }
+        };
+        items.push(val);
+    }
+    items
+}
+
+/// Parses Lexaloffle's `lister.php` `pdat=[ ... ]` JavaScript cart table into playable `MediaItem`s.
+pub fn parse_pico8_bbs_lister(html: &str) -> Result<Vec<MediaItem>, String> {
+    let Some(pos) = html.find("pdat=[") else {
+        return Err("Lexaloffle BBS response missing pdat=[ array".into());
+    };
+    let bytes = html.as_bytes();
+    let mut i = pos + "pdat=".len();
+    let rows = parse_js_array(bytes, &mut i);
+    let mut out = Vec::new();
+    for row in rows {
+        let JsVal::Arr(cols) = row else { continue };
+        if cols.len() < 10 {
+            continue;
+        }
+        let pid = match cols.first() {
+            Some(JsVal::Str(s)) => s.trim().to_string(),
+            _ => continue,
+        };
+        if pid.is_empty() {
+            continue;
+        }
+        let title = match cols.get(2) {
+            Some(JsVal::Str(s)) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => continue,
+        };
+        let thumb = match cols.get(3) {
+            Some(JsVal::Str(s)) => s.trim().to_string(),
+            _ => String::new(),
+        };
+        let author = match cols.get(8) {
+            Some(JsVal::Str(s)) => s.trim().to_string(),
+            _ => String::new(),
+        };
+        let tags: Vec<String> = match cols.get(18) {
+            Some(JsVal::Arr(arr)) => arr
+                .iter()
+                .filter_map(|v| match v {
+                    JsVal::Str(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                    _ => None,
+                })
+                .take(4)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let artwork_id = if thumb.is_empty() {
+            String::new()
+        } else if thumb.starts_with("http://") || thumb.starts_with("https://") {
+            thumb
+        } else {
+            format!("https://www.lexaloffle.com/{}", thumb.trim_start_matches('/'))
+        };
+        let tag_str = if tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", tags.join(", "))
+        };
+        let author_str = if author.is_empty() {
+            "PICO-8 BBS".to_string()
+        } else {
+            format!("by {author}")
+        };
+        let overview = format!("{author_str}{tag_str} · Arrows move · Z/X action · Enter pause");
+        let play_url = format!("https://www.lexaloffle.com/bbs/?pid={pid}#p");
+        out.push(MediaItem {
+            id: format!("pico8:{pid}"),
+            title,
+            season: None,
+            episode: None,
+            overview,
+            runtime_secs: 1800.0,
+            played: false,
+            resume_secs: 0.0,
+            artwork_id,
+            stream_url: ensure_web_prefix(&play_url),
+        });
+    }
+    Ok(out)
+}
+
+pub fn pico8_cache_path() -> Option<PathBuf> {
+    crate::settings::presets_dir().and_then(|d| d.parent().map(|p| p.join("pico8_bbs.cache.json")))
+}
+
+pub fn load_cached_pico8_gallery(cache_path: &Path) -> Option<Vec<MediaItem>> {
+    let text = std::fs::read_to_string(cache_path).ok()?;
+    let items: Vec<MediaItem> = serde_json::from_str(&text).ok()?;
+    if items.is_empty() { None } else { Some(items) }
+}
+
+pub fn fetch_pico8_gallery(lister_url: &str, cache_path: Option<&Path>) -> Result<Vec<MediaItem>, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(6))
+        .timeout(Duration::from_secs(12))
+        .build();
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // Fetch pages 1 & 2 (~64 featured/recent carts) so the arcade feels rich immediately.
+    for page in 1..=2 {
+        let url = if page == 1 || lister_url.contains("page=") {
+            lister_url.to_string()
+        } else if lister_url.contains('?') {
+            format!("{lister_url}&page={page}")
+        } else {
+            format!("{lister_url}?page={page}")
+        };
+        let resp = match agent.get(&url).call() {
+            Ok(r) => r,
+            Err(e) if page == 1 => return Err(format!("Couldn't fetch PICO-8 BBS ({url}): {e}")),
+            Err(_) => break,
+        };
+        let Ok(body) = resp.into_string() else { break };
+        if let Ok(page_items) = parse_pico8_bbs_lister(&body) {
+            for m in page_items {
+                if seen.insert(m.id.clone()) {
+                    items.push(m);
+                }
+            }
+        }
+        if lister_url.contains("page=") {
+            break;
+        }
+    }
+    if items.is_empty() {
+        return Err("PICO-8 BBS returned no playable carts.".into());
+    }
+    if let Some(cp) = cache_path {
+        if let Some(parent) = cp.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string(&items) {
+            let _ = std::fs::write(cp, json);
+        }
+    }
+    Ok(items)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,6 +1275,28 @@ let games_gallery = [
         assert!(items[0].overview.contains("by pap4qlxxlevb"));
         assert_eq!(items[1].title, "2D Whale World");
         assert_eq!(items[1].stream_url, "web://https://www.puzzlescript.net/play.html?p=6841165");
+    }
+
+    #[test]
+    fn pico8_bbs_lister_parses_pdat_rows_and_tags() {
+        let sample = r#"
+<script>
+pdat=[
+  ['190262', 157055, `Forlorn Shores`,"/bbs/thumbs/pico8_forlornshores_jusiv_v01-9.png",256,170.6,"2026-05-25",24585,"Jusiv","2026-11-23",0,"",45,44,0,7,2,'0',["puzzle","adventure",],2,272,7,`Forlorn Shores v1.9`,``],
+  ['165759', 148484, `Mole, "Mole"`,"/bbs/thumbs/pico8_molemole-1.png",256,170.6,"2025-04-18",13953,"Adam Atomic","2026-11-01",0,"",109,25,0,7,2,'0',[],2,276,7,`Mole Mole`,``],
+];
+</script>
+"#;
+        let items = parse_pico8_bbs_lister(sample).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "pico8:190262");
+        assert_eq!(items[0].title, "Forlorn Shores");
+        assert_eq!(items[0].stream_url, "web://https://www.lexaloffle.com/bbs/?pid=190262#p");
+        assert_eq!(items[0].artwork_id, "https://www.lexaloffle.com/bbs/thumbs/pico8_forlornshores_jusiv_v01-9.png");
+        assert!(items[0].overview.contains("by Jusiv [puzzle, adventure]"));
+        assert_eq!(items[1].title, "Mole, \"Mole\"");
+        assert!(is_pico8_gallery_url("https://www.lexaloffle.com/bbs/?cat=7"));
+        assert!(!is_pico8_gallery_url("https://www.lexaloffle.com/bbs/?pid=190262#p"));
     }
 
     #[test]

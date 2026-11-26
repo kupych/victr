@@ -30,22 +30,30 @@ use std::time::{Duration, Instant};
 
 pub const ROM_EXTS: &[&str] = &[
     "nes", "fds", "unif", "sfc", "smc", "fig", "swc", "md", "gen", "smd", "sms", "gg", "sg",
-    "gba", "gb", "gbc", "pce", "chd", "cue", "iso", "zip",
+    "gba", "gb", "gbc", "pce", "p8", "chd", "cue", "iso", "zip",
 ];
 
-pub fn is_rom_file(path: &Path) -> bool {
+fn rom_ext_key(path: &Path) -> String {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name.to_ascii_lowercase().ends_with(".p8.png") {
+            return "p8".to_string();
+        }
+    }
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|ext| {
-            // Exclude `.zip` from drag-and-drop ambiguity unless explicitly picked, keep console extensions
-            let low = ext.to_ascii_lowercase();
-            matches!(
-                low.as_str(),
-                "nes" | "fds" | "unif" | "sfc" | "smc" | "fig" | "swc"
-                    | "md" | "gen" | "smd" | "sms" | "gg" | "sg"
-                    | "gba" | "gb" | "gbc" | "pce"
-            )
-        })
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+pub fn is_rom_file(path: &Path) -> bool {
+    let low = rom_ext_key(path);
+    // Exclude `.zip` from drag-and-drop ambiguity unless explicitly picked, keep console extensions
+    matches!(
+        low.as_str(),
+        "nes" | "fds" | "unif" | "sfc" | "smc" | "fig" | "swc"
+            | "md" | "gen" | "smd" | "sms" | "gg" | "sg"
+            | "gba" | "gb" | "gbc" | "pce" | "p8"
+    )
 }
 
 pub fn is_retro_url(src: &str) -> bool {
@@ -245,11 +253,7 @@ pub fn select_core_for_rom<'a>(
         }
     }
 
-    let ext = rom_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
+    let ext = rom_ext_key(rom_path);
 
     if let Some(pref) = preferred.get(&ext) {
         if let Some(found) = cores
@@ -267,6 +271,7 @@ pub fn select_core_for_rom<'a>(
         "gba" => &["mgba", "vba_next", "vbam", "gpsp"],
         "gb" | "gbc" => &["mgba", "gambatte", "sameboy", "tgbdual"],
         "pce" => &["mednafen_pce", "mednafen_pce_fast", "mednafen_supergrafx"],
+        "p8" => &["fake08", "retro8"],
         "chd" | "cue" | "iso" => &["mednafen_psx", "mednafen_psx_hw", "pcsx_rearmed", "swanstation", "genesis_plus_gx"],
         "zip" => &["mame", "fbneo", "fbalpha", "snes9x", "mesen"],
         _ => &[],
@@ -296,6 +301,7 @@ fn console_label_for_ext(ext: &str) -> &'static str {
         "gb" => "GB",
         "gbc" => "GBC",
         "pce" => "PC ENGINE",
+        "p8" => "PICO-8",
         "chd" | "cue" | "iso" => "DISC",
         _ => "ARCADE",
     }
@@ -315,10 +321,9 @@ fn scan_roms_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             continue;
         }
         if p.is_file() {
-            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                if ROM_EXTS.iter().any(|r| r.eq_ignore_ascii_case(ext)) {
-                    out.push(p);
-                }
+            let ext = rom_ext_key(&p);
+            if !ext.is_empty() && ROM_EXTS.iter().any(|r| r.eq_ignore_ascii_case(&ext)) {
+                out.push(p);
             }
         } else if p.is_dir() {
             scan_roms_recursive(&p, depth + 1, out);
@@ -343,9 +348,14 @@ pub fn build_console_channel(cfg: &RetroConfig, cores: &[CoreInfo]) -> Option<Ch
         .into_iter()
         .filter_map(|p| {
             let core = select_core_for_rom(&p, cores, None, &cfg.preferred_cores)?;
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+            let ext = rom_ext_key(&p);
             let sys = console_label_for_ext(&ext);
-            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("Cartridge");
+            let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("Cartridge");
+            let stem = if fname.to_ascii_lowercase().ends_with(".p8.png") && fname.len() > 7 {
+                &fname[..fname.len() - 7]
+            } else {
+                p.file_stem().and_then(|s| s.to_str()).unwrap_or("Cartridge")
+            };
             let path_str = p.to_string_lossy().to_string();
             Some(MediaItem {
                 id: path_str.clone(),
@@ -1817,11 +1827,16 @@ mod tests {
             CoreInfo { name: "bsnes".into(), path: PathBuf::from("/usr/lib/libretro/bsnes_libretro.so") },
             CoreInfo { name: "mesen".into(), path: PathBuf::from("/usr/lib/libretro/mesen_libretro.so") },
             CoreInfo { name: "genesis_plus_gx".into(), path: PathBuf::from("/usr/lib/libretro/genesis_plus_gx_libretro.so") },
+            CoreInfo { name: "fake08".into(), path: PathBuf::from("/usr/lib/libretro/fake08_libretro.so") },
         ];
         let empty = HashMap::new();
         assert_eq!(select_core_for_rom(Path::new("smw.sfc"), &cores, None, &empty).unwrap().name, "bsnes");
         assert_eq!(select_core_for_rom(Path::new("smb3.nes"), &cores, None, &empty).unwrap().name, "mesen");
         assert_eq!(select_core_for_rom(Path::new("sonic.md"), &cores, None, &empty).unwrap().name, "genesis_plus_gx");
+        assert_eq!(select_core_for_rom(Path::new("celeste.p8"), &cores, None, &empty).unwrap().name, "fake08");
+        assert_eq!(select_core_for_rom(Path::new("celeste.p8.png"), &cores, None, &empty).unwrap().name, "fake08");
+        assert!(is_rom_file(Path::new("celeste.p8.png")));
+        assert!(!is_rom_file(Path::new("screenshot.png")));
     }
 
     #[test]
