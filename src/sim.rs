@@ -109,6 +109,7 @@ pub struct Sim {
     pub degauss_t: f32,
     degauss_phase: f32,
     pub channel_switch_t: f32,
+    tuning_static: bool,
     ch_fine_tune_init: f32,
     ch_tracking_init: f32,
     ch_h_pull_init: f32,
@@ -143,6 +144,7 @@ impl Sim {
             degauss_t: 0.0,
             degauss_phase: 0.7,
             channel_switch_t: 10.0,
+            tuning_static: false,
             ch_fine_tune_init: 0.0,
             ch_tracking_init: 0.0,
             ch_h_pull_init: 0.0,
@@ -202,6 +204,16 @@ impl Sim {
         self.ch_tracking_init = sign_tr * (0.24 + 0.20 * self.next());
         self.ch_h_pull_init = sign_h * (0.028 + 0.028 * self.next());
         self.ch_v_pull_init = sign_v * (0.012 + 0.016 * self.next());
+    }
+
+    /// Holds authentic untuned CRT static snow on screen while a new channel/stream is
+    /// still connecting and buffering its first frame, then cleanly pulls into lock on arrival.
+    pub fn set_tuning_static(&mut self, active: bool) {
+        if self.tuning_static && !active {
+            // Transitioning from static placeholder -> first real frame: trigger crisp lock-in fade
+            self.channel_switch_t = 0.04;
+        }
+        self.tuning_static = active;
     }
 
     /// Crisp input relay snap (e.g. RF static -> VIDEO 1 blue screen) with the mechanical
@@ -441,12 +453,16 @@ impl Sim {
 
         // ---- noise budget
         let eff_signal_db = (s.signal_db - self.chaos.signal_drop_db - ch_ft.abs() * 8.0).max(-25.0);
-        let rf_sigma = if s.input == Input::Rf { 10f32.powf(-eff_signal_db / 20.0) } else { 0.0 }
+        let mut rf_sigma = if s.input == Input::Rf { 10f32.powf(-eff_signal_db / 20.0) } else { 0.0 }
             + 0.85 * ch_env
             + ch_aft_noise
             + self.chaos.noise * 1.4
             + whack_pop;
-        let extra_noise_eff = s.extra_noise + 0.65 * ch_env + ch_aft_noise * 0.75 + self.chaos.noise + whack_pop;
+        let mut extra_noise_eff = s.extra_noise + 0.65 * ch_env + ch_aft_noise * 0.75 + self.chaos.noise + whack_pop;
+        if self.tuning_static {
+            rf_sigma = rf_sigma.max(1.9);
+            extra_noise_eff = extra_noise_eff.max(1.2);
+        }
         let (tape_sigma, speed_bw) = if s.vcr {
             let k = match s.tape_speed {
                 TapeSpeed::Sp => (1.0, 3.0),
@@ -740,7 +756,7 @@ impl Sim {
             }) + sh_mag * 0.32,
             chroma_noise: (if s.vcr { s.tape_wear * 0.9 } else { 0.0 }) + sh_mag * 0.42,
             dropout: ((if s.vcr { s.dropouts } else { 0.0 }) + sh_mag * 0.55).min(1.0),
-            input: s.input.id(),
+            input: if self.tuning_static { Input::Rf.id() } else { s.input.id() },
             snow: rf_sigma,
             noise: extra_noise_eff,
             ghost_amp: (s.ghost_amp + self.chaos.ghost).clamp(-0.6, 0.6),
@@ -756,7 +772,7 @@ impl Sim {
             color: s.color,
             tint: s.tint.to_radians(),
             sharp: s.sharpness,
-            killer: if self.color_on { 0.0 } else { 1.0 },
+            killer: if self.color_on && !self.tuning_static { 0.0 } else { 1.0 },
             rx_chroma_sigma: gs(1.1),
             view,
             curv: s.curvature,

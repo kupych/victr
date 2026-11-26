@@ -60,6 +60,7 @@ struct Audio {
     session: u64,
     stop: Arc<AtomicBool>,
     discard: Arc<AtomicBool>,
+    bytes_in: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Audio {
@@ -70,6 +71,7 @@ impl Audio {
         if let Some(ring) = self.ring.clone() {
             let stop = self.stop.clone();
             let discard = self.discard.clone();
+            let bytes_in = self.bytes_in.clone();
             let session = self.session;
             std::thread::spawn(move || {
                 // 1024 B = 256 stereo frames (~5.3 ms) so samples reach the DSP ring promptly
@@ -81,6 +83,7 @@ impl Audio {
                             if stop.load(Ordering::Relaxed) {
                                 break;
                             }
+                            bytes_in.fetch_add(n as u64, Ordering::Relaxed);
                             if discard.load(Ordering::Relaxed) {
                                 continue;
                             }
@@ -126,8 +129,9 @@ impl Player {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let discard = Arc::new(AtomicBool::new(false));
+        let bytes_in = Arc::new(std::sync::atomic::AtomicU64::new(0));
         std::thread::spawn(move || {
-            let audio = Audio { ring: audio, session, stop: stop2, discard };
+            let audio = Audio { ring: audio, session, stop: stop2, discard, bytes_in };
             let lib_err = match Lib::load() {
                 Ok(lib) => match run_libmpv(&lib, &src, volume, crop, &opts, &rx, &sh, &audio) {
                     Ok(()) => {
@@ -438,9 +442,13 @@ fn run_libmpv(
         // Settings the TV needs no matter what the person's config says. They are
         // applied before start-up and again afterwards, because mpv.conf is read
         // during start-up and could override them (e.g. vo=gpu or a custom ao).
+        let verbose_log = std::env::var_os("VICTR_MPV_LOG").is_some();
         let essentials = |set: &dyn Fn(&str, &str) -> c_int| {
             set("vo", "libmpv");
-            set("terminal", "no");
+            set("terminal", if verbose_log { "yes" } else { "no" });
+            if verbose_log {
+                set("msg-level", "ao=v,ad=v,cplayer=v");
+            }
             set("osc", "no");
             set("keep-open", "yes");
             set("panscan", if crop { "1.0" } else { "0.0" });
@@ -528,6 +536,8 @@ fn run_libmpv(
         let mut size: [c_int; 2] = [FW as c_int, FH as c_int];
         let mut stride: usize = FW * 4;
         let mut last_poll = Instant::now();
+        let mut last_log = Instant::now();
+        let mut last_log_bytes = 0u64;
         let mut last_resync = Instant::now() - Duration::from_secs(10);
         let mut shuttle_active = false;
         let mut was_paused = false;
@@ -721,6 +731,17 @@ fn run_libmpv(
                 }
                 if let Some(sk) = seeking {
                     s.seeking = sk;
+                }
+                if verbose_log && last_log.elapsed() >= Duration::from_secs(1) {
+                    let cur_b = audio.bytes_in.load(Ordering::Relaxed);
+                    let dt_s = last_log.elapsed().as_secs_f64().max(0.001);
+                    let bps = (cur_b.saturating_sub(last_log_bytes)) as f64 / dt_s;
+                    last_log_bytes = cur_b;
+                    last_log = Instant::now();
+                    eprintln!(
+                        "[victr-mpv] pos={:.2} avsync={:.2} paused={} seeking={} shuttle={} pcm={:.0}B/s",
+                        s.pos, avsync, is_paused, is_seeking, shuttle_active, bps
+                    );
                 }
             }
             std::thread::sleep(Duration::from_millis(3));
@@ -1119,6 +1140,7 @@ mod tests {
             session,
             stop: Arc::new(AtomicBool::new(false)),
             discard: Arc::new(AtomicBool::new(false)),
+            bytes_in: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let mut child = spawn_audio(route, "av://lavfi:sine=frequency=440:duration=2", 0.0, 100.0, false, &audio);
         assert!(child.is_some(), "mpv should start");

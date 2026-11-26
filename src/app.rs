@@ -3266,12 +3266,15 @@ impl CrtApp {
     }
 
     fn start_video_at(&mut self, src: String, start: f64) {
-        // Stop any previous player FIRST so teardown cannot race with the new audio/video session.
+        // Stop any previous player FIRST so teardown cannot race with the new audio/video session,
+        // and clear the previous channel's frame immediately so static plays until frame #1 arrives.
         self.stop_vcr_shuttle_silent();
         self.player = None;
         self.web_player = None;
         self.retro_player = None;
         self.capture_player = None;
+        self.video_image = None;
+        self.video_frame_no = 0;
         let _ = self.splash.skip();
         self.startup_dest_pending = false;
         if self.current_channel.is_none() && self.screenshot.is_none() {
@@ -3517,6 +3520,8 @@ impl CrtApp {
                     self.web_player.take();
                     self.retro_player.take();
                     self.capture_player.take();
+                    self.video_image = None;
+                    self.video_frame_no = 0;
                 }
                 ui.horizontal(|ui| {
                     let te = ui.add(
@@ -3678,7 +3683,24 @@ impl CrtApp {
             });
     }
 
+    /// True while tuning into a new channel or buffering a newly loaded stream's first frame:
+    /// errs on the side of authentic CRT static snow + hiss instead of flashing the old frame or audio blip.
+    fn is_tuning_static(&self) -> bool {
+        if self.guide.active || self.splash.is_active() {
+            return false;
+        }
+        if self.pending_tune_channel.is_some() {
+            return true;
+        }
+        let has_active_stream = self.player.is_some()
+            || self.web_player.is_some()
+            || self.retro_player.is_some()
+            || self.capture_player.is_some();
+        self.s.pattern == Pattern::Video && has_active_stream && self.video_image.is_none()
+    }
+
     fn update_audio(&mut self) {
+        let tuning_static = self.is_tuning_static();
         let Some(a) = &self.audio else { return };
         let s = &self.s;
         let mut p = a.params.lock().unwrap();
@@ -3693,7 +3715,7 @@ impl CrtApp {
         p.degauss_t = self.sim.degauss_t;
         p.channel_switch_t = self.sim.channel_switch_t;
         p.whack_t = self.sim.whack_t;
-        p.splash_static = if self.splash.is_static() { 1.0 } else { 0.0 };
+        p.splash_static = if self.splash.is_static() || tuning_static { 1.0 } else { 0.0 };
         p.test_tone = s.test_tone && s.pattern == Pattern::ColorBars && !self.splash.is_active();
         let (c_sig_drop, c_noise, c_ghost, c_track, c_warble, c_hum, c_ripple) = self.sim.chaos_audio_offsets();
         let (ch_ft, ch_tr) = self.sim.channel_aft_offsets();
@@ -5930,6 +5952,8 @@ impl CrtApp {
                 let view = [self.pan[0] + shift_x, self.pan[1], h];
 
                 // simulation step
+                let tuning_static = self.is_tuning_static();
+                self.sim.set_tuning_static(tuning_static);
                 // In slow motion the whole TV (beam, signal, animation) runs on a slowed clock.
                 let slow = if self.s.rolling_scan { self.s.slow_mo.max(1.0) } else { 1.0 };
                 let mut scan_step = (0.0f32, 1.0f32, 1.0f32 / 60.0); // (phase, window, frame time)
@@ -6069,6 +6093,10 @@ impl CrtApp {
                     );
                     fi.image = Some(guide_frame);
                     fi.u.pattern = Pattern::Image.id();
+                } else if tuning_static {
+                    fi.image = None;
+                    fi.u.pattern = Pattern::FlatField.id();
+                    fi.u.flat = [0.16, 0.16, 0.16];
                 } else {
                     fi.image = if self.s.pattern == Pattern::Video { self.video_image.clone() } else { self.image.clone() };
                 }
