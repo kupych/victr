@@ -821,7 +821,7 @@ impl PlexManager {
                         }
                     }
                 }
-                ChannelKind::Guide | ChannelKind::LiveStream { .. } => {}
+                ChannelKind::Guide | ChannelKind::LiveStream { .. } | ChannelKind::Block { .. } => {}
             }
         }
         if let Some(w) = &mut self.active_watch {

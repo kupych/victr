@@ -563,9 +563,12 @@ impl GuideState {
                 let is_sel = idx == self.selected_idx;
                 let is_movie = matches!(ch.kind, ChannelKind::MovieGenre { .. });
                 let is_live = matches!(ch.kind, ChannelKind::LiveStream { .. });
+                let is_block = matches!(ch.kind, ChannelKind::Block { .. });
 
                 let (c_fill, c_hi, c_lo, c_fg) = if is_sel {
                     ([244, 198, 52, 255], [255, 236, 148, 255], [154, 112, 16, 255], [10, 18, 44, 255])
+                } else if is_block {
+                    ([74, 38, 128, 255], [148, 102, 224, 255], [34, 14, 68, 255], [250, 222, 96, 255])
                 } else if is_live {
                     ([18, 92, 76, 255], [76, 188, 156, 255], [8, 44, 36, 255], [250, 224, 96, 255])
                 } else if is_movie {

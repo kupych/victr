@@ -1109,6 +1109,23 @@ impl CrtApp {
         raw.extend(self.folders.channels.iter().cloned());
         raw.extend(self.m3u.channels.iter().cloned());
         raw.extend(self.custom.channels.iter().cloned());
+        let block_res = channels_file::build_block_channels(&self.channels_file.cfg, &raw);
+        if !block_res.hidden_source_keys.is_empty() {
+            raw.retain(|c| {
+                !block_res
+                    .hidden_source_keys
+                    .iter()
+                    .any(|(p, sk)| c.provider_id == *p && c.source_key == *sk)
+            });
+        }
+        raw.extend(block_res.channels);
+        for (prov, sid) in block_res.pending_episode_fetches {
+            match prov.as_str() {
+                "jellyfin" => self.jellyfin.ensure_series_episodes(&sid),
+                "plex" => self.plex.ensure_series_episodes(&sid),
+                _ => {}
+            }
+        }
         channels_file::apply_overrides(&mut raw, &self.channels_file.cfg);
         if raw.is_empty() {
             self.lineup.clear();
@@ -1524,6 +1541,13 @@ impl CrtApp {
                     self.osd.show_channel(number, &ch.callsign, "TUNING...", self.s.mono);
                     return;
                 }
+            }
+        } else if let ChannelKind::Block { ref items, pending_loads, .. } = ch.kind {
+            if items.is_empty() && pending_loads {
+                self.pending_tune_channel = Some(number);
+                self.sim.switch_channel();
+                self.osd.show_channel(number, &ch.callsign, "LOADING BLOCK...", self.s.mono);
+                return;
             }
         }
         let now_unix = chrono::Utc::now().timestamp();
@@ -4945,7 +4969,12 @@ impl CrtApp {
         }
         if let Some(pending) = self.pending_tune_channel {
             if let Some(ch) = self.channel_by_number(pending) {
-                if let ChannelKind::Series { loaded_episodes: true, .. } = ch.kind {
+                let ready = match &ch.kind {
+                    ChannelKind::Series { loaded_episodes: true, .. } => true,
+                    ChannelKind::Block { items, pending_loads, .. } => !items.is_empty() || !pending_loads,
+                    _ => false,
+                };
+                if ready {
                     self.pending_tune_channel = None;
                     self.tune_channel(pending);
                 }

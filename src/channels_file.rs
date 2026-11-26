@@ -52,10 +52,10 @@ pub struct FileChannelDef {
     pub name: String,
     #[serde(default)]
     pub callsign: String,
-    /// `"live"`, `"web"`, `"series"`, `"movies"`, or `"folder"`.
+    /// `"live"`, `"web"`, `"series"`, `"movies"`, `"folder"`, `"game"`, `"capture"`, or `"block"`.
     #[serde(default)]
     pub kind: String,
-    /// Semantic channel type mapped through `type_profiles` (e.g. `"broadcast"`, `"vhs"`, `"weather"`).
+    /// Semantic channel type mapped through `type_profiles` (e.g. `"broadcast"`, `"vhs"`, `"weather"`, `"animated"`).
     #[serde(rename = "type", default)]
     pub channel_type: String,
     /// Optional direct TV preset/profile override for this channel.
@@ -82,6 +82,21 @@ pub struct FileChannelDef {
     pub enabled: bool,
     #[serde(default)]
     pub items: Vec<FileMediaItem>,
+    /// Show/channel names to pull into a `kind: "block"` channel (matched across Jellyfin, Plex, Folders, etc.).
+    #[serde(default)]
+    pub shows: Vec<String>,
+    /// Optional genre keywords to pull into a `kind: "block"` channel (e.g. `["Animation"]`).
+    #[serde(default)]
+    pub genres: Vec<String>,
+    /// Rotation mode for `kind: "block"`: `"alternate"` (round-robin, default), `"shuffle"`, or `"sequential"`.
+    #[serde(default)]
+    pub mode: String,
+    /// For `kind: "block"`: `true` (default) = drop in live on a 24/7 broadcast clock; `false` = episodic next-unwatched from 0:00.
+    #[serde(default = "default_true")]
+    pub live: bool,
+    /// For `kind: "block"`: if `true`, hides the individual matched source channels from the main lineup.
+    #[serde(default)]
+    pub hide_sources: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -155,6 +170,13 @@ pub fn build_inline_channels(cfg: &ChannelsFileConfig) -> Vec<Channel> {
         }
         let name = def.name.trim().to_string();
         let kind_norm = def.kind.trim().to_ascii_lowercase();
+        // Programming blocks (`kind: "block"` / `"mix"` / `"playlist"`) are built in `build_block_channels`
+        // once all Jellyfin, Plex, and Local Folder channels have been collected.
+        if matches!(kind_norm.as_str(), "block" | "mix" | "playlist")
+            || (!def.shows.is_empty() && kind_norm.is_empty())
+        {
+            continue;
+        }
         let ch_id = if def.id.trim().is_empty() {
             format!("cfg:{idx}:{}", if name.is_empty() { "ch" } else { &name })
         } else {
@@ -346,6 +368,274 @@ pub fn build_inline_channels(cfg: &ChannelsFileConfig) -> Vec<Channel> {
     out
 }
 
+/// Output from assembling `kind: "block"` channels against the combined provider lineup.
+pub struct BlockBuildResult {
+    pub channels: Vec<Channel>,
+    /// `(provider_id, series_id)` pairs whose episodes haven't been fetched yet from Jellyfin/Plex.
+    pub pending_episode_fetches: Vec<(String, String)>,
+    /// `(provider_id, source_key)` pairs requested to be hidden (`hide_sources: true`).
+    pub hidden_source_keys: Vec<(String, String)>,
+}
+
+fn match_source_for_query<'a>(query: &str, sources: &'a [Channel]) -> Option<&'a Channel> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    let low = q.to_ascii_lowercase();
+    // 1. Exact case-insensitive name or callsign match first
+    if let Some(ch) = sources.iter().find(|c| {
+        !matches!(c.kind, ChannelKind::Guide | ChannelKind::LiveStream { .. } | ChannelKind::Block { .. })
+            && (c.name.eq_ignore_ascii_case(q) || c.callsign.eq_ignore_ascii_case(q))
+    }) {
+        return Some(ch);
+    }
+    // 2. Substring match on name or source_key
+    sources.iter().find(|c| {
+        !matches!(c.kind, ChannelKind::Guide | ChannelKind::LiveStream { .. } | ChannelKind::Block { .. })
+            && (c.name.to_ascii_lowercase().contains(&low)
+                || c.source_key.to_ascii_lowercase().contains(&low))
+    })
+}
+
+fn format_block_item(show_name: &str, show_art: &str, ep: &MediaItem) -> MediaItem {
+    let ep_part = ep.short_label();
+    let title = if ep_part.to_ascii_lowercase().starts_with(&show_name.to_ascii_lowercase()) {
+        ep_part
+    } else {
+        format!("{show_name} · {ep_part}")
+    };
+    MediaItem {
+        id: ep.id.clone(),
+        title,
+        season: None,
+        episode: None,
+        overview: ep.overview.clone(),
+        runtime_secs: if ep.runtime_secs > 60.0 { ep.runtime_secs } else { 1500.0 },
+        played: ep.played,
+        resume_secs: ep.resume_secs,
+        artwork_id: if !ep.artwork_id.is_empty() {
+            ep.artwork_id.clone()
+        } else {
+            show_art.to_string()
+        },
+        stream_url: ep.stream_url.clone(),
+    }
+}
+
+/// Builds `kind: "block"` / `"mix"` channels by pulling episodes from matching Jellyfin, Plex,
+/// Local Folder, or Custom channels and interleaving them (`alternate`, `shuffle`, or `sequential`).
+pub fn build_block_channels(cfg: &ChannelsFileConfig, source_channels: &[Channel]) -> BlockBuildResult {
+    let mut res = BlockBuildResult {
+        channels: Vec::new(),
+        pending_episode_fetches: Vec::new(),
+        hidden_source_keys: Vec::new(),
+    };
+
+    for (idx, def) in cfg.channels.iter().enumerate() {
+        if !def.enabled {
+            continue;
+        }
+        let kind_norm = def.kind.trim().to_ascii_lowercase();
+        let is_block = matches!(kind_norm.as_str(), "block" | "mix" | "playlist")
+            || (!def.shows.is_empty() && kind_norm.is_empty());
+        if !is_block {
+            continue;
+        }
+        let name = def.name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+
+        // Collect matched source channels in user-specified order without duplicates
+        let mut matched: Vec<&Channel> = Vec::new();
+        let mut seen_keys: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        for q in &def.shows {
+            if let Some(ch) = match_source_for_query(q, source_channels) {
+                if seen_keys.insert((ch.provider_id.clone(), ch.source_key.clone())) {
+                    matched.push(ch);
+                }
+            }
+        }
+        for gq in &def.genres {
+            let low = gq.trim().to_ascii_lowercase();
+            if low.is_empty() {
+                continue;
+            }
+            for ch in source_channels {
+                if matches!(ch.kind, ChannelKind::Guide | ChannelKind::LiveStream { .. } | ChannelKind::Block { .. }) {
+                    continue;
+                }
+                let hit = match &ch.kind {
+                    ChannelKind::MovieGenre { genre, .. } => genre.to_ascii_lowercase().contains(&low),
+                    ChannelKind::Series { overview, .. } => {
+                        ch.name.to_ascii_lowercase().contains(&low)
+                            || ch.channel_type.to_ascii_lowercase().contains(&low)
+                            || overview.to_ascii_lowercase().contains(&low)
+                    }
+                    _ => false,
+                };
+                if hit && seen_keys.insert((ch.provider_id.clone(), ch.source_key.clone())) {
+                    matched.push(ch);
+                }
+            }
+        }
+
+        let mut pending_loads = false;
+        let mut per_show: Vec<Vec<MediaItem>> = Vec::new();
+        let mut primary_provider: Option<String> = None;
+        let mut primary_art: String = def.artwork_url.trim().to_string();
+
+        for ch in &matched {
+            if primary_provider.is_none() {
+                primary_provider = Some(ch.provider_id.clone());
+            }
+            if primary_art.is_empty() && !ch.artwork_id.is_empty() {
+                primary_art = ch.artwork_id.clone();
+            }
+            if def.hide_sources {
+                res.hidden_source_keys.push((ch.provider_id.clone(), ch.source_key.clone()));
+            }
+            if let ChannelKind::Series { series_id, loaded_episodes: false, .. } = &ch.kind {
+                pending_loads = true;
+                if ch.provider_id == "jellyfin" || ch.provider_id == "plex" {
+                    let pair = (ch.provider_id.clone(), series_id.clone());
+                    if !res.pending_episode_fetches.contains(&pair) {
+                        res.pending_episode_fetches.push(pair);
+                    }
+                }
+            }
+            let eps: Vec<MediaItem> = ch
+                .items()
+                .iter()
+                .map(|ep| format_block_item(&ch.name, &ch.artwork_id, ep))
+                .collect();
+            if !eps.is_empty() {
+                per_show.push(eps);
+            }
+        }
+
+        // Also allow optional explicit inline `def.items` appended as an extra pool
+        if !def.items.is_empty() {
+            let inline_eps: Vec<MediaItem> = def
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| !it.stream_url.trim().is_empty())
+                .map(|(i, it)| MediaItem {
+                    id: if it.id.trim().is_empty() {
+                        format!("blk:{idx}:{i}")
+                    } else {
+                        it.id.trim().to_string()
+                    },
+                    title: it.title.trim().to_string(),
+                    season: it.season,
+                    episode: it.episode,
+                    overview: it.overview.clone(),
+                    runtime_secs: it.runtime_secs.unwrap_or(1500.0),
+                    played: false,
+                    resume_secs: 0.0,
+                    artwork_id: it.artwork_url.trim().to_string(),
+                    stream_url: it.stream_url.trim().to_string(),
+                })
+                .collect();
+            if !inline_eps.is_empty() {
+                per_show.push(inline_eps);
+            }
+        }
+
+        let mode_raw = def.mode.trim().to_ascii_lowercase();
+        let mode = match mode_raw.as_str() {
+            "shuffle" | "random" => "shuffle",
+            "sequential" | "serial" | "marathon" => "sequential",
+            _ => "alternate",
+        };
+
+        let mut combined: Vec<MediaItem> = Vec::new();
+        match mode {
+            "alternate" => {
+                let max_len = per_show.iter().map(|v| v.len()).max().unwrap_or(0);
+                for round in 0..max_len {
+                    for show_eps in &per_show {
+                        if let Some(ep) = show_eps.get(round) {
+                            combined.push(ep.clone());
+                        }
+                    }
+                }
+            }
+            "shuffle" => {
+                for show_eps in per_show {
+                    combined.extend(show_eps);
+                }
+                let seed_num = def.number.unwrap_or(idx as u16 + 20) as u64;
+                let mut keyed: Vec<(u64, MediaItem)> = combined
+                    .into_iter()
+                    .map(|item| {
+                        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ seed_num.wrapping_mul(0x9e37_79b9);
+                        for b in name.bytes().chain(item.id.bytes()).chain(item.title.bytes()) {
+                            h ^= b as u64;
+                            h = h.wrapping_mul(0x1000_0000_01b3);
+                        }
+                        (h, item)
+                    })
+                    .collect();
+                keyed.sort_by_key(|(h, _)| *h);
+                combined = keyed.into_iter().map(|(_, it)| it).collect();
+            }
+            _ => {
+                for show_eps in per_show {
+                    combined.extend(show_eps);
+                }
+            }
+        }
+
+        let ch_id = if def.id.trim().is_empty() {
+            format!("cfg:block:{idx}:{name}")
+        } else {
+            format!("cfg:{}", def.id.trim())
+        };
+        let callsign = if !def.callsign.trim().is_empty() {
+            def.callsign.trim().chars().take(5).collect::<String>().to_ascii_uppercase()
+        } else {
+            make_callsign(&name)
+        };
+        let overview = if !def.overview.trim().is_empty() {
+            def.overview.trim().to_string()
+        } else if !matched.is_empty() {
+            let list: Vec<&str> = matched.iter().map(|c| c.name.as_str()).collect();
+            format!("Rotating block: {}", list.join(", "))
+        } else {
+            "Custom programming block".into()
+        };
+        let ch_type = if def.channel_type.trim().is_empty() {
+            "block".to_string()
+        } else {
+            def.channel_type.trim().to_string()
+        };
+
+        res.channels.push(Channel {
+            number: def.number.filter(|&n| n >= 2).unwrap_or(0),
+            provider_id: primary_provider.unwrap_or_else(|| "channels".into()),
+            source_key: ch_id,
+            callsign,
+            name,
+            artwork_id: primary_art,
+            channel_type: ch_type,
+            profile_override: def.profile.clone().filter(|s| !s.trim().is_empty()),
+            kind: ChannelKind::Block {
+                mode: mode.into(),
+                live_clock: def.live,
+                overview,
+                is_favorite: def.is_favorite,
+                items: combined,
+                pending_loads,
+            },
+        });
+    }
+
+    res
+}
+
 fn rule_matches_channel(rule: &ChannelOverride, ch: &Channel) -> bool {
     if !rule.provider.trim().is_empty() && !ch.provider_id.eq_ignore_ascii_case(rule.provider.trim()) {
         return false;
@@ -403,8 +693,11 @@ pub fn apply_overrides(channels: &mut Vec<Channel>, cfg: &ChannelsFileConfig) {
                 }
             }
             if let Some(fav) = rule.favorite {
-                if let ChannelKind::Series { is_favorite, .. } = &mut ch.kind {
-                    *is_favorite = fav;
+                match &mut ch.kind {
+                    ChannelKind::Series { is_favorite, .. } | ChannelKind::Block { is_favorite, .. } => {
+                        *is_favorite = fav;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -546,6 +839,11 @@ impl ChannelsFileManager {
                     is_favorite: false,
                     enabled: true,
                     items: Vec::new(),
+                    shows: Vec::new(),
+                    genres: Vec::new(),
+                    mode: String::new(),
+                    live: true,
+                    hide_sources: false,
                 });
             }
             if self.cfg.overrides.is_empty() {
@@ -756,5 +1054,106 @@ mod tests {
             resolve_profile_name(&cfg, "unknown_type", None).as_deref(),
             Some("Broadcast")
         );
+    }
+
+    #[test]
+    fn block_channel_alternates_shows_on_live_clock_and_supports_browsing() {
+        let json = r#"{
+            "channels": [
+                {
+                    "number": 20,
+                    "callsign": "TOONS",
+                    "name": "Animated Block",
+                    "kind": "block",
+                    "type": "broadcast",
+                    "mode": "alternate",
+                    "live": true,
+                    "hide_sources": true,
+                    "shows": ["The Simpsons", "Futurama"]
+                }
+            ]
+        }"#;
+        let cfg: ChannelsFileConfig = serde_json::from_str(json).unwrap();
+        let mk_ep = |id: &str, s: u32, e: u32, title: &str| MediaItem {
+            id: id.into(),
+            title: title.into(),
+            season: Some(s),
+            episode: Some(e),
+            overview: String::new(),
+            runtime_secs: 1320.0,
+            played: false,
+            resume_secs: 0.0,
+            artwork_id: String::new(),
+            stream_url: format!("/media/{id}.mkv"),
+        };
+        let sources = vec![
+            Channel {
+                number: 0,
+                provider_id: "jellyfin".into(),
+                source_key: "jf-simpsons".into(),
+                callsign: "SIMPS".into(),
+                name: "The Simpsons".into(),
+                artwork_id: "art-simps".into(),
+                channel_type: "series".into(),
+                profile_override: None,
+                kind: ChannelKind::Series {
+                    series_id: "jf-simpsons".into(),
+                    overview: String::new(),
+                    is_continue: false,
+                    is_favorite: false,
+                    episodes: vec![
+                        mk_ep("s1", 1, 1, "Simpsons Roasting"),
+                        mk_ep("s2", 1, 2, "Bart the Genius"),
+                    ],
+                    next_up_episode_id: None,
+                    loaded_episodes: true,
+                },
+            },
+            Channel {
+                number: 0,
+                provider_id: "jellyfin".into(),
+                source_key: "jf-futurama".into(),
+                callsign: "FUTUR".into(),
+                name: "Futurama".into(),
+                artwork_id: "art-futur".into(),
+                channel_type: "series".into(),
+                profile_override: None,
+                kind: ChannelKind::Series {
+                    series_id: "jf-futurama".into(),
+                    overview: String::new(),
+                    is_continue: false,
+                    is_favorite: false,
+                    episodes: vec![
+                        mk_ep("f1", 1, 1, "Space Pilot 3000"),
+                        mk_ep("f2", 1, 2, "The Series Has Landed"),
+                    ],
+                    next_up_episode_id: None,
+                    loaded_episodes: true,
+                },
+            },
+        ];
+
+        let res = build_block_channels(&cfg, &sources);
+        assert_eq!(res.channels.len(), 1);
+        assert_eq!(res.hidden_source_keys.len(), 2);
+        let blk = &res.channels[0];
+        assert_eq!(blk.number, 20);
+        assert_eq!(blk.callsign, "TOONS");
+        // Round-robin interleaved: Simpsons Ep1 -> Futurama Ep1 -> Simpsons Ep2 -> Futurama Ep2
+        let titles: Vec<&str> = blk.items().iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "The Simpsons · S01E01 Simpsons Roasting",
+                "Futurama · S01E01 Space Pilot 3000",
+                "The Simpsons · S01E02 Bart the Genius",
+                "Futurama · S01E02 The Series Has Landed",
+            ]
+        );
+        // Live drop-in works at any timestamp, and next_after rolls cleanly to the next show
+        let target = blk.resolve_now(1_700_000_123).expect("block should resolve live");
+        assert!(target.is_live_clock);
+        let next = blk.next_after("s1").expect("next_after should advance to Futurama");
+        assert_eq!(next.item.id, "f1");
     }
 }

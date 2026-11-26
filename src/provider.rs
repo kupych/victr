@@ -61,6 +61,16 @@ pub enum ChannelKind {
         now_title: String,
         overview: String,
     },
+    /// Curated multi-show programming block (e.g. "Animated Block") alternating or shuffling
+    /// episodes across multiple shows. Supports both 24/7 live drop-in and full episode browsing.
+    Block {
+        mode: String,
+        live_clock: bool,
+        overview: String,
+        is_favorite: bool,
+        items: Vec<MediaItem>,
+        pending_loads: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +103,7 @@ pub fn default_channel_type(kind: &ChannelKind) -> &'static str {
                 "live"
             }
         }
+        ChannelKind::Block { .. } => "block",
     }
 }
 
@@ -223,7 +234,7 @@ pub fn merge_channel_lineup(raw: Vec<Channel>) -> Vec<Channel> {
         ch.number = 0;
         match ch.kind {
             ChannelKind::Guide => {}
-            ChannelKind::Series { .. } => series.push(ch),
+            ChannelKind::Series { .. } | ChannelKind::Block { .. } => series.push(ch),
             ChannelKind::MovieGenre { .. } => movies.push(ch),
             ChannelKind::LiveStream { .. } => live.push(ch),
         }
@@ -326,6 +337,14 @@ pub fn filter_visible_channels<'a>(channels: &'a [Channel], favorites_only: bool
                     || now_title.to_lowercase().contains(&q);
                 !favorites_only && q_ok
             }
+            ChannelKind::Block { is_favorite, .. } => {
+                let fav_ok = !favorites_only || *is_favorite;
+                let q_ok = q.is_empty()
+                    || ch.name.to_lowercase().contains(&q)
+                    || ch.callsign.to_lowercase().contains(&q)
+                    || ch.channel_type.to_lowercase().contains(&q);
+                fav_ok && q_ok
+            }
         })
         .collect()
 }
@@ -333,11 +352,12 @@ pub fn filter_visible_channels<'a>(channels: &'a [Channel], favorites_only: bool
 // ------------------------------------------------------------------ Scheduling & Tuning
 
 impl Channel {
-    /// Returns all selectable items (episodes for Series, movies for MovieGenre).
+    /// Returns all selectable items (episodes for Series, movies for MovieGenre, rotation items for Block).
     pub fn items(&self) -> &[MediaItem] {
         match &self.kind {
             ChannelKind::Series { episodes, .. } => episodes,
             ChannelKind::MovieGenre { movies, .. } => movies,
+            ChannelKind::Block { items, .. } => items,
             ChannelKind::Guide | ChannelKind::LiveStream { .. } => &[],
         }
     }
@@ -360,6 +380,14 @@ impl Channel {
                     movies.iter().position(|x| x.id == m.id).unwrap_or(0)
                 } else {
                     0
+                }
+            }
+            ChannelKind::Block { live_clock, items, .. } => {
+                if *live_clock {
+                    let now = Utc::now().timestamp();
+                    schedule_live_in_order(items, self.number, now).map(|(idx, _)| idx).unwrap_or(0)
+                } else {
+                    pick_next_episode_index(items, None).unwrap_or(0)
                 }
             }
             ChannelKind::Guide | ChannelKind::LiveStream { .. } => 0,
@@ -464,10 +492,44 @@ impl Channel {
                     is_live_clock: true,
                 })
             }
+            ChannelKind::Block { live_clock, items, .. } => {
+                if *live_clock {
+                    let (idx, offset) = schedule_live_in_order(items, self.number, now_unix)?;
+                    let item = &items[idx];
+                    Some(TuneTarget {
+                        channel_number: self.number,
+                        provider_id: self.provider_id.clone(),
+                        source_key: self.source_key.clone(),
+                        callsign: self.callsign.clone(),
+                        channel_name: self.name.clone(),
+                        channel_type: self.effective_type().to_string(),
+                        profile_override: self.profile_override.clone(),
+                        stream_url: item.stream_url.clone(),
+                        start_secs: offset,
+                        item: item.clone(),
+                        is_live_clock: true,
+                    })
+                } else {
+                    let item = pick_next_episode(items, None)?;
+                    Some(TuneTarget {
+                        channel_number: self.number,
+                        provider_id: self.provider_id.clone(),
+                        source_key: self.source_key.clone(),
+                        callsign: self.callsign.clone(),
+                        channel_name: self.name.clone(),
+                        channel_type: self.effective_type().to_string(),
+                        profile_override: self.profile_override.clone(),
+                        stream_url: item.stream_url.clone(),
+                        start_secs: item.resume_secs.max(0.0),
+                        item: item.clone(),
+                        is_live_clock: false,
+                    })
+                }
+            }
         }
     }
 
-    /// Returns the next episode after `current_item_id` (for auto-advance on Series channels).
+    /// Returns the next episode after `current_item_id` (for auto-advance on Series & Block channels).
     pub fn next_after(&self, current_item_id: &str) -> Option<TuneTarget> {
         match &self.kind {
             ChannelKind::Series { episodes, .. } => {
@@ -485,6 +547,29 @@ impl Channel {
                     start_secs: 0.0,
                     item: next.clone(),
                     is_live_clock: false,
+                })
+            }
+            ChannelKind::Block { items, live_clock, .. } => {
+                if items.is_empty() {
+                    return None;
+                }
+                let next = if let Some(pos) = items.iter().position(|e| e.id == current_item_id) {
+                    &items[(pos + 1) % items.len()]
+                } else {
+                    &items[0]
+                };
+                Some(TuneTarget {
+                    channel_number: self.number,
+                    provider_id: self.provider_id.clone(),
+                    source_key: self.source_key.clone(),
+                    callsign: self.callsign.clone(),
+                    channel_name: self.name.clone(),
+                    channel_type: self.effective_type().to_string(),
+                    profile_override: self.profile_override.clone(),
+                    stream_url: next.stream_url.clone(),
+                    start_secs: 0.0,
+                    item: next.clone(),
+                    is_live_clock: *live_clock,
                 })
             }
             ChannelKind::MovieGenre { movies, .. } => {
@@ -592,6 +677,71 @@ impl Channel {
                 }
                 out
             }
+            ChannelKind::Block { live_clock, items, pending_loads, .. } => {
+                if items.is_empty() {
+                    let msg = if *pending_loads {
+                        format!("{} (LOADING SHOWS...)", self.name)
+                    } else {
+                        self.name.clone()
+                    };
+                    return vec![GridEntry {
+                        title: msg,
+                        start_unix: window_start,
+                        end_unix: window_end,
+                        is_live_in_progress: false,
+                    }];
+                }
+                if *live_clock {
+                    let total_secs: i64 = items.iter().map(block_slot_secs).sum::<i64>().max(900);
+                    let phase_off = ((self.number as i64 * 900) % total_secs).rem_euclid(total_secs);
+                    let cycle_start = ((window_start + phase_off) / total_secs) * total_secs - phase_off;
+                    let mut t = cycle_start;
+                    let mut out = Vec::new();
+                    let mut guard = 0;
+                    while t < window_end && guard < 240 {
+                        for ep in items {
+                            let dur = block_slot_secs(ep);
+                            let end = t + dur;
+                            if end > window_start && t < window_end {
+                                out.push(GridEntry {
+                                    title: ep.short_label(),
+                                    start_unix: t,
+                                    end_unix: end,
+                                    is_live_in_progress: now_unix >= t && now_unix < end,
+                                });
+                            }
+                            t = end;
+                            guard += 1;
+                            if t >= window_end || guard >= 240 {
+                                break;
+                            }
+                        }
+                    }
+                    out
+                } else {
+                    let start_idx = pick_next_episode_index(items, None).unwrap_or(0);
+                    let slot_anchor = (now_unix / 1800) * 1800;
+                    let mut cur_t = slot_anchor;
+                    let mut out = Vec::new();
+                    let mut idx = start_idx;
+                    while cur_t < window_end && idx < items.len() && out.len() < 12 {
+                        let ep = &items[idx];
+                        let dur = block_slot_secs(ep).max(1800);
+                        let end_t = cur_t + dur;
+                        if end_t > window_start {
+                            out.push(GridEntry {
+                                title: ep.short_label(),
+                                start_unix: cur_t,
+                                end_unix: end_t,
+                                is_live_in_progress: false,
+                            });
+                        }
+                        cur_t = end_t;
+                        idx += 1;
+                    }
+                    out
+                }
+            }
         }
     }
 
@@ -639,6 +789,31 @@ impl Channel {
                 };
                 (title, meta, overview.clone(), self.artwork_id.clone())
             }
+            ChannelKind::Block { mode, live_clock, overview, items, pending_loads, .. } => {
+                let mode_tag = mode.to_ascii_uppercase();
+                if items.is_empty() {
+                    let meta = if *pending_loads { "BLOCK · LOADING SHOWS..." } else { "PROGRAMMING BLOCK" };
+                    return (self.name.clone(), meta.into(), overview.clone(), self.artwork_id.clone());
+                }
+                if *live_clock {
+                    if let Some((idx, offset)) = schedule_live_in_order(items, self.number, now_unix) {
+                        let ep = &items[idx];
+                        let in_mins = (offset / 60.0) as u32;
+                        let meta = format!("BLOCK ({}) · {} MIN · LIVE ({}M IN)", mode_tag, ep.runtime_mins(), in_mins);
+                        let desc = if !ep.overview.is_empty() { ep.overview.clone() } else { overview.clone() };
+                        let art = if !ep.artwork_id.is_empty() { ep.artwork_id.clone() } else { self.artwork_id.clone() };
+                        return (ep.short_label(), meta, desc, art);
+                    }
+                }
+                if let Some(ep) = pick_next_episode(items, None) {
+                    let meta = format!("BLOCK ({}) · {} MIN · UP NEXT", mode_tag, ep.runtime_mins());
+                    let desc = if !ep.overview.is_empty() { ep.overview.clone() } else { overview.clone() };
+                    let art = if !ep.artwork_id.is_empty() { ep.artwork_id.clone() } else { self.artwork_id.clone() };
+                    (ep.short_label(), meta, desc, art)
+                } else {
+                    (self.name.clone(), format!("BLOCK ({mode_tag})"), overview.clone(), self.artwork_id.clone())
+                }
+            }
         }
     }
 }
@@ -660,6 +835,35 @@ pub fn pick_next_episode_index(episodes: &[MediaItem], next_up_id: Option<&str>)
 
 pub fn pick_next_episode<'a>(episodes: &'a [MediaItem], next_up_id: Option<&str>) -> Option<&'a MediaItem> {
     pick_next_episode_index(episodes, next_up_id).and_then(|i| episodes.get(i))
+}
+
+fn block_slot_secs(ep: &MediaItem) -> i64 {
+    let raw = if ep.runtime_secs > 60.0 { ep.runtime_secs } else { 1500.0 };
+    ((raw / 900.0).ceil() as i64).max(1) * 900
+}
+
+/// Deterministic 24/7 broadcast clock that preserves the exact interleaved `items` order.
+/// Returns `(item_index, live_seek_offset_secs)`.
+pub fn schedule_live_in_order(items: &[MediaItem], ch_num: u16, now_unix: i64) -> Option<(usize, f64)> {
+    if items.is_empty() {
+        return None;
+    }
+    let total_secs: i64 = items.iter().map(block_slot_secs).sum::<i64>().max(900);
+    let phase_off = ((ch_num as i64 * 900) % total_secs).rem_euclid(total_secs);
+    let mut pos = (now_unix + phase_off).rem_euclid(total_secs);
+    for (idx, ep) in items.iter().enumerate() {
+        let dur = block_slot_secs(ep);
+        if pos < dur {
+            let max_off = if ep.runtime_secs > 30.0 {
+                (ep.runtime_secs - 15.0).max(0.0)
+            } else {
+                pos as f64
+            };
+            return Some((idx, (pos as f64).min(max_off)));
+        }
+        pos -= dur;
+    }
+    Some((0, 0.0))
 }
 
 fn movie_slot_secs(m: &MediaItem) -> i64 {

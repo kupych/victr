@@ -697,7 +697,7 @@ impl FoldersManager {
                         }
                     }
                 }
-                ChannelKind::Guide | ChannelKind::LiveStream { .. } => {}
+                ChannelKind::Guide | ChannelKind::LiveStream { .. } | ChannelKind::Block { .. } => {}
             }
         }
         let _ = save_config(&self.cfg);
