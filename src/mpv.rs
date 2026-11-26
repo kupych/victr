@@ -59,18 +59,30 @@ struct Audio {
     ring: Option<Arc<AudioRing>>,
     session: u64,
     stop: Arc<AtomicBool>,
-    discard: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    pump_active: Arc<AtomicBool>,
+    drain_req: Arc<std::sync::atomic::AtomicU64>,
+    drain_ack: Arc<std::sync::atomic::AtomicU64>,
     bytes_in: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Audio {
-    /// Copies raw s16le stereo PCM from `r` into the ring until EOF or stop.
-    /// When `discard` is set (during FF/RW shuttle), drops pipe bytes non-blockingly
-    /// so `ao=pcm` never stalls or drifts A/V sync against the 1× ring buffer.
+    fn new(ring: Option<Arc<AudioRing>>, session: u64, stop: Arc<AtomicBool>) -> Self {
+        Audio {
+            ring,
+            session,
+            stop,
+            paused: Arc::new(AtomicBool::new(false)),
+            pump_active: Arc::new(AtomicBool::new(false)),
+            drain_req: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            drain_ack: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bytes_in: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+    /// Copies raw s16le stereo PCM from a generic reader (CLI fallback) into the ring.
     fn pump(&self, mut r: impl Read + Send + 'static) {
         if let Some(ring) = self.ring.clone() {
             let stop = self.stop.clone();
-            let discard = self.discard.clone();
             let bytes_in = self.bytes_in.clone();
             let session = self.session;
             std::thread::spawn(move || {
@@ -84,9 +96,6 @@ impl Audio {
                                 break;
                             }
                             bytes_in.fetch_add(n as u64, Ordering::Relaxed);
-                            if discard.load(Ordering::Relaxed) {
-                                continue;
-                            }
                             let n = n & !3;
                             ring.push_s16_session(session, &buf[..n], &stop);
                             if stop.load(Ordering::Relaxed) {
@@ -98,12 +107,100 @@ impl Audio {
             });
         }
     }
-    #[allow(dead_code)]
-    fn set_discard(&self, on: bool) {
-        self.discard.store(on, Ordering::SeqCst);
+    /// Copies raw s16le stereo PCM from libmpv's `ao=pcm` pipe into the ring, supporting
+    /// sample-accurate pause gating (leaving unread burst bytes in the kernel pipe) and
+    /// synchronous non-blocking pipe draining before seeks/shuttle so stale audio never leaks.
+    #[cfg(unix)]
+    fn pump_pipe_fd(&self, fd: c_int) {
+        let Some(ring) = self.ring.clone() else {
+            close_pipe(Some((fd, -1)));
+            return;
+        };
+        let stop = self.stop.clone();
+        let paused = self.paused.clone();
+        let pump_active = self.pump_active.clone();
+        let drain_req = self.drain_req.clone();
+        let drain_ack = self.drain_ack.clone();
+        let bytes_in = self.bytes_in.clone();
+        let session = self.session;
+        pump_active.store(true, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            let mut r = fd_reader(fd);
+            let mut buf = vec![0u8; 1024];
+            let mut scratch = [0u8; 4096];
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let req = drain_req.load(Ordering::SeqCst);
+                if req != drain_ack.load(Ordering::Relaxed) {
+                    let mut avail = pipe_readable_bytes(fd);
+                    while avail > 0 {
+                        let want = avail.min(scratch.len());
+                        match r.read(&mut scratch[..want]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => avail = avail.saturating_sub(n),
+                        }
+                    }
+                    drain_ack.store(req, Ordering::SeqCst);
+                    continue;
+                }
+                if paused.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                let mut pfd = PollFd { fd, events: POLLIN, revents: 0 };
+                let pr = unsafe { poll(&mut pfd, 1, 5) };
+                if pr <= 0 {
+                    continue;
+                }
+                if (pfd.revents & POLLIN) == 0 && (pfd.revents & (POLLHUP | POLLERR)) != 0 {
+                    break;
+                }
+                match r.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        bytes_in.fetch_add(n as u64, Ordering::Relaxed);
+                        let n = n & !3;
+                        ring.push_s16_session(session, &buf[..n], &stop);
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                }
+            }
+            pump_active.store(false, Ordering::SeqCst);
+        });
+    }
+    #[cfg(not(unix))]
+    fn pump_pipe_fd(&self, fd: c_int) {
+        self.pump(fd_reader(fd));
+    }
+    fn set_paused(&self, on: bool) {
+        self.paused.store(on, Ordering::SeqCst);
         if on {
             self.clear();
         }
+    }
+    /// Clears the ring and synchronously discards any stale bytes currently queued
+    /// inside the kernel PCM pipe (must be called BEFORE issuing a seek/restart).
+    fn drain_pipe(&self) {
+        self.clear();
+        if !self.pump_active.load(Ordering::Relaxed) {
+            return;
+        }
+        let seq = self.drain_req.fetch_add(1, Ordering::SeqCst) + 1;
+        for _ in 0..20 {
+            if self.drain_ack.load(Ordering::SeqCst) >= seq || !self.pump_active.load(Ordering::Relaxed) {
+                break;
+            }
+            self.clear();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.clear();
     }
     fn clear(&self) {
         if let Some(r) = &self.ring {
@@ -129,10 +226,8 @@ impl Player {
         let src = source.to_string();
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
-        let discard = Arc::new(AtomicBool::new(false));
-        let bytes_in = Arc::new(std::sync::atomic::AtomicU64::new(0));
         std::thread::spawn(move || {
-            let audio = Audio { ring: audio, session, stop: stop2, discard, bytes_in };
+            let audio = Audio::new(audio, session, stop2);
             let lib_err = match Lib::load() {
                 Ok(lib) => match run_libmpv(&lib, &src, volume, crop, &opts, &rx, &sh, &audio) {
                     Ok(()) => {
@@ -197,9 +292,9 @@ impl Player {
 }
 
 /// Baseline DSP pipeline latency compensation (in seconds) when routing audio through `AudioRing` + sink:
-/// ~21 ms ao_pcm stdio + ~21 ms 4 KB pcm_pipe + ~45 ms AudioRing + ~5 ms block + ~21 ms out pipe + ~35 ms sink
-/// minus ~28 ms video presentation latency ≈ 120 ms net audio lag -> advance audio by -0.12 s.
-const DSP_AUDIO_DELAY_BASE_SECS: f64 = -0.12;
+/// ~55 ms steady-state pcm_pipe + ~45 ms AudioRing + ~5 ms block + ~21 ms out pipe + ~35 ms sink
+/// minus ~21 ms video presentation latency ≈ 140 ms net audio lag -> advance audio by -0.14 s.
+const DSP_AUDIO_DELAY_BASE_SECS: f64 = -0.14;
 
 #[derive(Clone, Copy)]
 pub struct StartOpts {
@@ -487,7 +582,7 @@ fn run_libmpv(
             essentials(&setp);
         }
         if let Some((r, _)) = pcm_pipe {
-            audio.pump(fd_reader(r));
+            audio.pump_pipe_fd(r);
         }
         let api = CString::new("sw").unwrap();
         let mut params = [
@@ -542,6 +637,7 @@ fn run_libmpv(
         let mut last_poll_bytes = 0u64;
         let mut last_poll_pos = -1.0f64;
         let mut silent_play_since: Option<Instant> = None;
+        let mut healthy_audio_since: Option<Instant> = None;
         let mut stall_recoveries: u32 = 0;
         let mut last_resync = Instant::now() - Duration::from_secs(10);
         let mut shuttle_active = false;
@@ -551,9 +647,12 @@ fn run_libmpv(
             // never accumulate a backlog of overlapping range requests.
             let mut pending_seek = 0.0f64;
             let mut pending_seek_fast = false;
-            let flush_seek = |pending_seek: &mut f64, pending_seek_fast: &mut bool| {
+            let flush_seek = |pending_seek: &mut f64, pending_seek_fast: &mut bool, in_shuttle: bool| {
                 if pending_seek.abs() > 0.001 {
                     let mode = if *pending_seek_fast { "relative+keyframes" } else { "relative" };
+                    if !in_shuttle {
+                        audio.drain_pipe();
+                    }
                     cmd(&["seek", &format!("{:.3}", *pending_seek), mode]);
                     audio.clear();
                     sh.lock().unwrap().seeking = true;
@@ -573,19 +672,28 @@ fn run_libmpv(
                         continue;
                     }
                     other => {
-                        flush_seek(&mut pending_seek, &mut pending_seek_fast);
+                        flush_seek(&mut pending_seek, &mut pending_seek_fast, shuttle_active);
                         match other {
                             Cmd::Stop => break 'outer,
                             Cmd::TogglePause => {
                                 cmd(&["cycle", "pause"]);
+                                if let Some(p) = get_flag("pause") {
+                                    audio.set_paused(p && !shuttle_active);
+                                    was_paused = p;
+                                }
                             }
                             Cmd::SetPaused(p) => {
                                 prop("pause", if p { "yes" } else { "no" });
+                                audio.set_paused(p && !shuttle_active);
+                                was_paused = p;
                             }
                             Cmd::SeekAbs(s) => {
+                                audio.drain_pipe();
                                 cmd(&["seek", &format!("{s:.3}"), "absolute"]);
                                 audio.clear();
                                 sh.lock().unwrap().seeking = true;
+                                silent_play_since = None;
+                                stall_recoveries = 0;
                             }
                             Cmd::Speed(sp) => {
                                 let clamped = sp.clamp(0.25, 16.0);
@@ -597,12 +705,11 @@ fn run_libmpv(
                             Cmd::SetShuttle(spd) => {
                                 if spd.abs() > 0.1 {
                                     shuttle_active = true;
-                                    // Detach audio decoding completely (`aid=no`) while shuttling!
-                                    // Never drain `ao=pcm` unthrottled while open — because `ao_pcm`
-                                    // is untimed, an unthrottled pipe lets mpv devour 50+ seconds of
-                                    // cached audio in 0.1s and get stuck in `delaying audio start`.
-                                    audio.clear();
+                                    // Detach audio decoding (`aid=no`) while shuttling, then flush any
+                                    // remaining initial-burst bytes out of the kernel pipe.
                                     prop("aid", "no");
+                                    audio.set_paused(false);
+                                    audio.drain_pipe();
                                     if spd > 0.1 && spd <= 8.5 {
                                         prop("pause", "no");
                                         prop("speed", &format!("{:.2}", spd.clamp(1.0, 8.0)));
@@ -616,16 +723,20 @@ fn run_libmpv(
                                     shuttle_active = false;
                                     prop("speed", "1.0");
                                     prop("pause", "no");
-                                    audio.clear();
+                                    audio.set_paused(false);
+                                    audio.drain_pipe();
                                     if was_sh {
                                         let cur_pos = get_f64("time-pos").unwrap_or_else(|| sh.lock().unwrap().pos).max(0.0);
-                                        // Re-attach audio BEFORE seeking so mpv seeks BOTH video & audio
-                                        // streams together to `cur_pos` (instead of attaching audio at the old cursor!).
+                                        // Re-attach audio BEFORE seeking, and use an exact `absolute` seek
+                                        // so playback resumes right where shuttle stopped instead of snapping
+                                        // backwards 3-5 seconds to a previous keyframe.
                                         prop("aid", "auto");
-                                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute+keyframes"]);
+                                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute"]);
                                         sh.lock().unwrap().seeking = true;
                                         silent_play_since = None;
+                                        healthy_audio_since = None;
                                         stall_recoveries = 0;
+                                        last_resync = Instant::now();
                                     } else {
                                         prop("aid", "auto");
                                     }
@@ -645,13 +756,17 @@ fn run_libmpv(
                             }
                             Cmd::Key(k) => {
                                 cmd(&["keypress", &k]);
+                                if let Some(p) = get_flag("pause") {
+                                    audio.set_paused(p && !shuttle_active);
+                                    was_paused = p;
+                                }
                             }
                             Cmd::Seek(_) | Cmd::SeekFast(_) => {}
                         }
                     }
                 }
             }
-            flush_seek(&mut pending_seek, &mut pending_seek_fast);
+            flush_seek(&mut pending_seek, &mut pending_seek_fast, shuttle_active);
             loop {
                 let ev = (lib.wait_event)(h, 0.0);
                 if ev.is_null() || (*ev).event_id == 0 {
@@ -710,6 +825,7 @@ fn run_libmpv(
                 let audio_pts = get_f64("audio-pts");
                 let is_paused = paused.unwrap_or(was_paused);
                 let is_seeking = seeking.unwrap_or(false);
+                audio.set_paused(is_paused && !shuttle_active);
                 let cur_bytes = audio.bytes_in.load(Ordering::Relaxed);
                 let bytes_delta = cur_bytes.saturating_sub(last_poll_bytes);
                 last_poll_bytes = cur_bytes;
@@ -721,44 +837,60 @@ fn run_libmpv(
 
                 // Track prolonged silent playback while video is actively advancing:
                 // catches mpv's `delaying audio start X vs Y` state where `avsync` reports 0.00
-                // even though `audio-pts` is 30-60s ahead of `video-pts`!
-                if !is_paused && !shuttle_active && !is_seeking && pos_advancing && bytes_delta == 0 {
-                    if silent_play_since.is_none() {
-                        silent_play_since = Some(Instant::now());
+                // even though `audio-pts` is 30-60s ahead of `video-pts`.
+                // Note: with the 512 KiB audio pipe, ao_pcm's initial 65536-sample burst drains
+                // smoothly at 192 KB/s with zero silence (`bytes_delta > 0` on every tick), while
+                // `audio-pts` temporarily leads `pos` by ~1.4s. Therefore we NEVER trigger recovery
+                // while PCM bytes are actively flowing, and we only clear `stall_recoveries` after
+                // 4 seconds of continuous healthy audio (preventing any recovery loop).
+                if !is_paused && !shuttle_active && !is_seeking {
+                    if bytes_delta > 0 {
+                        silent_play_since = None;
+                        let h0 = healthy_audio_since.get_or_insert_with(Instant::now);
+                        if h0.elapsed() >= Duration::from_secs(4) {
+                            stall_recoveries = 0;
+                        }
+                    } else if pos_advancing {
+                        healthy_audio_since = None;
+                        if silent_play_since.is_none() {
+                            silent_play_since = Some(Instant::now());
+                        }
                     }
                 } else {
                     silent_play_since = None;
-                    if bytes_delta > 0 {
-                        stall_recoveries = 0;
-                    }
+                    healthy_audio_since = None;
                 }
 
-                let apts_runaway = !is_paused
-                    && !shuttle_active
-                    && !is_seeking
+                let silent_ms = silent_play_since.map_or(0, |t0| t0.elapsed().as_millis());
+                let apts_runaway = bytes_delta == 0
+                    && silent_ms >= 900
                     && pos.is_some()
-                    && audio_pts.is_some_and(|a| (a - cur_pos).abs() > 2.2);
-                let prolonged_silence = silent_play_since.is_some_and(|t0| t0.elapsed() >= Duration::from_millis(650));
+                    && audio_pts.is_some_and(|a| (a - cur_pos).abs() > 3.5);
+                let prolonged_silence = silent_ms >= 1800;
+                let severe_desync = bytes_delta == 0 && silent_ms >= 900 && avsync.abs() > 3.5;
 
-                // Detect pause -> resume transitions (whether from UI button or SPACE key):
-                // flush stale audio and re-lock A/V sync immediately if ao=pcm drifted while paused.
+                // Only resync on unpause if audio-pts genuinely ran far away (> 3.5s); normal
+                // early pauses during ao_pcm's 1.36s burst resume cleanly from the kernel pipe.
                 if was_paused && !is_paused && !shuttle_active {
-                    audio.clear();
-                    if (avsync.abs() > 0.6 || apts_runaway) && last_resync.elapsed() > Duration::from_millis(1200) {
+                    let far_drift = pos.is_some() && audio_pts.is_some_and(|a| (a - cur_pos).abs() > 3.5);
+                    if far_drift && last_resync.elapsed() > Duration::from_secs(2) {
+                        audio.drain_pipe();
                         prop("aid", "auto");
-                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute+keyframes"]);
+                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute"]);
                         last_resync = Instant::now();
                     }
-                } else if (apts_runaway || prolonged_silence || (!is_paused && !shuttle_active && !is_seeking && avsync.abs() > 2.2))
-                    && last_resync.elapsed() > Duration::from_millis(1500)
+                } else if (apts_runaway || prolonged_silence || severe_desync)
+                    && stall_recoveries < 2
+                    && last_resync.elapsed() > Duration::from_secs(4)
                 {
                     // Self-healing recovery for `delaying audio start` or severe A/V desync:
-                    // First attempt re-attaches audio BEFORE keyframe-seeking both tracks to `cur_pos`.
-                    // If the demuxer cache itself kept stale audio timestamps, reload cleanly at `cur_pos`.
+                    // Attempt 1 re-attaches audio BEFORE an exact `absolute` seek to `cur_pos`.
+                    // Attempt 2 reloads the stream cleanly at `cur_pos`. Capped at 2 attempts
+                    // until 4s of continuous healthy audio resets the counter.
                     stall_recoveries = stall_recoveries.saturating_add(1);
                     silent_play_since = None;
+                    healthy_audio_since = None;
                     last_resync = Instant::now();
-                    audio.clear();
                     if verbose_log {
                         eprintln!(
                             "[victr-mpv] audio stall detected (attempt={}, pos={:.2}, apts={:?}, avsync={:.2}), resyncing…",
@@ -767,9 +899,11 @@ fn run_libmpv(
                     }
                     if stall_recoveries == 1 {
                         prop("aid", "no");
+                        audio.drain_pipe();
                         prop("aid", "auto");
-                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute+keyframes"]);
+                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute"]);
                     } else if stall_recoveries == 2 {
+                        audio.drain_pipe();
                         let start_opt = format!("start={cur_pos:.2}");
                         cmd(&["loadfile", src, "replace", &start_opt]);
                     }
@@ -801,6 +935,9 @@ fn run_libmpv(
             }
             std::thread::sleep(Duration::from_millis(3));
         }
+        audio.stop.store(true, Ordering::SeqCst);
+        audio.set_paused(false);
+        audio.clear();
         (lib.rc_free)(rc);
         (lib.terminate_destroy)(h);
         close_pipe(pcm_pipe.map(|(_, w)| (-1, w)));
@@ -812,27 +949,63 @@ fn run_libmpv(
 // ------------------------------------------------------------------ pipes
 
 #[cfg(unix)]
+const POLLIN: i16 = 0x0001;
+#[cfg(unix)]
+const POLLERR: i16 = 0x0008;
+#[cfg(unix)]
+const POLLHUP: i16 = 0x0010;
+
+#[cfg(unix)]
+#[repr(C)]
+struct PollFd {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+}
+
+#[cfg(unix)]
 unsafe extern "C" {
     fn pipe(fds: *mut c_int) -> c_int;
     fn close(fd: c_int) -> c_int;
+    fn poll(fds: *mut PollFd, nfds: usize, timeout: c_int) -> c_int;
     #[cfg(target_os = "linux")]
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn ioctl(fd: c_int, request: std::ffi::c_ulong, ...) -> c_int;
 }
 
 #[cfg(target_os = "linux")]
-fn shrink_pipe_fd(fd: c_int) {
-    // F_SETPIPE_SZ = 1031: shrink Linux's 64 KB default pipe (~341 ms at 48 kHz stereo s16)
-    // down to 1 page (4096 B = ~21 ms) so audio stays tightly lip-synced to video.
-    unsafe { fcntl(fd, 1031, 4096 as c_int) };
+fn pipe_readable_bytes(fd: c_int) -> usize {
+    // FIONREAD = 0x541B on Linux: exact byte count currently buffered in the pipe.
+    let mut avail: c_int = 0;
+    if unsafe { ioctl(fd, 0x541B, &mut avail as *mut c_int) } == 0 && avail > 0 {
+        avail as usize
+    } else {
+        0
+    }
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pipe_readable_bytes(_fd: c_int) -> usize {
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn size_audio_pipe_fd(fd: c_int) {
+    // F_SETPIPE_SZ = 1031: mpv's `ao=pcm` hardcodes a 65,536-sample (262,144 B = 1.365 s)
+    // initial device buffer burst on every start, seek, and track attach. A 4 KiB pipe blocked
+    // mpv's core inside `fwrite()` for 1.34 s and left a ~1.3 s silence gap while A-V caught up.
+    // Sizing the pipe to 512 KiB absorbs the initial burst with zero blocking and naturally
+    // drains down to ~12 KiB (~60 ms) at steady state.
+    unsafe { fcntl(fd, 1031, 524_288 as c_int) };
 }
 #[cfg(not(target_os = "linux"))]
-fn shrink_pipe_fd(_fd: c_int) {}
+fn size_audio_pipe_fd(_fd: c_int) {}
 
 #[cfg(unix)]
 fn make_pipe() -> Option<(c_int, c_int)> {
     let mut fds = [0 as c_int; 2];
     if unsafe { pipe(fds.as_mut_ptr()) } == 0 {
-        shrink_pipe_fd(fds[1]);
+        size_audio_pipe_fd(fds[1]);
         Some((fds[0], fds[1]))
     } else {
         None
@@ -1002,7 +1175,7 @@ fn spawn_audio(route: Route, src: &str, start: f64, volume: f64, user_config: bo
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
-            shrink_pipe_fd(out.as_raw_fd());
+            size_audio_pipe_fd(out.as_raw_fd());
         }
         audio.pump(out);
     }
@@ -1190,13 +1363,7 @@ mod tests {
         let Some(route) = find_route() else { return };
         let ring = AudioRing::new();
         let session = ring.begin_session();
-        let audio = Audio {
-            ring: Some(ring.clone()),
-            session,
-            stop: Arc::new(AtomicBool::new(false)),
-            discard: Arc::new(AtomicBool::new(false)),
-            bytes_in: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        };
+        let audio = Audio::new(Some(ring.clone()), session, Arc::new(AtomicBool::new(false)));
         let mut child = spawn_audio(route, "av://lavfi:sine=frequency=440:duration=2", 0.0, 100.0, false, &audio);
         assert!(child.is_some(), "mpv should start");
         let t = Instant::now();
