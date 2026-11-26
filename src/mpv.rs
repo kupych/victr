@@ -98,6 +98,7 @@ impl Audio {
             });
         }
     }
+    #[allow(dead_code)]
     fn set_discard(&self, on: bool) {
         self.discard.store(on, Ordering::SeqCst);
         if on {
@@ -538,6 +539,10 @@ fn run_libmpv(
         let mut last_poll = Instant::now();
         let mut last_log = Instant::now();
         let mut last_log_bytes = 0u64;
+        let mut last_poll_bytes = 0u64;
+        let mut last_poll_pos = -1.0f64;
+        let mut silent_play_since: Option<Instant> = None;
+        let mut stall_recoveries: u32 = 0;
         let mut last_resync = Instant::now() - Duration::from_secs(10);
         let mut shuttle_active = false;
         let mut was_paused = false;
@@ -592,10 +597,12 @@ fn run_libmpv(
                             Cmd::SetShuttle(spd) => {
                                 if spd.abs() > 0.1 {
                                     shuttle_active = true;
-                                    // Non-blocking pipe discard + mute prevents ao=pcm from stalling
-                                    // against the 1× audio ring or piling up 30s of A/V desync!
-                                    audio.set_discard(true);
-                                    prop("mute", "yes");
+                                    // Detach audio decoding completely (`aid=no`) while shuttling!
+                                    // Never drain `ao=pcm` unthrottled while open — because `ao_pcm`
+                                    // is untimed, an unthrottled pipe lets mpv devour 50+ seconds of
+                                    // cached audio in 0.1s and get stuck in `delaying audio start`.
+                                    audio.clear();
+                                    prop("aid", "no");
                                     if spd > 0.1 && spd <= 8.5 {
                                         prop("pause", "no");
                                         prop("speed", &format!("{:.2}", spd.clamp(1.0, 8.0)));
@@ -608,15 +615,18 @@ fn run_libmpv(
                                     let was_sh = shuttle_active;
                                     shuttle_active = false;
                                     prop("speed", "1.0");
-                                    prop("mute", "no");
                                     prop("pause", "no");
-                                    audio.set_discard(false);
                                     audio.clear();
                                     if was_sh {
-                                        // Re-lock audio & video PTS cleanly at the exact current timestamp
-                                        cmd(&["seek", "0", "relative+exact"]);
+                                        let cur_pos = get_f64("time-pos").unwrap_or_else(|| sh.lock().unwrap().pos).max(0.0);
+                                        // Re-seek both video & audio demuxer queues cleanly to `cur_pos`
+                                        // before re-attaching audio so audio starts at exact `video_pts`.
+                                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute+keyframes"]);
+                                        prop("aid", "auto");
                                         sh.lock().unwrap().seeking = true;
                                         last_resync = Instant::now();
+                                    } else {
+                                        prop("aid", "auto");
                                     }
                                 }
                             }
@@ -696,27 +706,71 @@ fn run_libmpv(
                 let paused = get_flag("pause");
                 let seeking = get_flag("seeking");
                 let avsync = get_f64("avsync").unwrap_or(0.0);
+                let audio_pts = get_f64("audio-pts");
                 let is_paused = paused.unwrap_or(was_paused);
                 let is_seeking = seeking.unwrap_or(false);
+                let cur_bytes = audio.bytes_in.load(Ordering::Relaxed);
+                let bytes_delta = cur_bytes.saturating_sub(last_poll_bytes);
+                last_poll_bytes = cur_bytes;
+                let cur_pos = pos.unwrap_or(last_poll_pos.max(0.0));
+                let pos_advancing = pos.is_some() && last_poll_pos >= 0.0 && (cur_pos - last_poll_pos) > 0.02;
+                if let Some(p) = pos {
+                    last_poll_pos = p;
+                }
+
+                // Track prolonged silent playback while video is actively advancing:
+                // catches mpv's `delaying audio start X vs Y` state where `avsync` reports 0.00
+                // even though `audio-pts` is 30-60s ahead of `video-pts`!
+                if !is_paused && !shuttle_active && !is_seeking && pos_advancing && bytes_delta == 0 {
+                    if silent_play_since.is_none() {
+                        silent_play_since = Some(Instant::now());
+                    }
+                } else {
+                    silent_play_since = None;
+                    if bytes_delta > 0 {
+                        stall_recoveries = 0;
+                    }
+                }
+
+                let apts_runaway = !is_paused
+                    && !shuttle_active
+                    && !is_seeking
+                    && pos.is_some()
+                    && audio_pts.is_some_and(|a| (a - cur_pos).abs() > 3.0);
+                let prolonged_silence = silent_play_since.is_some_and(|t0| t0.elapsed() >= Duration::from_millis(1500));
+
                 // Detect pause -> resume transitions (whether from UI button or SPACE key):
                 // flush stale audio and re-lock A/V sync immediately if ao=pcm drifted while paused.
                 if was_paused && !is_paused && !shuttle_active {
                     audio.clear();
-                    if avsync.abs() > 0.6 && last_resync.elapsed() > Duration::from_secs(2) {
-                        cmd(&["seek", "0", "relative+exact"]);
+                    if (avsync.abs() > 0.6 || apts_runaway) && last_resync.elapsed() > Duration::from_secs(2) {
+                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute+keyframes"]);
                         last_resync = Instant::now();
                     }
-                } else if !is_paused
-                    && !shuttle_active
-                    && !is_seeking
-                    && avsync.abs() > 2.2
-                    && last_resync.elapsed() > Duration::from_secs(4)
+                } else if (apts_runaway || prolonged_silence || (!is_paused && !shuttle_active && !is_seeking && avsync.abs() > 2.2))
+                    && last_resync.elapsed() > Duration::from_secs(3)
                 {
-                    // Self-healing safety net: if a network stream ever stalls A/V sync > 2.2s,
-                    // snap audio right back to video instead of sitting silent for 30s.
-                    audio.clear();
-                    cmd(&["seek", "0", "relative+exact"]);
+                    // Self-healing recovery for `delaying audio start` or severe A/V desync:
+                    // First attempt resets the audio stream + keyframe-seeks both tracks to `cur_pos`.
+                    // If the demuxer cache itself kept stale audio timestamps, reload cleanly at `cur_pos`.
+                    stall_recoveries = stall_recoveries.saturating_add(1);
+                    silent_play_since = None;
                     last_resync = Instant::now();
+                    audio.clear();
+                    if verbose_log {
+                        eprintln!(
+                            "[victr-mpv] audio stall detected (attempt={}, pos={:.2}, apts={:?}, avsync={:.2}), resyncing…",
+                            stall_recoveries, cur_pos, audio_pts, avsync
+                        );
+                    }
+                    if stall_recoveries == 1 {
+                        prop("aid", "no");
+                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute+keyframes"]);
+                        prop("aid", "auto");
+                    } else if stall_recoveries == 2 {
+                        let start_opt = format!("start={cur_pos:.2}");
+                        cmd(&["loadfile", src, "replace", &start_opt]);
+                    }
                 }
                 was_paused = is_paused;
                 let mut s = sh.lock().unwrap();
@@ -733,14 +787,13 @@ fn run_libmpv(
                     s.seeking = sk;
                 }
                 if verbose_log && last_log.elapsed() >= Duration::from_secs(1) {
-                    let cur_b = audio.bytes_in.load(Ordering::Relaxed);
                     let dt_s = last_log.elapsed().as_secs_f64().max(0.001);
-                    let bps = (cur_b.saturating_sub(last_log_bytes)) as f64 / dt_s;
-                    last_log_bytes = cur_b;
+                    let bps = (cur_bytes.saturating_sub(last_log_bytes)) as f64 / dt_s;
+                    last_log_bytes = cur_bytes;
                     last_log = Instant::now();
                     eprintln!(
-                        "[victr-mpv] pos={:.2} avsync={:.2} paused={} seeking={} shuttle={} pcm={:.0}B/s",
-                        s.pos, avsync, is_paused, is_seeking, shuttle_active, bps
+                        "[victr-mpv] pos={:.2} apts={:?} avsync={:.2} paused={} seeking={} shuttle={} pcm={:.0}B/s",
+                        s.pos, audio_pts, avsync, is_paused, is_seeking, shuttle_active, bps
                     );
                 }
             }
