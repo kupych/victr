@@ -3365,7 +3365,7 @@ impl CrtApp {
             self.vcr_shuttle_speed = 0.0;
             self.sim.set_vcr_shuttle(0.0);
             if let Some(p) = &self.player {
-                p.set_speed(1.0);
+                p.set_shuttle(0.0);
             }
         }
     }
@@ -3409,30 +3409,20 @@ impl CrtApp {
         self.sim.set_vcr_shuttle(speed);
         let lbl = Self::vcr_shuttle_label(speed);
         if let Some(p) = &self.player {
+            p.set_shuttle(speed as f64);
             if speed > 0.1 {
-                p.set_paused(false);
-                // 4x and 8x use smooth real-time mpv speed; 16x and 32x use snappy stepped visual search
-                // so high-bitrate / network streams zip cleanly without stalling the decoder.
-                if speed <= 8.5 {
-                    p.set_speed(speed as f64);
-                } else {
-                    p.set_speed(1.0);
-                    self.vcr_rw_last_step = std::time::Instant::now() - std::time::Duration::from_millis(200);
+                if speed > 8.5 {
+                    self.vcr_rw_last_step = std::time::Instant::now() - std::time::Duration::from_millis(250);
                 }
                 self.osd.show_action(lbl);
                 self.show_video_progress_osd(lbl, None);
             } else if speed < -0.1 {
-                p.set_speed(1.0);
-                p.set_paused(false);
-                self.vcr_rw_last_step = std::time::Instant::now() - std::time::Duration::from_millis(200);
+                self.vcr_rw_last_step = std::time::Instant::now() - std::time::Duration::from_millis(250);
                 self.osd.show_action(lbl);
                 self.show_video_progress_osd(lbl, None);
-            } else {
-                p.set_speed(1.0);
-                if was_shuttling {
-                    self.osd.show_action("PLAY >");
-                    self.show_video_progress_osd("PLAY >", None);
-                }
+            } else if was_shuttling {
+                self.osd.show_action("PLAY >");
+                self.show_video_progress_osd("PLAY >", None);
             }
         }
     }
@@ -5375,30 +5365,34 @@ impl CrtApp {
             let lbl = Self::vcr_shuttle_label(spd);
             let mut live_osd: Option<(f64, f64)> = None;
             if let Some(p) = &self.player {
-                let (pos, dur, ended, running) = {
+                let (pos, dur, ended, running, seeking) = {
                     let sh = p.shared.lock().unwrap();
-                    (sh.pos, sh.duration, sh.ended, sh.running)
+                    (sh.pos, sh.duration, sh.ended, sh.running, sh.seeking)
                 };
+                let step_ready = (!seeking && self.vcr_rw_last_step.elapsed() >= std::time::Duration::from_millis(125))
+                    || self.vcr_rw_last_step.elapsed() >= std::time::Duration::from_millis(550);
                 if !running || ended {
                     cancel_shuttle = true;
                 } else if spd < -0.1 {
                     if pos <= 0.6 {
                         p.seek_abs(0.0);
                         cancel_shuttle = true;
-                    } else if self.vcr_rw_last_step.elapsed() >= std::time::Duration::from_millis(95) {
+                    } else if step_ready {
+                        let dt_s = self.vcr_rw_last_step.elapsed().as_secs_f64().clamp(0.10, 0.35);
                         self.vcr_rw_last_step = std::time::Instant::now();
-                        let step = spd as f64 * 0.105; // ~-0.42s @4x, -0.84s @8x, -1.68s @16x, -3.36s @32x
-                        p.seek(step);
+                        let step = spd as f64 * dt_s;
+                        p.seek_fast(step);
                         self.osd.show_action(lbl);
                     }
                     live_osd = Some((pos, dur));
                 } else if spd > 8.5 {
                     if dur > 1.0 && pos >= dur - 1.5 {
                         cancel_shuttle = true;
-                    } else if self.vcr_rw_last_step.elapsed() >= std::time::Duration::from_millis(95) {
+                    } else if step_ready {
+                        let dt_s = self.vcr_rw_last_step.elapsed().as_secs_f64().clamp(0.10, 0.35);
                         self.vcr_rw_last_step = std::time::Instant::now();
-                        let step = spd as f64 * 0.105; // ~+1.68s @16x, +3.36s @32x
-                        p.seek(step);
+                        let step = spd as f64 * dt_s;
+                        p.seek_fast(step);
                         self.osd.show_action(lbl);
                     }
                     live_osd = Some((pos, dur));

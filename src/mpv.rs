@@ -27,6 +27,7 @@ pub struct Shared {
     pub pos: f64,
     pub duration: f64,
     pub paused: bool,
+    pub seeking: bool,
     pub ended: bool,
     pub running: bool,
     pub backend: &'static str,
@@ -34,10 +35,13 @@ pub struct Shared {
 
 enum Cmd {
     TogglePause,
+    #[allow(dead_code)]
     SetPaused(bool),
     Seek(f64),
+    SeekFast(f64),
     SeekAbs(f64),
     Speed(f64),
+    SetShuttle(f64),
     Volume(f64),
     AudioDelay(f64),
     Crop(bool),
@@ -55,13 +59,17 @@ struct Audio {
     ring: Option<Arc<AudioRing>>,
     session: u64,
     stop: Arc<AtomicBool>,
+    discard: Arc<AtomicBool>,
 }
 
 impl Audio {
     /// Copies raw s16le stereo PCM from `r` into the ring until EOF or stop.
+    /// When `discard` is set (during FF/RW shuttle), drops pipe bytes non-blockingly
+    /// so `ao=pcm` never stalls or drifts A/V sync against the 1× ring buffer.
     fn pump(&self, mut r: impl Read + Send + 'static) {
         if let Some(ring) = self.ring.clone() {
             let stop = self.stop.clone();
+            let discard = self.discard.clone();
             let session = self.session;
             std::thread::spawn(move || {
                 // 1024 B = 256 stereo frames (~5.3 ms) so samples reach the DSP ring promptly
@@ -70,6 +78,12 @@ impl Audio {
                     match r.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            if discard.load(Ordering::Relaxed) {
+                                continue;
+                            }
                             let n = n & !3;
                             ring.push_s16_session(session, &buf[..n], &stop);
                             if stop.load(Ordering::Relaxed) {
@@ -79,6 +93,12 @@ impl Audio {
                     }
                 }
             });
+        }
+    }
+    fn set_discard(&self, on: bool) {
+        self.discard.store(on, Ordering::SeqCst);
+        if on {
+            self.clear();
         }
     }
     fn clear(&self) {
@@ -105,8 +125,9 @@ impl Player {
         let src = source.to_string();
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
+        let discard = Arc::new(AtomicBool::new(false));
         std::thread::spawn(move || {
-            let audio = Audio { ring: audio, session, stop: stop2 };
+            let audio = Audio { ring: audio, session, stop: stop2, discard };
             let lib_err = match Lib::load() {
                 Ok(lib) => match run_libmpv(&lib, &src, volume, crop, &opts, &rx, &sh, &audio) {
                     Ok(()) => {
@@ -130,17 +151,28 @@ impl Player {
     pub fn toggle_pause(&self) {
         let _ = self.tx.send(Cmd::TogglePause);
     }
+    #[allow(dead_code)]
     pub fn set_paused(&self, paused: bool) {
         let _ = self.tx.send(Cmd::SetPaused(paused));
     }
     pub fn seek(&self, secs: f64) {
         let _ = self.tx.send(Cmd::Seek(secs));
     }
+    /// Fast keyframe-aligned relative seek used during stepped VHS FF/RW picture search.
+    pub fn seek_fast(&self, secs: f64) {
+        let _ = self.tx.send(Cmd::SeekFast(secs));
+    }
     pub fn seek_abs(&self, secs: f64) {
         let _ = self.tx.send(Cmd::SeekAbs(secs));
     }
+    #[allow(dead_code)]
     pub fn set_speed(&self, speed: f64) {
         let _ = self.tx.send(Cmd::Speed(speed));
+    }
+    /// Enters or exits VHS FF/RW shuttle cleanly (`0.0` = Play, `4.0`/`8.0` = smooth FF,
+    /// `< 0` or `> 8.5` = paused keyframe-stepped shuttle) without letting `ao=pcm` drift A/V sync.
+    pub fn set_shuttle(&self, speed: f64) {
+        let _ = self.tx.send(Cmd::SetShuttle(speed));
     }
     pub fn volume(&self, v: f64) {
         let _ = self.tx.send(Cmd::Volume(v));
@@ -356,6 +388,8 @@ const RP_SW_POINTER: c_int = 20;
 const EV_SHUTDOWN: c_int = 1;
 const EV_END_FILE: c_int = 7;
 const EV_FILE_LOADED: c_int = 8;
+const EV_SEEK: c_int = 20;
+const EV_PLAYBACK_RESTART: c_int = 21;
 const FMT_DOUBLE: c_int = 5;
 const FMT_FLAG: c_int = 3;
 
@@ -384,6 +418,18 @@ fn run_libmpv(
         opt("input-default-bindings", "yes");
         opt("ytdl", "yes");
         opt("hwdec", "auto-copy-safe");
+        // Keep generous forward & back cache in RAM + auto-reconnect on HTTP/HTTPS streams
+        // so pausing, rewinding, and fast-forwarding over Jellyfin/Plex never stall on dropped sockets.
+        opt("cache", "yes");
+        opt("demuxer-max-bytes", "64MiB");
+        opt("demuxer-max-back-bytes", "32MiB");
+        if src.starts_with("http://") || src.starts_with("https://") {
+            opt(
+                "stream-lavf-o",
+                "reconnect=1,reconnect_streamed=1,reconnect_at_eof=1,reconnect_on_network_error=1,reconnect_delay_max=4",
+            );
+            opt("demuxer-lavf-o", "rw_timeout=8000000");
+        }
         if o.start > 0.0 {
             opt("start", &format!("{:.3}", o.start));
         }
@@ -482,48 +528,109 @@ fn run_libmpv(
         let mut size: [c_int; 2] = [FW as c_int, FH as c_int];
         let mut stride: usize = FW * 4;
         let mut last_poll = Instant::now();
+        let mut last_resync = Instant::now() - Duration::from_secs(10);
+        let mut shuttle_active = false;
+        let mut was_paused = false;
         'outer: loop {
+            // Drain pending commands and coalesce consecutive relative seeks so remote HTTP streams
+            // never accumulate a backlog of overlapping range requests.
+            let mut pending_seek = 0.0f64;
+            let mut pending_seek_fast = false;
+            let flush_seek = |pending_seek: &mut f64, pending_seek_fast: &mut bool| {
+                if pending_seek.abs() > 0.001 {
+                    let mode = if *pending_seek_fast { "relative+keyframes" } else { "relative" };
+                    cmd(&["seek", &format!("{:.3}", *pending_seek), mode]);
+                    audio.clear();
+                    sh.lock().unwrap().seeking = true;
+                    *pending_seek = 0.0;
+                    *pending_seek_fast = false;
+                }
+            };
             while let Ok(c) = rx.try_recv() {
                 match c {
-                    Cmd::Stop => break 'outer,
-                    Cmd::TogglePause => {
-                        cmd(&["cycle", "pause"]);
-                    }
-                    Cmd::SetPaused(p) => {
-                        prop("pause", if p { "yes" } else { "no" });
-                    }
                     Cmd::Seek(s) => {
-                        cmd(&["seek", &format!("{s}"), "relative"]);
-                        audio.clear();
+                        pending_seek += s;
+                        continue;
                     }
-                    Cmd::SeekAbs(s) => {
-                        cmd(&["seek", &format!("{s}"), "absolute"]);
-                        audio.clear();
+                    Cmd::SeekFast(s) => {
+                        pending_seek += s;
+                        pending_seek_fast = true;
+                        continue;
                     }
-                    Cmd::Speed(sp) => {
-                        let clamped = sp.clamp(0.25, 16.0);
-                        prop("speed", &format!("{clamped:.2}"));
-                        if clamped > 1.05 {
-                            audio.clear();
+                    other => {
+                        flush_seek(&mut pending_seek, &mut pending_seek_fast);
+                        match other {
+                            Cmd::Stop => break 'outer,
+                            Cmd::TogglePause => {
+                                cmd(&["cycle", "pause"]);
+                            }
+                            Cmd::SetPaused(p) => {
+                                prop("pause", if p { "yes" } else { "no" });
+                            }
+                            Cmd::SeekAbs(s) => {
+                                cmd(&["seek", &format!("{s:.3}"), "absolute"]);
+                                audio.clear();
+                                sh.lock().unwrap().seeking = true;
+                            }
+                            Cmd::Speed(sp) => {
+                                let clamped = sp.clamp(0.25, 16.0);
+                                prop("speed", &format!("{clamped:.2}"));
+                                if clamped > 1.05 {
+                                    audio.clear();
+                                }
+                            }
+                            Cmd::SetShuttle(spd) => {
+                                if spd.abs() > 0.1 {
+                                    shuttle_active = true;
+                                    // Non-blocking pipe discard + mute prevents ao=pcm from stalling
+                                    // against the 1× audio ring or piling up 30s of A/V desync!
+                                    audio.set_discard(true);
+                                    prop("mute", "yes");
+                                    if spd > 0.1 && spd <= 8.5 {
+                                        prop("pause", "no");
+                                        prop("speed", &format!("{:.2}", spd.clamp(1.0, 8.0)));
+                                    } else {
+                                        // Stepped RW & 16x/32x FF: pause decoder so only clean keyframes decode
+                                        prop("speed", "1.0");
+                                        prop("pause", "yes");
+                                    }
+                                } else {
+                                    let was_sh = shuttle_active;
+                                    shuttle_active = false;
+                                    prop("speed", "1.0");
+                                    prop("mute", "no");
+                                    prop("pause", "no");
+                                    audio.set_discard(false);
+                                    audio.clear();
+                                    if was_sh {
+                                        // Re-lock audio & video PTS cleanly at the exact current timestamp
+                                        cmd(&["seek", "0", "relative+exact"]);
+                                        sh.lock().unwrap().seeking = true;
+                                        last_resync = Instant::now();
+                                    }
+                                }
+                            }
+                            Cmd::Volume(v) => {
+                                if pcm_pipe.is_none() {
+                                    prop("volume", &format!("{v:.0}"));
+                                }
+                            }
+                            Cmd::AudioDelay(offset) => {
+                                let delay = if pcm_pipe.is_some() { DSP_AUDIO_DELAY_BASE_SECS + offset } else { offset };
+                                prop("audio-delay", &format!("{delay:.4}"));
+                            }
+                            Cmd::Crop(c) => {
+                                prop("panscan", if c { "1.0" } else { "0.0" });
+                            }
+                            Cmd::Key(k) => {
+                                cmd(&["keypress", &k]);
+                            }
+                            Cmd::Seek(_) | Cmd::SeekFast(_) => {}
                         }
-                    }
-                    Cmd::Volume(v) => {
-                        if pcm_pipe.is_none() {
-                            prop("volume", &format!("{v:.0}"));
-                        }
-                    }
-                    Cmd::AudioDelay(offset) => {
-                        let delay = if pcm_pipe.is_some() { DSP_AUDIO_DELAY_BASE_SECS + offset } else { offset };
-                        prop("audio-delay", &format!("{delay:.4}"));
-                    }
-                    Cmd::Crop(c) => {
-                        prop("panscan", if c { "1.0" } else { "0.0" });
-                    }
-                    Cmd::Key(k) => {
-                        cmd(&["keypress", &k]);
                     }
                 }
             }
+            flush_seek(&mut pending_seek, &mut pending_seek_fast);
             loop {
                 let ev = (lib.wait_event)(h, 0.0);
                 if ev.is_null() || (*ev).event_id == 0 {
@@ -535,10 +642,22 @@ fn run_libmpv(
                         let mut s = sh.lock().unwrap();
                         s.status = "Playing".into();
                         s.ended = false;
+                        s.seeking = false;
+                    }
+                    EV_SEEK => {
+                        sh.lock().unwrap().seeking = true;
+                        audio.clear();
+                    }
+                    EV_PLAYBACK_RESTART => {
+                        sh.lock().unwrap().seeking = false;
+                        if !shuttle_active {
+                            audio.clear();
+                        }
                     }
                     EV_END_FILE => {
                         let mut s = sh.lock().unwrap();
                         s.ended = true;
+                        s.seeking = false;
                         if (*ev).error < 0 || s.frame_no == 0 {
                             s.status = "mpv couldn't play that (check the path or URL).".into();
                         } else {
@@ -560,11 +679,36 @@ fn run_libmpv(
                     publish(sh, buf.as_slice().to_vec());
                 }
             }
-            if last_poll.elapsed() > Duration::from_millis(200) {
+            if last_poll.elapsed() > Duration::from_millis(120) {
                 last_poll = Instant::now();
                 let pos = get_f64("time-pos");
                 let dur = get_f64("duration");
                 let paused = get_flag("pause");
+                let seeking = get_flag("seeking");
+                let avsync = get_f64("avsync").unwrap_or(0.0);
+                let is_paused = paused.unwrap_or(was_paused);
+                let is_seeking = seeking.unwrap_or(false);
+                // Detect pause -> resume transitions (whether from UI button or SPACE key):
+                // flush stale audio and re-lock A/V sync immediately if ao=pcm drifted while paused.
+                if was_paused && !is_paused && !shuttle_active {
+                    audio.clear();
+                    if avsync.abs() > 0.6 && last_resync.elapsed() > Duration::from_secs(2) {
+                        cmd(&["seek", "0", "relative+exact"]);
+                        last_resync = Instant::now();
+                    }
+                } else if !is_paused
+                    && !shuttle_active
+                    && !is_seeking
+                    && avsync.abs() > 2.2
+                    && last_resync.elapsed() > Duration::from_secs(4)
+                {
+                    // Self-healing safety net: if a network stream ever stalls A/V sync > 2.2s,
+                    // snap audio right back to video instead of sitting silent for 30s.
+                    audio.clear();
+                    cmd(&["seek", "0", "relative+exact"]);
+                    last_resync = Instant::now();
+                }
+                was_paused = is_paused;
                 let mut s = sh.lock().unwrap();
                 if let Some(p) = pos {
                     s.pos = p;
@@ -574,6 +718,9 @@ fn run_libmpv(
                 }
                 if let Some(p) = paused {
                     s.paused = p;
+                }
+                if let Some(sk) = seeking {
+                    s.seeking = sk;
                 }
             }
             std::thread::sleep(Duration::from_millis(3));
@@ -811,7 +958,7 @@ fn run_cli(
             match rx.recv() {
                 Ok(Cmd::TogglePause) | Ok(Cmd::Key(_)) => paused = false,
                 Ok(Cmd::SetPaused(p)) => paused = p,
-                Ok(Cmd::Seek(d)) => {
+                Ok(Cmd::Seek(d)) | Ok(Cmd::SeekFast(d)) => {
                     start = (start + d).max(0.0);
                     sh.lock().unwrap().pos = start;
                 }
@@ -819,7 +966,7 @@ fn run_cli(
                     start = t.max(0.0);
                     sh.lock().unwrap().pos = start;
                 }
-                Ok(Cmd::Speed(_)) => {}
+                Ok(Cmd::Speed(_)) | Ok(Cmd::SetShuttle(_)) => {}
                 Ok(Cmd::Volume(v)) => volume = v,
                 Ok(Cmd::AudioDelay(_)) => {}
                 Ok(Cmd::Crop(c)) => crop = c,
@@ -901,8 +1048,8 @@ fn run_cli(
                             continue 'restart;
                         }
                     }
-                    Cmd::Speed(_) => {}
-                    Cmd::Seek(d) => {
+                    Cmd::Speed(_) | Cmd::SetShuttle(_) => {}
+                    Cmd::Seek(d) | Cmd::SeekFast(d) => {
                         start = (pos + d).max(0.0);
                         kill_child(&mut video);
                         kill_child(&mut audio_p);
@@ -967,7 +1114,12 @@ mod tests {
         let Some(route) = find_route() else { return };
         let ring = AudioRing::new();
         let session = ring.begin_session();
-        let audio = Audio { ring: Some(ring.clone()), session, stop: Arc::new(AtomicBool::new(false)) };
+        let audio = Audio {
+            ring: Some(ring.clone()),
+            session,
+            stop: Arc::new(AtomicBool::new(false)),
+            discard: Arc::new(AtomicBool::new(false)),
+        };
         let mut child = spawn_audio(route, "av://lavfi:sine=frequency=440:duration=2", 0.0, 100.0, false, &audio);
         assert!(child.is_some(), "mpv should start");
         let t = Instant::now();
