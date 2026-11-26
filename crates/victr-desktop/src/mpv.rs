@@ -524,9 +524,11 @@ fn run_libmpv(
         opt("demuxer-max-bytes", "64MiB");
         opt("demuxer-max-back-bytes", "32MiB");
         if src.starts_with("http://") || src.starts_with("https://") {
+            // Note: never set `reconnect_at_eof=1` globally — it causes ffmpeg's https protocol
+            // to infinitely reconnect at normal EOF on finite HLS `.m3u8` / YouTube Live manifests.
             opt(
                 "stream-lavf-o",
-                "reconnect=1,reconnect_streamed=1,reconnect_at_eof=1,reconnect_on_network_error=1,reconnect_delay_max=4",
+                "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=4",
             );
             opt("demuxer-lavf-o", "rw_timeout=8000000");
         }
