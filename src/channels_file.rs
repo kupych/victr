@@ -17,7 +17,7 @@ use crate::provider::{
     pick_next_episode_index,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -161,8 +161,25 @@ pub fn save_config_to(path: &Path, cfg: &ChannelsFileConfig) -> Result<(), Strin
     std::fs::write(path, json).map_err(|e| format!("Couldn't save channels.json: {e}"))
 }
 
+fn is_puzzlescript_def(def: &FileChannelDef) -> bool {
+    let kind_norm = def.kind.trim().to_ascii_lowercase();
+    matches!(kind_norm.as_str(), "puzzlescript" | "puzzlescript_gallery" | "ps")
+        || (!def.stream_url.trim().is_empty()
+            && crate::web_channel::is_puzzlescript_gallery_url(&def.stream_url))
+}
+
 /// Builds inline `Channel` records from `cfg.channels`.
+#[allow(dead_code)]
 pub fn build_inline_channels(cfg: &ChannelsFileConfig) -> Vec<Channel> {
+    build_inline_channels_with_galleries(cfg, &HashMap::new())
+}
+
+/// Builds inline `Channel` records from `cfg.channels`, populating any `kind: "puzzlescript"`
+/// (or PuzzleScript Gallery URL) entries from `puzzlescript_cache`.
+pub fn build_inline_channels_with_galleries(
+    cfg: &ChannelsFileConfig,
+    puzzlescript_cache: &HashMap<String, Vec<MediaItem>>,
+) -> Vec<Channel> {
     let mut out = Vec::new();
     for (idx, def) in cfg.channels.iter().enumerate() {
         if !def.enabled {
@@ -182,6 +199,73 @@ pub fn build_inline_channels(cfg: &ChannelsFileConfig) -> Vec<Channel> {
         } else {
             format!("cfg:{}", def.id.trim())
         };
+
+        // Special case: PuzzleScript Gallery channel (`kind: "puzzlescript"` or Gallery URL)
+        if is_puzzlescript_def(def) {
+            let ps_name = if name.is_empty() { "PuzzleScript Gallery".to_string() } else { name };
+            let callsign = if !def.callsign.trim().is_empty() {
+                def.callsign.trim().chars().take(5).collect::<String>().to_ascii_uppercase()
+            } else {
+                "PZLS".to_string()
+            };
+            let dat_url = crate::web_channel::puzzlescript_dat_url_for(&def.stream_url);
+            let ch_kind = if let Some(cached) = puzzlescript_cache.get(&dat_url).filter(|v| !v.is_empty()) {
+                let mut episodes = cached.clone();
+                if def.mode.trim().eq_ignore_ascii_case("shuffle") {
+                    episodes.sort_by_key(|m| {
+                        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                        for b in m.id.bytes().chain(ps_name.bytes()) {
+                            h ^= b as u64;
+                            h = h.wrapping_mul(0x0100_0000_01b3);
+                        }
+                        h
+                    });
+                }
+                let next_up = episodes.first().map(|m| m.id.clone());
+                ChannelKind::Series {
+                    series_id: ch_id.clone(),
+                    overview: if def.overview.trim().is_empty() {
+                        format!(
+                            "Interactive PuzzleScript Gallery ({} games) · Press E to browse · Arrows/WASD/Gamepad to play · X action · Z undo · R restart",
+                            episodes.len()
+                        )
+                    } else {
+                        def.overview.trim().to_string()
+                    },
+                    is_continue: false,
+                    is_favorite: def.is_favorite,
+                    episodes,
+                    next_up_episode_id: next_up,
+                    loaded_episodes: true,
+                }
+            } else {
+                ChannelKind::LiveStream {
+                    stream_url: crate::web_channel::ensure_web_prefix(
+                        "https://www.puzzlescript.net/Gallery/index.html",
+                    ),
+                    group: "Games".into(),
+                    now_title: "Loading PuzzleScript Gallery…".into(),
+                    overview: "Fetching games from puzzlescript.net/games_dat.js…".into(),
+                }
+            };
+            let ch_type = if def.channel_type.trim().is_empty() {
+                "web".to_string()
+            } else {
+                def.channel_type.trim().to_string()
+            };
+            out.push(Channel {
+                number: def.number.filter(|&n| n >= 2).unwrap_or(0),
+                provider_id: "channels".into(),
+                source_key: ch_id,
+                callsign,
+                name: ps_name,
+                artwork_id: def.artwork_url.trim().to_string(),
+                channel_type: ch_type,
+                profile_override: def.profile.clone().filter(|s| !s.trim().is_empty()),
+                kind: ch_kind,
+            });
+            continue;
+        }
 
         // Special case: `kind: "folder"` scans a local folder and tags all resulting channels
         if kind_norm == "folder" {
@@ -736,6 +820,7 @@ pub fn resolve_profile_name(
 
 enum FileEvent {
     ArtworkLoaded(String, ArtworkImage),
+    PuzzleScriptLoaded(String, Vec<MediaItem>),
 }
 
 pub struct ChannelsFileManager {
@@ -747,6 +832,8 @@ pub struct ChannelsFileManager {
     last_mtime: Option<SystemTime>,
     last_check: Instant,
     artwork_cache: HashMap<String, Option<ArtworkImage>>,
+    puzzlescript_cache: HashMap<String, Vec<MediaItem>>,
+    puzzlescript_fetching: HashSet<String>,
     events: Arc<Mutex<Vec<FileEvent>>>,
 }
 
@@ -761,6 +848,8 @@ impl ChannelsFileManager {
             last_mtime: None,
             last_check: Instant::now(),
             artwork_cache: HashMap::new(),
+            puzzlescript_cache: HashMap::new(),
+            puzzlescript_fetching: HashSet::new(),
             events: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -769,6 +858,37 @@ impl ChannelsFileManager {
         let mut mgr = Self::new_offline();
         mgr.reload_from_disk();
         mgr
+    }
+
+    fn ensure_puzzlescript_galleries(&mut self) {
+        let mut wanted: Vec<String> = Vec::new();
+        for def in &self.cfg.channels {
+            if def.enabled && is_puzzlescript_def(def) {
+                let url = crate::web_channel::puzzlescript_dat_url_for(&def.stream_url);
+                if !wanted.contains(&url) {
+                    wanted.push(url);
+                }
+            }
+        }
+        let cache_path = crate::web_channel::puzzlescript_cache_path();
+        for dat_url in wanted {
+            if !self.puzzlescript_cache.contains_key(&dat_url) {
+                if let Some(cp) = cache_path.as_deref() {
+                    if let Some(cached) = crate::web_channel::load_cached_puzzlescript_gallery(&dat_url, cp) {
+                        self.puzzlescript_cache.insert(dat_url.clone(), cached);
+                    }
+                }
+            }
+            if self.puzzlescript_fetching.insert(dat_url.clone()) {
+                let ev = self.events.clone();
+                let cp = cache_path.clone();
+                std::thread::spawn(move || {
+                    if let Ok(items) = crate::web_channel::fetch_puzzlescript_gallery(&dat_url, cp.as_deref()) {
+                        ev.lock().unwrap().push(FileEvent::PuzzleScriptLoaded(dat_url, items));
+                    }
+                });
+            }
+        }
     }
 
     pub fn reload_from_disk(&mut self) -> bool {
@@ -781,11 +901,12 @@ impl ChannelsFileManager {
         self.last_mtime = meta.modified().ok();
         match load_config_from(&path) {
             Ok(cfg) => {
-                self.channels = build_inline_channels(&cfg);
-                let n_ch = self.channels.len();
-                let n_ov = cfg.overrides.len();
-                let n_tp = cfg.type_profiles.len();
                 self.cfg = cfg;
+                self.ensure_puzzlescript_galleries();
+                self.channels = build_inline_channels_with_galleries(&self.cfg, &self.puzzlescript_cache);
+                let n_ch = self.channels.len();
+                let n_ov = self.cfg.overrides.len();
+                let n_tp = self.cfg.type_profiles.len();
                 self.last_error.clear();
                 self.status = format!("{n_ch} channels, {n_ov} overrides, {n_tp} type profiles");
                 true
@@ -802,7 +923,8 @@ impl ChannelsFileManager {
         save_config_to(&path, &self.cfg)?;
         self.file_exists = true;
         self.last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-        self.channels = build_inline_channels(&self.cfg);
+        self.ensure_puzzlescript_galleries();
+        self.channels = build_inline_channels_with_galleries(&self.cfg, &self.puzzlescript_cache);
         let n_ch = self.channels.len();
         let n_ov = self.cfg.overrides.len();
         let n_tp = self.cfg.type_profiles.len();
@@ -912,6 +1034,11 @@ impl ChannelsFileManager {
             match ev {
                 FileEvent::ArtworkLoaded(u, img) => {
                     self.artwork_cache.insert(u, Some(img));
+                    changed = true;
+                }
+                FileEvent::PuzzleScriptLoaded(url, items) => {
+                    self.puzzlescript_cache.insert(url, items);
+                    self.channels = build_inline_channels_with_galleries(&self.cfg, &self.puzzlescript_cache);
                     changed = true;
                 }
             }

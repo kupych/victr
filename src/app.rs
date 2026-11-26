@@ -229,6 +229,44 @@ impl Drop for CrtApp {
 }
 
 /// Turns an egui key/text event into an mpv key name for `keypress`.
+/// Maps an egui key event to Chrome DevTools Protocol `(key, code, vk, text)` for interactive
+/// `web://` channels (e.g. PuzzleScript), excluding TV remote shortcuts (`G`, `E`, `N`, `P`, `I`, `M`, digits).
+fn egui_key_to_cdp(key: egui::Key, shift: bool) -> Option<(&'static str, &'static str, i32, Option<&'static str>)> {
+    use egui::Key;
+    match key {
+        Key::ArrowUp => Some(("ArrowUp", "ArrowUp", 38, None)),
+        Key::ArrowDown => Some(("ArrowDown", "ArrowDown", 40, None)),
+        Key::ArrowLeft => Some(("ArrowLeft", "ArrowLeft", 37, None)),
+        Key::ArrowRight => Some(("ArrowRight", "ArrowRight", 39, None)),
+        Key::Space => Some((" ", "Space", 32, Some(" "))),
+        Key::Enter => Some(("Enter", "Enter", 13, Some("\r"))),
+        Key::Escape => Some(("Escape", "Escape", 27, None)),
+        Key::Backspace => Some(("Backspace", "Backspace", 8, None)),
+        Key::Tab => Some(("Tab", "Tab", 9, None)),
+        Key::A => Some((if shift { "A" } else { "a" }, "KeyA", 65, Some(if shift { "A" } else { "a" }))),
+        Key::B => Some((if shift { "B" } else { "b" }, "KeyB", 66, Some(if shift { "B" } else { "b" }))),
+        Key::C => Some((if shift { "C" } else { "c" }, "KeyC", 67, Some(if shift { "C" } else { "c" }))),
+        Key::D => Some((if shift { "D" } else { "d" }, "KeyD", 68, Some(if shift { "D" } else { "d" }))),
+        Key::F => Some((if shift { "F" } else { "f" }, "KeyF", 70, Some(if shift { "F" } else { "f" }))),
+        Key::H => Some((if shift { "H" } else { "h" }, "KeyH", 72, Some(if shift { "H" } else { "h" }))),
+        Key::J => Some((if shift { "J" } else { "j" }, "KeyJ", 74, Some(if shift { "J" } else { "j" }))),
+        Key::K => Some((if shift { "K" } else { "k" }, "KeyK", 75, Some(if shift { "K" } else { "k" }))),
+        Key::L => Some((if shift { "L" } else { "l" }, "KeyL", 76, Some(if shift { "L" } else { "l" }))),
+        Key::O => Some((if shift { "O" } else { "o" }, "KeyO", 79, Some(if shift { "O" } else { "o" }))),
+        Key::Q => Some((if shift { "Q" } else { "q" }, "KeyQ", 81, Some(if shift { "Q" } else { "q" }))),
+        Key::R => Some((if shift { "R" } else { "r" }, "KeyR", 82, Some(if shift { "R" } else { "r" }))),
+        Key::S => Some((if shift { "S" } else { "s" }, "KeyS", 83, Some(if shift { "S" } else { "s" }))),
+        Key::T => Some((if shift { "T" } else { "t" }, "KeyT", 84, Some(if shift { "T" } else { "t" }))),
+        Key::U => Some((if shift { "U" } else { "u" }, "KeyU", 85, Some(if shift { "U" } else { "u" }))),
+        Key::V => Some((if shift { "V" } else { "v" }, "KeyV", 86, Some(if shift { "V" } else { "v" }))),
+        Key::W => Some((if shift { "W" } else { "w" }, "KeyW", 87, Some(if shift { "W" } else { "w" }))),
+        Key::X => Some((if shift { "X" } else { "x" }, "KeyX", 88, Some(if shift { "X" } else { "x" }))),
+        Key::Y => Some((if shift { "Y" } else { "y" }, "KeyY", 89, Some(if shift { "Y" } else { "y" }))),
+        Key::Z => Some((if shift { "Z" } else { "z" }, "KeyZ", 90, Some(if shift { "Z" } else { "z" }))),
+        _ => None,
+    }
+}
+
 fn mpv_key_name(ev: &egui::Event) -> Option<String> {
     use egui::{Event, Key};
     match ev {
@@ -1765,7 +1803,10 @@ impl CrtApp {
             };
             self.retro.set_gamepad_device(dev.clone());
             if let Some(rp) = &self.retro_player {
-                rp.set_gamepad(dev);
+                rp.set_gamepad(dev.clone());
+            }
+            if let Some(wp) = &self.web_player {
+                wp.set_gamepad(dev);
             }
             self.osd.show_action(&format!("PAD: {osd_name}"));
         }
@@ -3337,7 +3378,8 @@ impl CrtApp {
             return;
         }
         if web_channel::is_web_channel_url(&src) {
-            self.web_player = Some(WebPlayer::start(&src, self.muted || !self.s.sound));
+            let gamepad_dev = self.retro.cfg.gamepad_device.clone();
+            self.web_player = Some(WebPlayer::start(&src, self.muted || !self.s.sound, gamepad_dev));
             self.video_name = web_channel::normalize_web_target_url(&src);
             self.video_frame_no = 0;
             self.s.pattern = Pattern::Video;
@@ -5036,6 +5078,7 @@ impl CrtApp {
         }
 
         let retro_playing = self.retro_player.as_ref().is_some_and(|rp| rp.shared.lock().unwrap().running);
+        let web_playing = self.web_player.as_ref().is_some_and(|wp| wp.shared.lock().unwrap().running);
         if let Some(rp) = &self.retro_player {
             if !self.guide.active && !ctx.egui_wants_keyboard_input() && !self.save_preset_open {
                 let mask = ctx.input(|i| {
@@ -5069,6 +5112,33 @@ impl CrtApp {
                 }
             } else {
                 rp.key_mask.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if let Some(wp) = &self.web_player {
+            if web_playing
+                && !self.guide.active
+                && !ctx.egui_wants_keyboard_input()
+                && !self.save_preset_open
+                && !self.osd.has_pending_digits()
+            {
+                let key_evs: Vec<(bool, egui::Key, bool)> = ctx.input(|i| {
+                    i.events
+                        .iter()
+                        .filter_map(|e| match e {
+                            egui::Event::Key { key, pressed, modifiers, .. }
+                                if !modifiers.ctrl && !modifiers.alt && !modifiers.command =>
+                            {
+                                Some((*pressed, *key, modifiers.shift))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                });
+                for (pressed, key, shift) in key_evs {
+                    if let Some((cdp_key, cdp_code, vk, text)) = egui_key_to_cdp(key, shift) {
+                        wp.send_key(pressed, cdp_key, cdp_code, vk, text);
+                    }
+                }
             }
         }
 
@@ -5138,7 +5208,7 @@ impl CrtApp {
                         self.open_episode_picker(cur);
                     }
                 }
-                if (!retro_playing || self.guide.active) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W)) {
+                if (!retro_playing && !web_playing || self.guide.active) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W)) {
                     remote_consumed = true;
                     if let (true, Some((ch_num, idx))) = (self.guide.active, self.guide.picker_selected()) {
                         if let Some((iid, played)) = self
@@ -5165,7 +5235,7 @@ impl CrtApp {
                     self.refresh_all_sources();
                     remote_consumed = true;
                 }
-                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R)) {
+                if (!web_playing || self.guide.active) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R)) {
                     if self.guide.active && self.guide.picker_selected().is_none() {
                         self.refresh_all_sources();
                         remote_consumed = true;
@@ -5842,6 +5912,7 @@ impl CrtApp {
                 let h = self.view_half(vis_rect);
                 let shift_x = (drawer_vis_w / rect.height().max(1.0)) * h;
                 let ctrl_down = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                let shift_down = ctx.input(|i| i.modifiers.shift);
                 if self.tv_hovered {
                     let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
                     if scroll.abs() > 0.0 {
@@ -5853,6 +5924,22 @@ impl CrtApp {
                             } else {
                                 let vis_len = self.visible_channels().len();
                                 self.guide.scroll_rows(step, vis_len);
+                            }
+                        } else if shift_down && !self.guide.active && self.web_player.is_some() {
+                            if let (Some(wp), Some(mp)) = (&self.web_player, resp.hover_pos()) {
+                                let nx = (mp.x - rect.left()) / rect.width().max(1.0) * 2.0 - 1.0;
+                                let ny = (mp.y - rect.top()) / rect.height().max(1.0) * 2.0 - 1.0;
+                                let a = rect.width() / rect.height().max(1.0);
+                                let fx = nx * a * h + (self.pan[0] + shift_x);
+                                let fy = ny * h + self.pan[1];
+                                let gu = ((fx / (4.0 / 3.0)) * 0.5 + 0.5).clamp(0.0, 1.0);
+                                let gv = (fy * 0.5 + 0.5).clamp(0.0, 1.0);
+                                wp.send_scroll(
+                                    gu * web_channel::WEB_W as f32,
+                                    gv * web_channel::WEB_H as f32,
+                                    0.0,
+                                    -scroll * 2.5,
+                                );
                             }
                         } else if let Some(mp) = resp.hover_pos() {
                             let nx = (mp.x - rect.left()) / rect.width() * 2.0 - 1.0;
@@ -5926,6 +6013,27 @@ impl CrtApp {
                         self.toggle_guide();
                     } else {
                         self.tune_channel(n);
+                    }
+                } else if !self.guide.active
+                    && !overlay_active
+                    && (resp.clicked() || resp.secondary_clicked())
+                {
+                    if let (Some(wp), Some(mp)) = (&self.web_player, resp.interact_pointer_pos()) {
+                        let nx = (mp.x - rect.left()) / rect.width().max(1.0) * 2.0 - 1.0;
+                        let ny = (mp.y - rect.top()) / rect.height().max(1.0) * 2.0 - 1.0;
+                        let a = rect.width() / rect.height().max(1.0);
+                        let fx = nx * a * h + (self.pan[0] + shift_x);
+                        let fy = ny * h + self.pan[1];
+                        let gu = (fx / (4.0 / 3.0)) * 0.5 + 0.5;
+                        let gv = fy * 0.5 + 0.5;
+                        if (0.0..=1.0).contains(&gu) && (0.0..=1.0).contains(&gv) {
+                            let btn = if resp.secondary_clicked() { "right" } else { "left" };
+                            wp.send_mouse_click(
+                                gu * web_channel::WEB_W as f32,
+                                gv * web_channel::WEB_H as f32,
+                                btn,
+                            );
+                        }
                     }
                 }
                 if resp.dragged() && !overlay_active {

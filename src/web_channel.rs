@@ -6,11 +6,14 @@
 //! Frames publish directly into ViCTR's NTSC/CRT physics pipeline so web emulators
 //! get real composite chroma bleed, scanlines, shadow mask, halation, and TV OSD.
 
+use crate::provider::MediaItem;
+use crate::retro::{self, LinuxGamepad};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,9 +23,44 @@ pub const WEB_H: u32 = 480;
 pub const WEATHERSTAR_PRESET_URL: &str =
     "web://https://4000.weatherstar.dev/?kiosk=true&wide=false&scanLines=false&mediaPlaying=true";
 
+pub const PUZZLESCRIPT_GALLERY_DAT_URL: &str = "https://www.puzzlescript.net/games_dat.js";
+
 pub fn is_web_channel_url(src: &str) -> bool {
     let s = src.trim();
     s.len() >= 6 && s[..6].eq_ignore_ascii_case("web://")
+}
+
+/// Returns `true` when `raw` refers to the PuzzleScript Gallery index or `games_dat.js`
+/// (as opposed to a specific game's `play.html?p=...` URL).
+pub fn is_puzzlescript_gallery_url(raw: &str) -> bool {
+    let norm = normalize_web_target_url(raw).to_ascii_lowercase();
+    let trimmed = norm.trim_end_matches('/');
+    if trimmed.contains("play.html") || trimmed.contains("editor.html") {
+        return false;
+    }
+    trimmed.ends_with("games_dat.js")
+        || trimmed == "https://www.puzzlescript.net"
+        || trimmed == "http://www.puzzlescript.net"
+        || trimmed == "https://puzzlescript.net"
+        || trimmed == "http://puzzlescript.net"
+        || trimmed.ends_with("puzzlescript.net/gallery")
+        || trimmed.ends_with("puzzlescript.net/gallery/index.html")
+}
+
+/// Resolves a PuzzleScript gallery URL or empty string to its `games_dat.js` endpoint.
+pub fn puzzlescript_dat_url_for(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return PUZZLESCRIPT_GALLERY_DAT_URL.to_string();
+    }
+    let norm = normalize_web_target_url(trimmed);
+    if norm.to_ascii_lowercase().ends_with("games_dat.js") {
+        norm
+    } else if let Some(idx) = norm.to_ascii_lowercase().find("/gallery") {
+        format!("{}/games_dat.js", norm[..idx].trim_end_matches('/'))
+    } else {
+        format!("{}/games_dat.js", norm.trim_end_matches('/'))
+    }
 }
 
 /// Converts `web://https://4000.weatherstar.dev` or `web://4000.weatherstar.dev` into an HTTP(S) URL.
@@ -51,15 +89,39 @@ pub fn ensure_web_prefix(raw: &str) -> String {
     }
 }
 
+pub enum WebInput {
+    Key {
+        down: bool,
+        key: String,
+        code: String,
+        vk: i32,
+        text: Option<String>,
+    },
+    MouseClick {
+        x: f32,
+        y: f32,
+        button: &'static str,
+    },
+    Scroll {
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+    },
+    SetGamepad(String),
+}
+
 pub struct WebShared {
     pub frame: Option<Arc<(usize, usize, Vec<u8>)>>,
     pub frame_no: u64,
     pub status: String,
+    pub active_gamepad: String,
     pub running: bool,
 }
 
 pub struct WebPlayer {
     pub shared: Arc<Mutex<WebShared>>,
+    tx: Sender<WebInput>,
     stop: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
     profile_dir: Option<PathBuf>,
@@ -79,14 +141,16 @@ impl Drop for WebPlayer {
 }
 
 impl WebPlayer {
-    pub fn start(web_url: &str, muted: bool) -> Self {
+    pub fn start(web_url: &str, muted: bool, gamepad_device: String) -> Self {
         let target_url = normalize_web_target_url(web_url);
         let shared = Arc::new(Mutex::new(WebShared {
             frame: None,
             frame_no: 0,
             status: "Starting web channel…".into(),
+            active_gamepad: String::new(),
             running: true,
         }));
+        let (tx, rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
 
@@ -102,7 +166,16 @@ impl WebPlayer {
         let prof_bg = profile_dir.clone();
 
         std::thread::spawn(move || {
-            if let Err(err) = run_web_channel(&target_url, muted, &prof_bg, &sh_bg, &stop_bg, &child_bg) {
+            if let Err(err) = run_web_channel(
+                &target_url,
+                muted,
+                gamepad_device,
+                &prof_bg,
+                &sh_bg,
+                rx,
+                &stop_bg,
+                &child_bg,
+            ) {
                 let mut g = sh_bg.lock().unwrap();
                 g.status = err;
                 g.running = false;
@@ -111,10 +184,33 @@ impl WebPlayer {
 
         Self {
             shared,
+            tx,
             stop,
             child: child_slot,
             profile_dir: Some(profile_dir),
         }
+    }
+
+    pub fn send_key(&self, down: bool, key: &str, code: &str, vk: i32, text: Option<&str>) {
+        let _ = self.tx.send(WebInput::Key {
+            down,
+            key: key.to_string(),
+            code: code.to_string(),
+            vk,
+            text: text.map(str::to_string),
+        });
+    }
+
+    pub fn send_mouse_click(&self, x: f32, y: f32, button: &'static str) {
+        let _ = self.tx.send(WebInput::MouseClick { x, y, button });
+    }
+
+    pub fn send_scroll(&self, x: f32, y: f32, dx: f32, dy: f32) {
+        let _ = self.tx.send(WebInput::Scroll { x, y, dx, dy });
+    }
+
+    pub fn set_gamepad(&self, dev: String) {
+        let _ = self.tx.send(WebInput::SetGamepad(dev));
     }
 }
 
@@ -178,8 +274,10 @@ fn which_in_path(name: &str) -> Option<PathBuf> {
 fn run_web_channel(
     target_url: &str,
     muted: bool,
+    gamepad_device: String,
     profile_dir: &Path,
     shared: &Arc<Mutex<WebShared>>,
+    rx: Receiver<WebInput>,
     stop: &Arc<AtomicBool>,
     child_slot: &Arc<Mutex<Option<Child>>>,
 ) -> Result<(), String> {
@@ -257,9 +355,11 @@ fn run_web_channel(
     let (host_port, ws_path) = parse_ws_url(&ws_url).ok_or_else(|| format!("Invalid DevTools WS URL: {ws_url}"))?;
 
     let mut ws = WsConn::connect(&host_port, &ws_path)?;
+    let mut gamepad = LinuxGamepad::new(gamepad_device);
     {
         let mut g = shared.lock().unwrap();
         g.status = "Live web channel".into();
+        g.active_gamepad = gamepad.active_summary();
     }
 
     // Force exact 4:3 640×480 viewport and start continuous CDP screencast
@@ -272,38 +372,169 @@ fn run_web_channel(
     )?;
 
     let mut next_id: u64 = 10;
+    let mut prev_gp_mask: u16 = 0;
+    let mut focused_canvas = false;
+
+    let send_cdp_key = |ws: &mut WsConn, next_id: &mut u64, down: bool, key: &str, code: &str, vk: i32, text: Option<&str>| {
+        let mut params = serde_json::json!({
+            "type": if down { "keyDown" } else { "keyUp" },
+            "key": key,
+            "code": code,
+            "windowsVirtualKeyCode": vk,
+            "nativeVirtualKeyCode": vk,
+        });
+        if down {
+            if let Some(t) = text.filter(|s| !s.is_empty()) {
+                params["text"] = serde_json::Value::String(t.to_string());
+                params["unmodifiedText"] = serde_json::Value::String(t.to_string());
+            }
+        }
+        let msg = serde_json::json!({
+            "id": *next_id,
+            "method": "Input.dispatchKeyEvent",
+            "params": params,
+        });
+        *next_id += 1;
+        let _ = ws.send_text(&msg.to_string());
+    };
+
+    let focus_page = |ws: &mut WsConn, next_id: &mut u64| {
+        let msg = serde_json::json!({
+            "id": *next_id,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": "window.focus(); (document.querySelector('canvas') || document.body)?.focus?.();"
+            }
+        });
+        *next_id += 1;
+        let _ = ws.send_text(&msg.to_string());
+    };
+
+    let gp_bindings: &[(u16, &str, &str, i32, Option<&str>)] = &[
+        (retro::BTN_UP, "ArrowUp", "ArrowUp", 38, None),
+        (retro::BTN_DOWN, "ArrowDown", "ArrowDown", 40, None),
+        (retro::BTN_LEFT, "ArrowLeft", "ArrowLeft", 37, None),
+        (retro::BTN_RIGHT, "ArrowRight", "ArrowRight", 39, None),
+        (retro::BTN_A, "x", "KeyX", 88, Some("x")),
+        (retro::BTN_B, "z", "KeyZ", 90, Some("z")),
+        (retro::BTN_X, " ", "Space", 32, Some(" ")),
+        (retro::BTN_Y, "r", "KeyR", 82, Some("r")),
+        (retro::BTN_START, "Enter", "Enter", 13, Some("\r")),
+        (retro::BTN_SELECT, "Escape", "Escape", 27, None),
+        (retro::BTN_L, "z", "KeyZ", 90, Some("z")),
+        (retro::BTN_R, "r", "KeyR", 82, Some("r")),
+    ];
+
+    let drain_inputs = |ws: &mut WsConn,
+                        next_id: &mut u64,
+                        rx: &Receiver<WebInput>,
+                        gamepad: &mut LinuxGamepad,
+                        prev_gp_mask: &mut u16,
+                        shared: &Arc<Mutex<WebShared>>| {
+        while let Ok(inp) = rx.try_recv() {
+            match inp {
+                WebInput::Key { down, key, code, vk, text } => {
+                    send_cdp_key(ws, next_id, down, &key, &code, vk, text.as_deref());
+                }
+                WebInput::MouseClick { x, y, button } => {
+                    let cx = x.clamp(0.0, (WEB_W - 1) as f32);
+                    let cy = y.clamp(0.0, (WEB_H - 1) as f32);
+                    for (ty, clicks) in [("mouseMoved", 0), ("mousePressed", 1), ("mouseReleased", 1)] {
+                        let msg = serde_json::json!({
+                            "id": *next_id,
+                            "method": "Input.dispatchMouseEvent",
+                            "params": {
+                                "type": ty,
+                                "x": cx,
+                                "y": cy,
+                                "button": if ty == "mouseMoved" { "none" } else { button },
+                                "clickCount": clicks,
+                            }
+                        });
+                        *next_id += 1;
+                        let _ = ws.send_text(&msg.to_string());
+                    }
+                }
+                WebInput::Scroll { x, y, dx, dy } => {
+                    let msg = serde_json::json!({
+                        "id": *next_id,
+                        "method": "Input.dispatchMouseEvent",
+                        "params": {
+                            "type": "mouseWheel",
+                            "x": x.clamp(0.0, (WEB_W - 1) as f32),
+                            "y": y.clamp(0.0, (WEB_H - 1) as f32),
+                            "deltaX": dx,
+                            "deltaY": dy,
+                        }
+                    });
+                    *next_id += 1;
+                    let _ = ws.send_text(&msg.to_string());
+                }
+                WebInput::SetGamepad(dev) => {
+                    gamepad.set_selected(dev);
+                }
+            }
+        }
+        let gp_mask = gamepad.poll_mask();
+        if let Some(summary) = gamepad.take_changed_summary() {
+            shared.lock().unwrap().active_gamepad = summary;
+        }
+        let diff = gp_mask ^ *prev_gp_mask;
+        if diff != 0 {
+            for &(bit, key, code, vk, text) in gp_bindings {
+                if (diff & bit) != 0 {
+                    let down = (gp_mask & bit) != 0;
+                    send_cdp_key(ws, next_id, down, key, code, vk, text);
+                }
+            }
+            *prev_gp_mask = gp_mask;
+        }
+    };
+
     while !stop.load(Ordering::SeqCst) {
+        drain_inputs(&mut ws, &mut next_id, &rx, &mut gamepad, &mut prev_gp_mask, shared);
         match ws.read_text_frame() {
             Ok(Some(msg)) => {
                 let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg) else { continue };
-                if val.get("method").and_then(|m| m.as_str()) == Some("Page.screencastFrame") {
-                    if let Some(params) = val.get("params") {
-                        let session_id = params.get("sessionId").and_then(|s| s.as_i64()).unwrap_or(0);
-                        // Acknowledge immediately so Chromium keeps pushing smoothly
-                        let ack = format!(
-                            r#"{{"id":{next_id},"method":"Page.screencastFrameAck","params":{{"sessionId":{session_id}}}}}"#
-                        );
-                        next_id += 1;
-                        let _ = ws.send_text(&ack);
+                match val.get("method").and_then(|m| m.as_str()) {
+                    Some("Page.loadEventFired") => {
+                        focus_page(&mut ws, &mut next_id);
+                        focused_canvas = true;
+                    }
+                    Some("Page.screencastFrame") => {
+                        if let Some(params) = val.get("params") {
+                            let session_id = params.get("sessionId").and_then(|s| s.as_i64()).unwrap_or(0);
+                            // Acknowledge immediately so Chromium keeps pushing smoothly
+                            let ack = format!(
+                                r#"{{"id":{next_id},"method":"Page.screencastFrameAck","params":{{"sessionId":{session_id}}}}}"#
+                            );
+                            next_id += 1;
+                            let _ = ws.send_text(&ack);
 
-                        if let Some(b64) = params.get("data").and_then(|d| d.as_str()) {
-                            if let Some(jpeg) = decode_base64(b64) {
-                                if let Ok(img) = image::load_from_memory(&jpeg) {
-                                    let rgba = img.to_rgba8();
-                                    let (w, h) = rgba.dimensions();
-                                    if w > 0 && h > 0 {
-                                        let mut g = shared.lock().unwrap();
-                                        g.frame_no += 1;
-                                        g.frame = Some(Arc::new((w as usize, h as usize, rgba.into_raw())));
+                            if let Some(b64) = params.get("data").and_then(|d| d.as_str()) {
+                                if let Some(jpeg) = decode_base64(b64) {
+                                    if let Ok(img) = image::load_from_memory(&jpeg) {
+                                        let rgba = img.to_rgba8();
+                                        let (w, h) = rgba.dimensions();
+                                        if w > 0 && h > 0 {
+                                            let mut g = shared.lock().unwrap();
+                                            g.frame_no += 1;
+                                            g.frame = Some(Arc::new((w as usize, h as usize, rgba.into_raw())));
+                                        }
                                     }
                                 }
                             }
+                            if !focused_canvas {
+                                focus_page(&mut ws, &mut next_id);
+                                focused_canvas = true;
+                            }
                         }
                     }
+                    _ => {}
                 }
             }
             Ok(None) => {
-                // Read timeout — keep looping and checking `stop`
+                // Short read timeout — loop immediately to keep input latency < 10 ms
             }
             Err(_) => {
                 if !stop.load(Ordering::SeqCst) {
@@ -363,7 +594,7 @@ impl WsConn {
     fn connect(host_port: &str, path: &str) -> Result<Self, String> {
         let mut stream =
             TcpStream::connect(host_port).map_err(|e| format!("CDP socket connect failed: {e}"))?;
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(8)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
 
         let req = format!(
@@ -540,6 +771,192 @@ pub fn decode_base64(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// ------------------------------------------------------------------ PuzzleScript Gallery Loader
+
+#[derive(serde::Deserialize)]
+struct PsGalleryEntry {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    thumb: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    author: String,
+    #[serde(rename = "NSFW", default)]
+    nsfw: bool,
+}
+
+/// Strips illegal trailing commas before `]` or `}` outside JSON strings (present in `games_dat.js`).
+fn strip_json_trailing_commas(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut in_str = false;
+    let mut esc = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            out.push(b);
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        if b == b',' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b']' || bytes[j] == b'}') {
+                i += 1;
+                continue;
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn extract_puzzlescript_gist_id(url: &str) -> Option<String> {
+    for needle in ["?p=", "&p=", "?hack=", "&hack="] {
+        if let Some(pos) = url.find(needle) {
+            let rest = &url[pos + needle.len()..];
+            let id: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Parses PuzzleScript's `games_dat.js` into browsable, playable `MediaItem` entries
+/// (newest first, matching the official gallery). Entries whose `url` points off-site
+/// (e.g. itch.io) are redirected to the clean `play.html?p=<id>` player whenever a
+/// PuzzleScript gist `source` is present.
+pub fn parse_puzzlescript_games_dat(js: &str, dat_url: &str, include_nsfw: bool) -> Result<Vec<MediaItem>, String> {
+    let start = js
+        .find('[')
+        .ok_or_else(|| "PuzzleScript games_dat.js missing '[' array start".to_string())?;
+    let end = js
+        .rfind(']')
+        .ok_or_else(|| "PuzzleScript games_dat.js missing ']' array end".to_string())?;
+    if end <= start {
+        return Err("PuzzleScript games_dat.js array bounds invalid".into());
+    }
+    let cleaned = strip_json_trailing_commas(&js[start..=end]);
+    let mut entries: Vec<PsGalleryEntry> =
+        serde_json::from_str(&cleaned).map_err(|e| format!("Invalid PuzzleScript gallery JSON: {e}"))?;
+    entries.reverse();
+
+    let base = dat_url
+        .rsplit_once('/')
+        .map(|(b, _)| b.trim_end_matches('/'))
+        .unwrap_or("https://www.puzzlescript.net");
+
+    let mut out = Vec::with_capacity(entries.len());
+    for (idx, e) in entries.into_iter().enumerate() {
+        if e.nsfw && !include_nsfw {
+            continue;
+        }
+        let title = e.title.trim();
+        if title.is_empty() {
+            continue;
+        }
+        let raw_url = e.url.trim();
+        let play_url = if raw_url.contains("play.html") {
+            raw_url.to_string()
+        } else if let Some(id) = extract_puzzlescript_gist_id(e.source.trim()) {
+            format!("{base}/play.html?p={id}")
+        } else if !raw_url.is_empty() {
+            raw_url.to_string()
+        } else {
+            continue;
+        };
+
+        let gist_id = extract_puzzlescript_gist_id(&play_url).unwrap_or_else(|| format!("{idx}"));
+        let artwork_id = if e.thumb.trim().is_empty() {
+            String::new()
+        } else if e.thumb.starts_with("http://") || e.thumb.starts_with("https://") {
+            e.thumb.trim().to_string()
+        } else {
+            format!("{base}/Gallery/gifs/{}", e.thumb.trim().trim_start_matches('/'))
+        };
+        let author = e.author.trim();
+        let overview = if author.is_empty() {
+            "PuzzleScript Gallery · Arrows/WASD move · X/Space action · Z undo · R restart".to_string()
+        } else {
+            format!("by {author} · Arrows/WASD move · X/Space action · Z undo · R restart")
+        };
+        out.push(MediaItem {
+            id: format!("ps:{gist_id}"),
+            title: title.to_string(),
+            season: None,
+            episode: None,
+            overview,
+            runtime_secs: 1800.0,
+            played: false,
+            resume_secs: 0.0,
+            artwork_id,
+            stream_url: ensure_web_prefix(&play_url),
+        });
+    }
+    Ok(out)
+}
+
+pub fn puzzlescript_cache_path() -> Option<PathBuf> {
+    crate::settings::presets_dir().and_then(|d| d.parent().map(|p| p.join("puzzlescript_gallery.cache.js")))
+}
+
+pub fn load_cached_puzzlescript_gallery(dat_url: &str, cache_path: &Path) -> Option<Vec<MediaItem>> {
+    let text = std::fs::read_to_string(cache_path).ok()?;
+    let items = parse_puzzlescript_games_dat(&text, dat_url, false).ok()?;
+    if items.is_empty() { None } else { Some(items) }
+}
+
+pub fn fetch_puzzlescript_gallery(dat_url: &str, cache_path: Option<&Path>) -> Result<Vec<MediaItem>, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(6))
+        .timeout(Duration::from_secs(12))
+        .build();
+    let resp = agent
+        .get(dat_url)
+        .call()
+        .map_err(|e| format!("Couldn't fetch PuzzleScript gallery ({dat_url}): {e}"))?;
+    let body = resp
+        .into_string()
+        .map_err(|e| format!("Couldn't read PuzzleScript gallery response: {e}"))?;
+    let items = parse_puzzlescript_games_dat(&body, dat_url, false)?;
+    if items.is_empty() {
+        return Err("PuzzleScript gallery returned no playable games.".into());
+    }
+    if let Some(cp) = cache_path {
+        if let Some(parent) = cp.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(cp, &body);
+    }
+    Ok(items)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,8 +973,53 @@ mod tests {
             ensure_web_prefix("4000.weatherstar.dev"),
             "web://https://4000.weatherstar.dev"
         );
+        assert!(is_puzzlescript_gallery_url("https://www.puzzlescript.net/Gallery/"));
+        assert!(is_puzzlescript_gallery_url("https://www.puzzlescript.net"));
+        assert!(!is_puzzlescript_gallery_url("https://www.puzzlescript.net/play.html?p=6841165"));
+        assert_eq!(
+            puzzlescript_dat_url_for("https://www.puzzlescript.net/Gallery/index.html"),
+            "https://www.puzzlescript.net/games_dat.js"
+        );
         assert_eq!(decode_base64("VmlDVFIgQ1JU").unwrap(), b"ViCTR CRT");
         assert_eq!(decode_base64("SGVsbG8=").unwrap(), b"Hello");
+    }
+
+    #[test]
+    fn puzzlescript_games_dat_parses_trailing_commas_and_prefers_play_url() {
+        let sample = r#"
+//do not change go const
+let games_gallery = [
+  {
+    "url": "https://www.puzzlescript.net/play.html?p=6841165",
+    "thumb": "6841165.gif",
+    "title": "2D Whale World",
+    "author": "increpare"
+  },
+  {
+    "url": "https://example.itch.io/midwinter/",
+    "source": "https://www.puzzlescript.net/editor.html?hack=3e73c82343df",
+    "thumb": "3e73c82343df.gif",
+    "title": "Midwinter Springtime",
+    "author": "pap4qlxxlevb",
+  },
+  {
+    "url": "https://www.puzzlescript.net/play.html?p=999",
+    "thumb": "999.gif",
+    "title": "Skipped NSFW",
+    "author": "anon",
+    "NSFW": true
+  },
+];
+"#;
+        let items = parse_puzzlescript_games_dat(sample, PUZZLESCRIPT_GALLERY_DAT_URL, false).unwrap();
+        assert_eq!(items.len(), 2);
+        // Reversed so newest appears first
+        assert_eq!(items[0].title, "Midwinter Springtime");
+        assert_eq!(items[0].stream_url, "web://https://www.puzzlescript.net/play.html?p=3e73c82343df");
+        assert_eq!(items[0].artwork_id, "https://www.puzzlescript.net/Gallery/gifs/3e73c82343df.gif");
+        assert!(items[0].overview.contains("by pap4qlxxlevb"));
+        assert_eq!(items[1].title, "2D Whale World");
+        assert_eq!(items[1].stream_url, "web://https://www.puzzlescript.net/play.html?p=6841165");
     }
 
     #[test]

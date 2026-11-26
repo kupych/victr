@@ -764,7 +764,7 @@ impl OpenGamepad {
 }
 
 #[cfg(target_os = "linux")]
-struct LinuxGamepad {
+pub(crate) struct LinuxGamepad {
     selected: String, // "" = auto (all real gamepads), or "js1" / "/dev/input/js1"
     devices: Vec<OpenGamepad>,
     last_probe: Instant,
@@ -773,7 +773,7 @@ struct LinuxGamepad {
 
 #[cfg(target_os = "linux")]
 impl LinuxGamepad {
-    fn new(selected: String) -> Self {
+    pub(crate) fn new(selected: String) -> Self {
         let mut gp = Self {
             selected,
             devices: Vec::new(),
@@ -784,7 +784,7 @@ impl LinuxGamepad {
         gp
     }
 
-    fn set_selected(&mut self, selected: String) {
+    pub(crate) fn set_selected(&mut self, selected: String) {
         self.selected = selected;
         self.devices.clear();
         self.last_probe = Instant::now() - Duration::from_secs(5);
@@ -792,7 +792,7 @@ impl LinuxGamepad {
         self.refresh_devices();
     }
 
-    fn active_summary(&self) -> String {
+    pub(crate) fn active_summary(&self) -> String {
         if self.devices.is_empty() {
             if self.selected.is_empty() {
                 "None (keyboard only)".into()
@@ -808,7 +808,7 @@ impl LinuxGamepad {
         }
     }
 
-    fn take_changed_summary(&mut self) -> Option<String> {
+    pub(crate) fn take_changed_summary(&mut self) -> Option<String> {
         if self.changed {
             self.changed = false;
             Some(self.active_summary())
@@ -847,7 +847,7 @@ impl LinuxGamepad {
         }
     }
 
-    fn poll_mask(&mut self) -> u16 {
+    pub(crate) fn poll_mask(&mut self) -> u16 {
         self.refresh_devices();
         let mut mask = 0u16;
         let mut i = 0;
@@ -868,15 +868,15 @@ impl LinuxGamepad {
 }
 
 #[cfg(not(target_os = "linux"))]
-struct LinuxGamepad;
+pub(crate) struct LinuxGamepad;
 
 #[cfg(not(target_os = "linux"))]
 impl LinuxGamepad {
-    fn new(_selected: String) -> Self { Self }
-    fn set_selected(&mut self, _selected: String) {}
-    fn active_summary(&self) -> String { "Keyboard only".into() }
-    fn take_changed_summary(&mut self) -> Option<String> { None }
-    fn poll_mask(&mut self) -> u16 { 0 }
+    pub(crate) fn new(_selected: String) -> Self { Self }
+    pub(crate) fn set_selected(&mut self, _selected: String) {}
+    pub(crate) fn active_summary(&self) -> String { "Keyboard only".into() }
+    pub(crate) fn take_changed_summary(&mut self) -> Option<String> { None }
+    pub(crate) fn poll_mask(&mut self) -> u16 { 0 }
 }
 
 // ------------------------------------------------------------------ Libretro FFI & Dynamic Loader
