@@ -1074,6 +1074,12 @@ pub struct AppConfig {
     pub startup_dest: StartupDestination,
     #[serde(default)]
     pub last_watched: Option<LastWatched>,
+    /// Favorited individual items (episodes, movies, PuzzleScript games, ROMs) keyed by `MediaItem::id`.
+    #[serde(default)]
+    pub favorite_items: std::collections::BTreeSet<String>,
+    /// Favorited channels keyed by `<provider_id>:<source_key>`.
+    #[serde(default)]
+    pub favorite_channels: std::collections::BTreeSet<String>,
 }
 
 impl Default for AppConfig {
@@ -1085,6 +1091,8 @@ impl Default for AppConfig {
             start_fullscreen: false,
             startup_dest: StartupDestination::Guide,
             last_watched: None,
+            favorite_items: std::collections::BTreeSet::new(),
+            favorite_channels: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -1214,6 +1222,8 @@ mod tests {
                 channel_name: "The Simpsons".into(),
                 item_id: "ep1".into(),
             }),
+            favorite_items: ["ps:6841210".to_string()].into_iter().collect(),
+            favorite_channels: ["channels:cfg:pzls".to_string()].into_iter().collect(),
         };
         save_app_config_to(&path, &cfg).unwrap();
         let loaded = load_app_config_from(&path);
@@ -1223,6 +1233,8 @@ mod tests {
         assert!(loaded.start_fullscreen);
         assert_eq!(loaded.startup_dest, StartupDestination::LastWatched);
         assert_eq!(loaded.last_watched.as_ref().map(|w| w.label()), Some("The Simpsons".into()));
+        assert!(loaded.favorite_items.contains("ps:6841210"));
+        assert!(loaded.favorite_channels.contains("channels:cfg:pzls"));
 
         let cfg2 = AppConfig {
             default_preset: Some(StartupPreset::BuiltIn(4)),
@@ -1231,6 +1243,8 @@ mod tests {
             start_fullscreen: false,
             startup_dest: StartupDestination::DefaultPattern,
             last_watched: None,
+            favorite_items: Default::default(),
+            favorite_channels: Default::default(),
         };
         save_app_config_to(&path, &cfg2).unwrap();
         let loaded2 = load_app_config_from(&path);

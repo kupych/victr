@@ -7,6 +7,7 @@
 use crate::osd::Canvas;
 use crate::provider::{ArtworkImage, Channel, ChannelKind, MediaItem};
 use chrono::{Local, TimeZone, Utc};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub const GUIDE_W: usize = 640;
@@ -42,6 +43,9 @@ pub struct GuideState {
     pub scroll_row: usize,
     /// Horizontal time-slot scroll offset in 30-minute increments (0 = current half-hour).
     pub time_offset_slots: i32,
+    /// Active `/` search/filter typing state and query (shared across Grid and ItemPicker).
+    pub search_active: bool,
+    pub search_query: String,
     canvas: Canvas,
     frame_counter: u64,
 }
@@ -60,12 +64,139 @@ impl GuideState {
             selected_idx: 0,
             scroll_row: 0,
             time_offset_slots: 0,
+            search_active: false,
+            search_query: String::new(),
             canvas: Canvas::new(GUIDE_W, GUIDE_H),
             frame_counter: 0,
         }
     }
 
+    pub fn channel_fav_key(ch: &Channel) -> String {
+        format!("{}:{}", ch.provider_id, ch.source_key)
+    }
+
+    pub fn is_channel_fav(ch: &Channel, fav_channels: &BTreeSet<String>) -> bool {
+        fav_channels.contains(&Self::channel_fav_key(ch))
+            || matches!(&ch.kind, ChannelKind::Series { is_favorite: true, .. })
+    }
+
+    pub fn start_search(&mut self) {
+        self.search_active = true;
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search_active = false;
+        self.search_query.clear();
+        self.reset_cursor_top();
+    }
+
+    fn reset_cursor_top(&mut self) {
+        match &mut self.view {
+            GuideView::Grid => {
+                self.selected_idx = 0;
+                self.scroll_row = 0;
+            }
+            GuideView::ItemPicker { selected_item, scroll_item, .. } => {
+                *selected_item = 0;
+                *scroll_item = 0;
+            }
+        }
+    }
+
+    pub fn push_search_char(&mut self, ch: char) {
+        if self.search_query.chars().count() < 36 {
+            self.search_query.push(ch);
+            self.reset_cursor_top();
+        }
+    }
+
+    pub fn pop_search_char(&mut self) {
+        if self.search_query.pop().is_none() {
+            self.search_active = false;
+        } else {
+            self.reset_cursor_top();
+        }
+    }
+
+    /// Filters a channel's items by `search_query`. A `*` token restricts to favorited items.
+    pub fn filter_items<'a>(&self, items: &'a [MediaItem], fav_items: &BTreeSet<String>) -> Vec<&'a MediaItem> {
+        let q = self.search_query.trim();
+        if q.is_empty() {
+            return items.iter().collect();
+        }
+        let mut fav_only = false;
+        let mut terms: Vec<String> = Vec::new();
+        for tok in q.split_whitespace() {
+            if tok == "*" {
+                fav_only = true;
+            } else if let Some(rest) = tok.strip_prefix('*') {
+                fav_only = true;
+                if !rest.is_empty() {
+                    terms.push(rest.to_ascii_lowercase());
+                }
+            } else {
+                terms.push(tok.to_ascii_lowercase());
+            }
+        }
+        items
+            .iter()
+            .filter(|m| {
+                if fav_only && !fav_items.contains(&m.id) {
+                    return false;
+                }
+                if terms.is_empty() {
+                    return true;
+                }
+                let hay = format!("{} {} {}", m.title, m.short_label(), m.overview).to_ascii_lowercase();
+                terms.iter().all(|t| hay.contains(t.as_str()))
+            })
+            .collect()
+    }
+
+    /// Filters visible channels by `search_query`. A `*` token restricts to favorited channels.
+    pub fn filter_channels<'a>(
+        &self,
+        channels: &[&'a Channel],
+        fav_channels: &BTreeSet<String>,
+    ) -> Vec<&'a Channel> {
+        let q = self.search_query.trim();
+        if q.is_empty() {
+            return channels.to_vec();
+        }
+        let mut fav_only = false;
+        let mut terms: Vec<String> = Vec::new();
+        for tok in q.split_whitespace() {
+            if tok == "*" {
+                fav_only = true;
+            } else if let Some(rest) = tok.strip_prefix('*') {
+                fav_only = true;
+                if !rest.is_empty() {
+                    terms.push(rest.to_ascii_lowercase());
+                }
+            } else {
+                terms.push(tok.to_ascii_lowercase());
+            }
+        }
+        channels
+            .iter()
+            .copied()
+            .filter(|ch| {
+                if fav_only && !Self::is_channel_fav(ch, fav_channels) {
+                    return false;
+                }
+                if terms.is_empty() {
+                    return true;
+                }
+                let hay = format!("{:02} {} {} {}", ch.number, ch.callsign, ch.name, ch.channel_type)
+                    .to_ascii_lowercase();
+                terms.iter().all(|t| hay.contains(t.as_str()))
+            })
+            .collect()
+    }
+
     pub fn open_picker(&mut self, channel_number: u16, initial_item: usize, total_items: usize) {
+        self.search_active = false;
+        self.search_query.clear();
         let sel = if total_items == 0 { 0 } else { initial_item.min(total_items - 1) };
         let scroll = sel.saturating_sub(VISIBLE_ROWS / 2).min(total_items.saturating_sub(VISIBLE_ROWS));
         self.view = GuideView::ItemPicker {
@@ -76,6 +207,8 @@ impl GuideState {
     }
 
     pub fn close_picker(&mut self) {
+        self.search_active = false;
+        self.search_query.clear();
         self.view = GuideView::Grid;
     }
 
@@ -250,6 +383,7 @@ impl GuideState {
     }
 
     /// Renders one complete 640x480 classic 1990s Prevue Channel frame (Grid OR Episode/Movie Picker).
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         channels: &[&Channel],
@@ -258,8 +392,11 @@ impl GuideState {
         live_video: Option<&Arc<(usize, usize, Vec<u8>)>>,
         now_playing_label: Option<&str>,
         highlighted_art: Option<&ArtworkImage>,
+        fav_channels: &BTreeSet<String>,
+        fav_items: &BTreeSet<String>,
     ) -> (u64, Arc<(usize, usize, Vec<u8>)>) {
-        self.clamp_selection(channels.len());
+        let filtered_channels = self.filter_channels(channels, fav_channels);
+        self.clamp_selection(filtered_channels.len());
         let now_unix = Utc::now().timestamp();
         let local_now = Local::now();
 
@@ -346,8 +483,13 @@ impl GuideState {
             .bevel_rect(rx, card_y, rw, card_h, [10, 24, 72, 255], [76, 118, 204, 255], [5, 10, 32, 255]);
 
         // Resolve info card content (either Picker's highlighted episode/movie OR Grid's channel)
-        let card_data = if let (GuideView::ItemPicker { selected_item, .. }, Some(pch)) = (self.view, picker_channel) {
-            let items = pch.items();
+        let card_data = if let (GuideView::ItemPicker { .. }, Some(pch)) = (self.view, picker_channel) {
+            let items = self.filter_items(pch.items(), fav_items);
+            self.clamp_picker(items.len());
+            let selected_item = match self.view {
+                GuideView::ItemPicker { selected_item, .. } => selected_item,
+                GuideView::Grid => 0,
+            };
             let badge = format!("CH {:02} {}", pch.number, pch.callsign);
             if let Some(ep) = items.get(selected_item) {
                 let status = if ep.played {
@@ -357,15 +499,25 @@ impl GuideState {
                 } else {
                     "UNWATCHED".to_string()
                 };
-                let meta = format!("{} MIN · {}", ep.runtime_mins(), status);
+                let fav_tag = if fav_items.contains(&ep.id) { "* FAV · " } else { "" };
+                let meta = format!("{}{} MIN · {}", fav_tag, ep.runtime_mins(), status);
                 Some((badge, ep.short_label(), meta, ep.overview.clone()))
+            } else if !self.search_query.trim().is_empty() {
+                Some((badge, pch.name.clone(), "NO MATCHES".into(), format!("Filter: /{}", self.search_query)))
             } else {
                 Some((badge, pch.name.clone(), "LOADING EPISODES...".into(), String::new()))
             }
-        } else if let Some(sel) = channels.get(self.selected_idx) {
+        } else if let Some(sel) = filtered_channels.get(self.selected_idx) {
             let (title, meta, overview, _) = sel.preview_info(now_unix);
-            let badge = format!("CH {:02} {}", sel.number, sel.callsign);
+            let is_fav = Self::is_channel_fav(sel, fav_channels);
+            let badge = if is_fav {
+                format!("* CH {:02} {}", sel.number, sel.callsign)
+            } else {
+                format!("CH {:02} {}", sel.number, sel.callsign)
+            };
             Some((badge, title, meta, overview))
+        } else if !self.search_query.trim().is_empty() {
+            Some(("SEARCH".into(), "NO MATCHING CHANNELS".into(), format!("/{}", self.search_query), "Press ESC to clear filter.".into()))
         } else {
             None
         };
@@ -427,28 +579,33 @@ impl GuideState {
         self.canvas.fill_rect(0, GRID_TOP, GUIDE_W as i32, VISIBLE_ROWS as i32 * ROW_H, [6, 14, 46, 255]);
 
         if let (GuideView::ItemPicker { selected_item, scroll_item, .. }, Some(pch)) = (self.view, picker_channel) {
-            let items = pch.items();
-            let is_series = matches!(pch.kind, ChannelKind::Series { .. });
+            let total_all = pch.items().len();
+            let items = self.filter_items(pch.items(), fav_items);
             // Left gold channel badge
             self.canvas.bevel_rect(SAFE_X, 209, CH_COL_W, 25, [186, 134, 22, 255], [250, 216, 98, 255], [108, 74, 8, 255]);
             let ch_badge = format!("{:02} {}", pch.number, pch.callsign);
             self.canvas
                 .draw_text_clipped(SAFE_X + 6, 214, &ch_badge, CH_COL_W - 10, 1, 2, [10, 18, 44, 255], None);
 
-            // Right header strip showing series name + season
+            // Right header strip showing series name + season + filter count
             let hdr_w = SAFE_W - CH_COL_W - 4;
             self.canvas
                 .bevel_rect(COL_X0, 209, hdr_w, 25, [22, 52, 142, 255], [104, 152, 242, 255], [8, 20, 62, 255]);
             let season_tag = items
                 .get(selected_item)
                 .and_then(|m| m.season)
-                .map(|s| format!(" · SEASON {:02}", s))
+                .map(|s| format!(" · S{:02}", s))
                 .unwrap_or_default();
+            let count_tag = if self.search_query.trim().is_empty() {
+                format!("({})", items.len())
+            } else {
+                format!("({}/{})", items.len(), total_all)
+            };
             let hdr_text = format!(
-                "{}{} ({})",
+                "{}{} {}",
                 pch.name.to_ascii_uppercase(),
                 season_tag,
-                items.len()
+                count_tag
             );
             self.canvas.draw_text_clipped(
                 COL_X0 + 10,
@@ -461,7 +618,7 @@ impl GuideState {
                 Some([6, 12, 36, 255]),
             );
 
-            // 6 visible episode/movie rows
+            // 6 visible episode/movie/game rows
             for row in 0..VISIBLE_ROWS {
                 let idx = scroll_item + row;
                 let ry = GRID_TOP + row as i32 * ROW_H;
@@ -471,6 +628,7 @@ impl GuideState {
                 };
                 let is_sel = idx == selected_item;
                 let is_now = active_item_id == Some(item.id.as_str());
+                let is_fav = fav_items.contains(&item.id);
 
                 let (fill, hi, lo, fg) = if is_sel {
                     ([246, 202, 58, 255], [255, 240, 162, 255], [156, 116, 18, 255], [10, 18, 44, 255])
@@ -481,11 +639,11 @@ impl GuideState {
                 };
                 self.canvas.bevel_rect(SAFE_X, ry + 1, SAFE_W, ROW_H - 2, fill, hi, lo);
 
-                // Status badge: [OK] watched, [>] playing/resume, [ ] unwatched
+                // Status badge: [►] playing, [+] watched/done, [~] resume, [ ] unwatched
                 let (st_txt, st_col) = if is_now {
                     ("[►]", if is_sel { [10, 18, 44, 255] } else { [92, 255, 132, 255] })
                 } else if item.played {
-                    ("[*]", if is_sel { [16, 78, 28, 255] } else { [102, 236, 132, 255] })
+                    ("[+]", if is_sel { [16, 78, 28, 255] } else { [102, 236, 132, 255] })
                 } else if item.resume_secs > 15.0 {
                     ("[~]", if is_sel { [10, 18, 44, 255] } else { [248, 214, 78, 255] })
                 } else {
@@ -493,10 +651,16 @@ impl GuideState {
                 };
                 self.canvas.draw_text(SAFE_X + 8, ry + 8, st_txt, 1, 2, st_col, None);
 
+                let mut title_x = SAFE_X + 38;
+                if is_fav {
+                    let star_col = if is_sel { [148, 56, 0, 255] } else { [255, 218, 66, 255] };
+                    self.canvas.draw_text(title_x, ry + 8, "*", 1, 2, star_col, None);
+                    title_x += 12;
+                }
+
                 let dur_str = format!("{}M", item.runtime_mins());
                 let dur_w = dur_str.len() as i32 * 8;
-                let title_x = SAFE_X + 40;
-                let title_w = SAFE_W - 48 - dur_w - 8;
+                let title_w = (SAFE_X + SAFE_W - dur_w - 14 - title_x).max(40);
                 self.canvas.draw_text_clipped(
                     title_x,
                     ry + 8,
@@ -511,21 +675,34 @@ impl GuideState {
                 self.canvas.draw_text(SAFE_X + SAFE_W - dur_w - 8, ry + 8, &dur_str, 1, 2, dur_col, None);
             }
 
-            // Footer ticker for Picker
+            // Footer ticker / live search bar for Picker
             self.canvas.fill_rect(0, foot_y, GUIDE_W as i32, 2, [242, 194, 52, 255]);
             self.canvas.fill_rect(0, foot_y + 2, GUIDE_W as i32, GUIDE_H as i32 - foot_y - 2, [8, 16, 48, 255]);
-            let hint = if is_series {
-                "UP/DN:EP  LT/RT:SEASON  ENTER:PLAY  W:WATCHED  ESC:BACK"
-            } else {
-                "UP/DN:MOVIE  ENTER:PLAY  R:START  W:WATCHED  ESC:BACK"
-            };
-            self.canvas.draw_text(SAFE_X + 4, foot_y + 7, hint, 1, 2, [244, 206, 78, 255], None);
             let page_info = if items.is_empty() {
-                "0/0".to_string()
+                format!("0/{total_all}")
             } else {
                 format!("{}/{}", selected_item + 1, items.len())
             };
             let pw = page_info.len() as i32 * 8;
+            if self.search_active || !self.search_query.is_empty() {
+                let blink = self.search_active && (self.frame_counter / 24).is_multiple_of(2);
+                let cursor = if blink { "_" } else { "" };
+                let bar = format!("FIND: /{}{}", self.search_query, cursor);
+                self.canvas.fill_rect(SAFE_X, foot_y + 4, SAFE_W - pw - 16, 20, [14, 38, 102, 255]);
+                self.canvas.draw_text_clipped(
+                    SAFE_X + 6,
+                    foot_y + 7,
+                    &bar,
+                    SAFE_W - pw - 26,
+                    1,
+                    2,
+                    [116, 255, 192, 255],
+                    None,
+                );
+            } else {
+                let hint = "/:FIND  *:FAV  ENTER:PLAY  W:DONE  ESC:BACK";
+                self.canvas.draw_text(SAFE_X + 4, foot_y + 7, hint, 1, 2, [244, 206, 78, 255], None);
+            }
             self.canvas
                 .draw_text(SAFE_X + SAFE_W - pw - 4, foot_y + 7, &page_info, 1, 2, [152, 212, 255, 255], None);
         } else {
@@ -556,7 +733,7 @@ impl GuideState {
             for row in 0..VISIBLE_ROWS {
                 let idx = self.scroll_row + row;
                 let ry = GRID_TOP + row as i32 * ROW_H;
-                let Some(ch) = channels.get(idx) else {
+                let Some(ch) = filtered_channels.get(idx) else {
                     self.canvas.fill_rect(SAFE_X, ry + 1, SAFE_W, ROW_H - 2, [8, 18, 56, 255]);
                     continue;
                 };
@@ -564,6 +741,7 @@ impl GuideState {
                 let is_movie = matches!(ch.kind, ChannelKind::MovieGenre { .. });
                 let is_live = matches!(ch.kind, ChannelKind::LiveStream { .. });
                 let is_block = matches!(ch.kind, ChannelKind::Block { .. });
+                let is_fav = Self::is_channel_fav(ch, fav_channels);
 
                 let (c_fill, c_hi, c_lo, c_fg) = if is_sel {
                     ([244, 198, 52, 255], [255, 236, 148, 255], [154, 112, 16, 255], [10, 18, 44, 255])
@@ -580,7 +758,8 @@ impl GuideState {
                 let num_s = format!("{:02}", ch.number);
                 self.canvas.draw_text(SAFE_X + 6, ry + 8, &num_s, 2, 2, c_fg, None);
                 let cs_fg = if is_sel { [10, 18, 44, 255] } else { [238, 244, 255, 255] };
-                self.canvas.draw_text_clipped(SAFE_X + 44, ry + 8, &ch.callsign, CH_COL_W - 48, 1, 2, cs_fg, None);
+                let cs_label = if is_fav { format!("*{}", ch.callsign) } else { ch.callsign.clone() };
+                self.canvas.draw_text_clipped(SAFE_X + 42, ry + 8, &cs_label, CH_COL_W - 46, 1, 2, cs_fg, None);
 
                 let entries = ch.grid_entries(win_start, win_end, now_unix);
                 let total_span = (win_end - win_start) as f32;
@@ -628,24 +807,41 @@ impl GuideState {
                 }
             }
 
-            // ---- Bottom Status Ticker
+            // ---- Bottom Status Ticker / Live Search Bar
             self.canvas.fill_rect(0, foot_y, GUIDE_W as i32, 2, [242, 194, 52, 255]);
             self.canvas.fill_rect(0, foot_y + 2, GUIDE_W as i32, GUIDE_H as i32 - foot_y - 2, [8, 16, 48, 255]);
-            let page_info = if channels.is_empty() {
-                "NO CHANNELS".to_string()
+            let page_info = if filtered_channels.is_empty() {
+                format!("0/{}", channels.len())
             } else {
-                format!("{}/{}", self.selected_idx + 1, channels.len())
+                format!("{}/{}", self.selected_idx + 1, filtered_channels.len())
             };
-            self.canvas.draw_text(
-                SAFE_X + 4,
-                foot_y + 7,
-                "ARROWS:BROWSE  ENTER:TUNE  E:EPISODES  R:SYNC  G:EXIT",
-                1,
-                2,
-                [244, 206, 78, 255],
-                None,
-            );
             let pw = page_info.len() as i32 * 8;
+            if self.search_active || !self.search_query.is_empty() {
+                let blink = self.search_active && (self.frame_counter / 24).is_multiple_of(2);
+                let cursor = if blink { "_" } else { "" };
+                let bar = format!("FIND: /{}{}", self.search_query, cursor);
+                self.canvas.fill_rect(SAFE_X, foot_y + 4, SAFE_W - pw - 16, 20, [14, 38, 102, 255]);
+                self.canvas.draw_text_clipped(
+                    SAFE_X + 6,
+                    foot_y + 7,
+                    &bar,
+                    SAFE_W - pw - 26,
+                    1,
+                    2,
+                    [116, 255, 192, 255],
+                    None,
+                );
+            } else {
+                self.canvas.draw_text(
+                    SAFE_X + 4,
+                    foot_y + 7,
+                    "/:FIND  *:FAV  ENTER:TUNE  E:LIST  G:EXIT",
+                    1,
+                    2,
+                    [244, 206, 78, 255],
+                    None,
+                );
+            }
             self.canvas
                 .draw_text(SAFE_X + SAFE_W - pw - 4, foot_y + 7, &page_info, 1, 2, [152, 212, 255, 255], None);
         }
@@ -735,9 +931,11 @@ mod tests {
             },
         };
         let list = vec![&ch1, &ch2];
+        let mut fav_ch = BTreeSet::new();
+        let mut fav_it = BTreeSet::new();
         let mut g = GuideState::new();
         g.selected_idx = 1;
-        let (id, frame) = g.render(&list, None, None, None, Some("NOW: CH 02 SEINF"), None);
+        let (id, frame) = g.render(&list, None, None, None, Some("NOW: CH 02 SEINF"), None, &fav_ch, &fav_it);
         assert!(id > 0);
         assert_eq!(frame.0, GUIDE_W);
         assert_eq!(frame.1, GUIDE_H);
@@ -746,9 +944,21 @@ mod tests {
         assert_eq!(g.hit_test_row(0.5, (GRID_TOP as f32 + ROW_H as f32 + 10.0) / GUIDE_H as f32, 2), Some(1));
 
         g.open_picker(2, 0, ch2.items().len());
-        let (id2, frame2) = g.render(&list, Some(&ch2), Some("e1"), None, Some("NOW: CH 02 SEINF"), None);
+        let (id2, frame2) = g.render(&list, Some(&ch2), Some("e1"), None, Some("NOW: CH 02 SEINF"), None, &fav_ch, &fav_it);
         assert!(id2 > id);
         assert_eq!(frame2.2.len(), GUIDE_W * GUIDE_H * 4);
         assert_eq!(g.picker_hit_test(0.5, (GRID_TOP as f32 + 10.0) / GUIDE_H as f32, 1), Some(0));
+
+        // Verify `/` search filtering and `*` favorites-only filtering
+        g.search_query = "contest".into();
+        assert_eq!(g.filter_items(ch2.items(), &fav_it).len(), 1);
+        g.search_query = "nomatch".into();
+        assert_eq!(g.filter_items(ch2.items(), &fav_it).len(), 0);
+        g.search_query = "*".into();
+        assert_eq!(g.filter_items(ch2.items(), &fav_it).len(), 0);
+        fav_it.insert("e1".into());
+        assert_eq!(g.filter_items(ch2.items(), &fav_it).len(), 1);
+        fav_ch.insert(GuideState::channel_fav_key(&ch2));
+        assert_eq!(g.filter_channels(&list, &fav_ch).len(), 1);
     }
 }

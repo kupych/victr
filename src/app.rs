@@ -1194,6 +1194,61 @@ impl CrtApp {
         )
     }
 
+    fn guide_visible_channels(&self) -> Vec<&Channel> {
+        let base = self.visible_channels();
+        self.guide.filter_channels(&base, &self.app_cfg.favorite_channels)
+    }
+
+    fn guide_picker_items(&self, ch_num: u16) -> Vec<MediaItem> {
+        self.channel_by_number(ch_num)
+            .map(|c| {
+                self.guide
+                    .filter_items(c.items(), &self.app_cfg.favorite_items)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn toggle_favorite_item(&mut self, item_id: &str, title: &str) {
+        if item_id.is_empty() {
+            return;
+        }
+        let added = if self.app_cfg.favorite_items.contains(item_id) {
+            self.app_cfg.favorite_items.remove(item_id);
+            false
+        } else {
+            self.app_cfg.favorite_items.insert(item_id.to_string());
+            true
+        };
+        let _ = settings::save_app_config(&self.app_cfg);
+        let short: String = title.chars().take(22).collect();
+        self.osd.show_action(&format!(
+            "{} {}",
+            if added { "FAV *" } else { "UNFAV" },
+            short.to_ascii_uppercase()
+        ));
+    }
+
+    fn toggle_favorite_channel(&mut self, ch: &Channel) {
+        let key = GuideState::channel_fav_key(ch);
+        let added = if self.app_cfg.favorite_channels.contains(&key) {
+            self.app_cfg.favorite_channels.remove(&key);
+            false
+        } else {
+            self.app_cfg.favorite_channels.insert(key);
+            true
+        };
+        let _ = settings::save_app_config(&self.app_cfg);
+        self.osd.show_action(&format!(
+            "{} CH {:02} {}",
+            if added { "FAV *" } else { "UNFAV" },
+            ch.number,
+            ch.callsign
+        ));
+    }
+
     fn channel_by_number(&self, number: u16) -> Option<&Channel> {
         self.lineup.iter().find(|c| c.number == number)
     }
@@ -5064,7 +5119,9 @@ impl CrtApp {
             } else if self.settings_open {
                 self.settings_open = false;
             } else if self.guide.active {
-                if self.guide.picker_channel().is_some() {
+                if self.guide.search_active || !self.guide.search_query.is_empty() {
+                    self.guide.clear_search();
+                } else if self.guide.picker_channel().is_some() {
                     self.guide.close_picker();
                 } else {
                     self.toggle_guide();
@@ -5145,6 +5202,110 @@ impl CrtApp {
         // TV remote & 90s Cable Guide keyboard controls (when not typing in a text field)
         let mut remote_consumed = false;
         if !ctx.egui_wants_keyboard_input() && !self.save_preset_open {
+            // Live `/` search typing inside the 90s Cable Guide (Grid or Episode/Game Picker)
+            if self.guide.active && self.guide.search_active {
+                remote_consumed = true;
+                let typed: Vec<char> = ctx.input(|i| {
+                    i.events
+                        .iter()
+                        .filter_map(|e| match e {
+                            egui::Event::Text(t) => Some(t.chars().collect::<Vec<_>>()),
+                            _ => None,
+                        })
+                        .flatten()
+                        .filter(|c| !c.is_control())
+                        .collect()
+                });
+                for c in typed {
+                    self.guide.push_search_char(c);
+                }
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)) {
+                    self.guide.pop_search_char();
+                }
+                if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
+                    let items = self.guide_picker_items(pch_num);
+                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+                        self.guide.picker_move(-1, items.len());
+                    }
+                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+                        self.guide.picker_move(1, items.len());
+                    }
+                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                        self.guide.search_active = false;
+                        if let Some(item) = items.get(sel_idx).cloned() {
+                            self.tune_specific(pch_num, item, false);
+                        }
+                    }
+                } else {
+                    let vis_len = self.guide_visible_channels().len();
+                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+                        self.guide.move_selection(-1, vis_len);
+                    }
+                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+                        self.guide.move_selection(1, vis_len);
+                    }
+                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                        self.guide.search_active = false;
+                        let target_ch = self
+                            .guide_visible_channels()
+                            .get(self.guide.selected_idx)
+                            .map(|c| c.number);
+                        if let Some(n) = target_ch {
+                            if n == 1 {
+                                self.toggle_guide();
+                            } else {
+                                self.tune_channel(n);
+                            }
+                        }
+                    }
+                }
+            } else {
+            // Check `/` (search in Guide) and `*` (favorite toggle) via Text/Key events before digits/shortcuts
+            let typed_slash = self.guide.active
+                && ctx.input_mut(|i| {
+                    let mut hit = i.consume_key(egui::Modifiers::NONE, egui::Key::Slash);
+                    if !hit {
+                        hit = i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "/"));
+                    }
+                    hit
+                });
+            if typed_slash {
+                self.guide.start_search();
+                remote_consumed = true;
+            }
+            let typed_star = !typed_slash
+                && ctx.input_mut(|i| {
+                    let mut hit = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num8);
+                    if !hit {
+                        hit = i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "*"));
+                    }
+                    hit
+                });
+            if typed_star {
+                remote_consumed = true;
+                if self.guide.active {
+                    if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
+                        if let Some(item) = self.guide_picker_items(pch_num).get(sel_idx).cloned() {
+                            self.toggle_favorite_item(&item.id, &item.short_label());
+                        }
+                    } else if let Some(ch) = self.guide_visible_channels().get(self.guide.selected_idx).cloned().cloned() {
+                        if ch.number > 1 {
+                            self.toggle_favorite_channel(&ch);
+                        }
+                    }
+                } else if let Some(w) = self.active_watch.clone() {
+                    if !w.item_id.is_empty() {
+                        self.toggle_favorite_item(&w.item_id, &w.title);
+                    } else if let Some(ch) = self.channel_by_number(w.channel_number).cloned() {
+                        self.toggle_favorite_channel(&ch);
+                    }
+                } else if let Some(ch) = self.current_channel.and_then(|n| self.channel_by_number(n).cloned()) {
+                    if ch.number > 1 {
+                        self.toggle_favorite_channel(&ch);
+                    }
+                }
+            }
+
             // Volume (- / +) and Mute (M) always work like a real TV remote
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Minus)) {
                 self.adjust_volume(-0.05);
@@ -5197,7 +5358,7 @@ impl CrtApp {
                             self.guide.close_picker();
                         } else {
                             let sel_ch = self
-                                .visible_channels()
+                                .guide_visible_channels()
                                 .get(self.guide.selected_idx)
                                 .map(|c| c.number);
                             if let Some(n) = sel_ch.filter(|&n| n > 1) {
@@ -5212,8 +5373,8 @@ impl CrtApp {
                     remote_consumed = true;
                     if let (true, Some((ch_num, idx))) = (self.guide.active, self.guide.picker_selected()) {
                         if let Some((iid, played)) = self
-                            .channel_by_number(ch_num)
-                            .and_then(|c| c.items().get(idx))
+                            .guide_picker_items(ch_num)
+                            .get(idx)
                             .map(|m| (m.id.clone(), !m.played))
                         {
                             self.set_channel_item_played(ch_num, &iid, played);
@@ -5240,7 +5401,7 @@ impl CrtApp {
                         self.refresh_all_sources();
                         remote_consumed = true;
                     } else if let (true, Some((ch_num, idx))) = (self.guide.active, self.guide.picker_selected()) {
-                        if let Some(item) = self.channel_by_number(ch_num).and_then(|c| c.items().get(idx)).cloned() {
+                        if let Some(item) = self.guide_picker_items(ch_num).get(idx).cloned() {
                             self.tune_specific(ch_num, item, true);
                             self.osd.show_action("RESTART 0:00");
                             remote_consumed = true;
@@ -5274,12 +5435,13 @@ impl CrtApp {
                 }
                 if self.guide.active {
                     if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
-                        let items: Vec<MediaItem> = self
-                            .channel_by_number(pch_num)
-                            .map(|c| c.items().to_vec())
-                            .unwrap_or_default();
+                        let items = self.guide_picker_items(pch_num);
                         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)) {
-                            self.guide.close_picker();
+                            if !self.guide.search_query.is_empty() {
+                                self.guide.clear_search();
+                            } else {
+                                self.guide.close_picker();
+                            }
                             remote_consumed = true;
                         }
                         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
@@ -5307,7 +5469,13 @@ impl CrtApp {
                             }
                         }
                     } else {
-                        let vis_len = self.visible_channels().len();
+                        let vis_len = self.guide_visible_channels().len();
+                        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace))
+                            && !self.guide.search_query.is_empty()
+                        {
+                            self.guide.clear_search();
+                            remote_consumed = true;
+                        }
                         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
                             self.guide.move_selection(-1, vis_len);
                             remote_consumed = true;
@@ -5330,7 +5498,7 @@ impl CrtApp {
                                 self.tune_channel(ch_num);
                             } else {
                                 let target_ch = self
-                                    .visible_channels()
+                                    .guide_visible_channels()
                                     .get(self.guide.selected_idx)
                                     .map(|c| c.number);
                                 if let Some(n) = target_ch {
@@ -5351,6 +5519,7 @@ impl CrtApp {
                         self.tune_channel(ch_num);
                     }
                 }
+            }
             }
         }
         // pointer activity: shows the hint, hides the idle pointer in fullscreen
@@ -5919,10 +6088,10 @@ impl CrtApp {
                         if self.guide.active && self.has_channels() && !ctrl_down {
                             let step = if scroll > 0.0 { -1 } else { 1 };
                             if let Some(pch_num) = self.guide.picker_channel() {
-                                let len = self.channel_by_number(pch_num).map(|c| c.items().len()).unwrap_or(0);
+                                let len = self.guide_picker_items(pch_num).len();
                                 self.guide.picker_scroll(step, len);
                             } else {
-                                let vis_len = self.visible_channels().len();
+                                let vis_len = self.guide_visible_channels().len();
                                 self.guide.scroll_rows(step, vis_len);
                             }
                         } else if shift_down && !self.guide.active && self.web_player.is_some() {
@@ -5974,8 +6143,8 @@ impl CrtApp {
                         if let Some((pch_num, cur_sel)) = self.guide.picker_selected() {
                             if resp.secondary_clicked() {
                                 self.guide.close_picker();
-                            } else if let Some(ch) = self.channel_by_number(pch_num).cloned() {
-                                let items = ch.items();
+                            } else {
+                                let items = self.guide_picker_items(pch_num);
                                 if let Some(idx) = self.guide.picker_hit_test(gu, gv, items.len()) {
                                     let already = cur_sel == idx;
                                     if let GuideView::ItemPicker { selected_item, .. } = &mut self.guide.view {
@@ -5990,7 +6159,7 @@ impl CrtApp {
                                 }
                             }
                         } else {
-                            let vis_nums: Vec<u16> = self.visible_channels().iter().map(|c| c.number).collect();
+                            let vis_nums: Vec<u16> = self.guide_visible_channels().iter().map(|c| c.number).collect();
                             if let Some(row_idx) = self.guide.hit_test_row(gu, gv, vis_nums.len()) {
                                 let already = self.guide.selected_idx == row_idx;
                                 self.guide.selected_idx = row_idx;
@@ -6129,16 +6298,15 @@ impl CrtApp {
                     let (needed_sids, sel_art_provider, sel_art_id) =
                         if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
                             if let Some(pch) = self.channel_by_number(pch_num).cloned() {
-                                let len = pch.items().len();
-                                self.guide.clamp_picker(len);
+                                let items = self.guide_picker_items(pch_num);
+                                self.guide.clamp_picker(items.len());
                                 let mut sids = Vec::new();
                                 if pch.provider_id == "jellyfin" || pch.provider_id == "plex" {
                                     if let ChannelKind::Series { series_id, loaded_episodes: false, .. } = &pch.kind {
                                         sids.push((pch.provider_id.clone(), series_id.clone()));
                                     }
                                 }
-                                let art = pch
-                                    .items()
+                                let art = items
                                     .get(sel_idx)
                                     .map(|m| m.artwork_id.clone())
                                     .filter(|a| !a.is_empty())
@@ -6149,13 +6317,9 @@ impl CrtApp {
                                 (Vec::new(), String::new(), String::new())
                             }
                         } else {
-                            let vis_len = self.visible_channels().len();
+                            let vis_len = self.guide_visible_channels().len();
                             self.guide.clamp_selection(vis_len);
-                            let vis = provider::filter_visible_channels(
-                                &self.lineup,
-                                self.jellyfin.cfg.favorites_only,
-                                &self.jellyfin.cfg.filter_text,
-                            );
+                            let vis = self.guide_visible_channels();
                             let mut sids = Vec::new();
                             for row in 0..6 {
                                 if let Some(ch) = vis.get(self.guide.scroll_row + row) {
@@ -6198,6 +6362,8 @@ impl CrtApp {
                         live_vid,
                         now_lbl.as_deref(),
                         art_img.as_ref(),
+                        &self.app_cfg.favorite_channels,
+                        &self.app_cfg.favorite_items,
                     );
                     fi.image = Some(guide_frame);
                     fi.u.pattern = Pattern::Image.id();
