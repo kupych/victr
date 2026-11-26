@@ -1120,8 +1120,10 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
 
         var cab = mix(plastic, walnut, woodMask);
         cab = mix(cab, chrome, chromeMask);
-        cab *= 0.55 + amb * 1.9;
-        cab += lin * 0.032 * bevel;
+        // Scale cabinet ambient lighting down to true dark when Room light approaches 0,
+        // leaving only subtle CRT screen spill on the inner bevel and brushed metal trim.
+        cab *= amb * 2.6;
+        cab += lin * (0.035 * bevel + 0.012 * chromeMask + 0.0025 * (1.0 - outer));
         let bz_lin = cab * U.glass1.y;
         let a = smoothstep(0.07 - pxw, 0.07 + pxw, sdf);
         let outside = smoothstep(bw - pxw, bw + pxw, d);
