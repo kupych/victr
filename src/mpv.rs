@@ -619,12 +619,13 @@ fn run_libmpv(
                                     audio.clear();
                                     if was_sh {
                                         let cur_pos = get_f64("time-pos").unwrap_or_else(|| sh.lock().unwrap().pos).max(0.0);
-                                        // Re-seek both video & audio demuxer queues cleanly to `cur_pos`
-                                        // before re-attaching audio so audio starts at exact `video_pts`.
-                                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute+keyframes"]);
+                                        // Re-attach audio BEFORE seeking so mpv seeks BOTH video & audio
+                                        // streams together to `cur_pos` (instead of attaching audio at the old cursor!).
                                         prop("aid", "auto");
+                                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute+keyframes"]);
                                         sh.lock().unwrap().seeking = true;
-                                        last_resync = Instant::now();
+                                        silent_play_since = None;
+                                        stall_recoveries = 0;
                                     } else {
                                         prop("aid", "auto");
                                     }
@@ -736,22 +737,23 @@ fn run_libmpv(
                     && !shuttle_active
                     && !is_seeking
                     && pos.is_some()
-                    && audio_pts.is_some_and(|a| (a - cur_pos).abs() > 3.0);
-                let prolonged_silence = silent_play_since.is_some_and(|t0| t0.elapsed() >= Duration::from_millis(1500));
+                    && audio_pts.is_some_and(|a| (a - cur_pos).abs() > 2.2);
+                let prolonged_silence = silent_play_since.is_some_and(|t0| t0.elapsed() >= Duration::from_millis(650));
 
                 // Detect pause -> resume transitions (whether from UI button or SPACE key):
                 // flush stale audio and re-lock A/V sync immediately if ao=pcm drifted while paused.
                 if was_paused && !is_paused && !shuttle_active {
                     audio.clear();
-                    if (avsync.abs() > 0.6 || apts_runaway) && last_resync.elapsed() > Duration::from_secs(2) {
+                    if (avsync.abs() > 0.6 || apts_runaway) && last_resync.elapsed() > Duration::from_millis(1200) {
+                        prop("aid", "auto");
                         cmd(&["seek", &format!("{cur_pos:.3}"), "absolute+keyframes"]);
                         last_resync = Instant::now();
                     }
                 } else if (apts_runaway || prolonged_silence || (!is_paused && !shuttle_active && !is_seeking && avsync.abs() > 2.2))
-                    && last_resync.elapsed() > Duration::from_secs(3)
+                    && last_resync.elapsed() > Duration::from_millis(1500)
                 {
                     // Self-healing recovery for `delaying audio start` or severe A/V desync:
-                    // First attempt resets the audio stream + keyframe-seeks both tracks to `cur_pos`.
+                    // First attempt re-attaches audio BEFORE keyframe-seeking both tracks to `cur_pos`.
                     // If the demuxer cache itself kept stale audio timestamps, reload cleanly at `cur_pos`.
                     stall_recoveries = stall_recoveries.saturating_add(1);
                     silent_play_since = None;
@@ -765,8 +767,8 @@ fn run_libmpv(
                     }
                     if stall_recoveries == 1 {
                         prop("aid", "no");
-                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute+keyframes"]);
                         prop("aid", "auto");
+                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute+keyframes"]);
                     } else if stall_recoveries == 2 {
                         let start_opt = format!("start={cur_pos:.2}");
                         cmd(&["loadfile", src, "replace", &start_opt]);
