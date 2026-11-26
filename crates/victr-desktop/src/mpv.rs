@@ -527,14 +527,28 @@ fn run_libmpv(
         opt("cache", "yes");
         opt("demuxer-max-bytes", "64MiB");
         opt("demuxer-max-back-bytes", "32MiB");
-        if src.starts_with("http://") || src.starts_with("https://") {
-            // Note: never set `reconnect_at_eof=1` globally — it causes ffmpeg's https protocol
-            // to infinitely reconnect at normal EOF on finite HLS `.m3u8` / YouTube Live manifests.
-            opt(
-                "stream-lavf-o",
-                "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=4",
-            );
-            opt("demuxer-lavf-o", "rw_timeout=8000000");
+        let src_low = src.to_ascii_lowercase();
+        let is_live_http = (src_low.starts_with("http://") || src_low.starts_with("https://"))
+            && (src_low.contains(".m3u8")
+                || src_low.contains("youtube.com")
+                || src_low.contains("youtu.be")
+                || src_low.contains("twitch.tv")
+                || src_low.ends_with("/live"));
+        if src_low.starts_with("http://") || src_low.starts_with("https://") {
+            // Give live/remote streams a small initial buffer cushion before playback starts
+            // so HLS segments don't starve at the live edge (`Cache: 0.0s`).
+            opt("cache-pause-initial", "yes");
+            opt("cache-pause-wait", "2");
+            if !is_live_http {
+                // Only apply byte-range HTTP reconnect on seekable direct media files (Jellyfin/Plex).
+                // Applying `reconnect_streamed=1` to HLS/YouTube Live splices restarted segments
+                // mid-packet, causing `Invalid video timestamp` jumps and corrupt AAC frames!
+                opt(
+                    "stream-lavf-o",
+                    "reconnect=1,reconnect_on_network_error=1,reconnect_delay_max=4",
+                );
+                opt("demuxer-lavf-o", "rw_timeout=8000000");
+            }
         }
         if o.start > 0.0 {
             opt("start", &format!("{:.3}", o.start));
@@ -875,10 +889,11 @@ fn run_libmpv(
                 let prolonged_silence = silent_ms >= 1800;
                 let severe_desync = bytes_delta == 0 && silent_ms >= 900 && avsync.abs() > 3.5;
 
-                // Only resync on unpause if audio-pts genuinely ran far away (> 3.5s); normal
-                // early pauses during ao_pcm's 1.36s burst resume cleanly from the kernel pipe.
+                let is_seekable = !is_live_http && get_flag("seekable").unwrap_or(true);
+                // Only resync on unpause if audio-pts genuinely ran far away (> 3.5s) on a seekable file;
+                // normal early pauses during ao_pcm's 1.36s burst resume cleanly from the kernel pipe.
                 if was_paused && !is_paused && !shuttle_active {
-                    let far_drift = pos.is_some() && audio_pts.is_some_and(|a| (a - cur_pos).abs() > 3.5);
+                    let far_drift = is_seekable && pos.is_some() && audio_pts.is_some_and(|a| (a - cur_pos).abs() > 3.5);
                     if far_drift && last_resync.elapsed() > Duration::from_secs(2) {
                         audio.drain_pipe();
                         prop("aid", "auto");
@@ -890,28 +905,34 @@ fn run_libmpv(
                     && last_resync.elapsed() > Duration::from_secs(4)
                 {
                     // Self-healing recovery for `delaying audio start` or severe A/V desync:
-                    // Attempt 1 re-attaches audio BEFORE an exact `absolute` seek to `cur_pos`.
-                    // Attempt 2 reloads the stream cleanly at `cur_pos`. Capped at 2 attempts
-                    // until 4s of continuous healthy audio resets the counter.
+                    // On seekable files, re-attach audio before an exact `absolute` seek (or reload at `cur_pos`).
+                    // On live HLS/YouTube streams, NEVER `hr-seek` (which hangs at `seeking=true`) —
+                    // just reset `aid` on attempt 1, or cleanly reload the live edge on attempt 2.
                     stall_recoveries = stall_recoveries.saturating_add(1);
                     silent_play_since = None;
                     healthy_audio_since = None;
                     last_resync = Instant::now();
                     if verbose_log {
                         eprintln!(
-                            "[victr-mpv] audio stall detected (attempt={}, pos={:.2}, apts={:?}, avsync={:.2}), resyncing…",
-                            stall_recoveries, cur_pos, audio_pts, avsync
+                            "[victr-mpv] audio stall detected (attempt={}, live={}, pos={:.2}, apts={:?}, avsync={:.2}), resyncing…",
+                            stall_recoveries, !is_seekable, cur_pos, audio_pts, avsync
                         );
                     }
                     if stall_recoveries == 1 {
                         prop("aid", "no");
                         audio.drain_pipe();
                         prop("aid", "auto");
-                        cmd(&["seek", &format!("{cur_pos:.3}"), "absolute"]);
+                        if is_seekable {
+                            cmd(&["seek", &format!("{cur_pos:.3}"), "absolute"]);
+                        }
                     } else if stall_recoveries == 2 {
                         audio.drain_pipe();
-                        let start_opt = format!("start={cur_pos:.2}");
-                        cmd(&["loadfile", src, "replace", &start_opt]);
+                        if is_seekable {
+                            let start_opt = format!("start={cur_pos:.2}");
+                            cmd(&["loadfile", src, "replace", &start_opt]);
+                        } else {
+                            cmd(&["loadfile", src, "replace"]);
+                        }
                     }
                 }
                 was_paused = is_paused;
