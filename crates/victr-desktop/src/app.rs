@@ -5318,13 +5318,14 @@ impl CrtApp {
                 );
                 ui.add_space(4.0);
                 for it in &self.sys_check.items {
-                    let (dot, col) = match it.level {
-                        crate::sys_check::CheckLevel::Ready => ("●", Color32::from_rgb(112, 236, 172)),
-                        crate::sys_check::CheckLevel::Optional => ("●", Color32::from_rgb(244, 198, 102)),
-                        crate::sys_check::CheckLevel::Missing => ("●", Color32::from_rgb(246, 118, 106)),
+                    let col = match it.level {
+                        crate::sys_check::CheckLevel::Ready => Color32::from_rgb(112, 236, 172),
+                        crate::sys_check::CheckLevel::Optional => Color32::from_rgb(244, 198, 102),
+                        crate::sys_check::CheckLevel::Missing => Color32::from_rgb(246, 118, 106),
                     };
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(dot).color(col).strong());
+                        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot_rect.center(), 4.0, col);
                         ui.label(RichText::new(it.label).strong().small());
                         ui.label(RichText::new("—").weak().small());
                         ui.label(RichText::new(&it.detail).small().color(col));
@@ -6064,12 +6065,15 @@ impl CrtApp {
                                     "Analog TV Sound DSP" => "Audio",
                                     _ => "Capture",
                                 };
-                                let resp = ui.label(RichText::new(format!("● {short}")).small().color(col));
+                                let (dot_rect, dot_resp) = ui.allocate_exact_size(egui::vec2(8.0, 10.0), egui::Sense::hover());
+                                ui.painter().circle_filled(dot_rect.center(), 3.5, col);
+                                let resp = ui.label(RichText::new(short).small().color(col));
                                 let tip = if it.hint.is_empty() {
                                     format!("{}: {}", it.label, it.detail)
                                 } else {
                                     format!("{}: {}\n{}", it.label, it.detail, it.hint)
                                 };
+                                dot_resp.on_hover_text(&tip);
                                 resp.on_hover_text(tip);
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -6148,10 +6152,33 @@ impl CrtApp {
             .id(egui::Id::unique("victr_remote_win"))
             .open(&mut open)
             .collapsible(true)
-            .resizable(false)
+            .auto_sized()
             .default_pos([26.0, 72.0])
             .show(ctx, |ui| {
-                ui.set_width(214.0);
+                // Exact 222px content grid: 3x70+2x6 = 222, 4x51+3x6 = 222, 53+6+104+6+53 = 222
+                ui.set_max_width(222.0);
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 5.0);
+
+                // Helper to draw a crisp font-independent directional arrow button
+                let arrow_btn = |ui: &mut egui::Ui, dir: u8, tip: &str| -> bool {
+                    let resp = ui
+                        .add_sized([32.0, 22.0], egui::Button::new(""))
+                        .on_hover_text(tip);
+                    let c = resp.rect.center();
+                    let col = if resp.hovered() {
+                        Color32::from_rgb(248, 214, 132)
+                    } else {
+                        Color32::from_rgb(218, 212, 202)
+                    };
+                    let pts = match dir {
+                        0 => vec![c + egui::vec2(0.0, -4.5), c + egui::vec2(-5.0, 3.5), c + egui::vec2(5.0, 3.5)], // Up
+                        1 => vec![c + egui::vec2(0.0, 4.5), c + egui::vec2(-5.0, -3.5), c + egui::vec2(5.0, -3.5)], // Down
+                        2 => vec![c + egui::vec2(-4.5, 0.0), c + egui::vec2(3.5, -5.0), c + egui::vec2(3.5, 5.0)], // Left
+                        _ => vec![c + egui::vec2(4.5, 0.0), c + egui::vec2(-3.5, -5.0), c + egui::vec2(-3.5, 5.0)], // Right
+                    };
+                    ui.painter().add(egui::Shape::convex_polygon(pts, col, egui::Stroke::NONE));
+                    resp.clicked()
+                };
 
                 // Top power / mute / info row
                 ui.horizontal(|ui| {
@@ -6161,7 +6188,7 @@ impl CrtApp {
                         Color32::from_rgb(138, 240, 178)
                     };
                     if ui
-                        .add_sized([66.0, 26.0], egui::Button::new(RichText::new("POWER").strong().small().color(pwr_col)))
+                        .add_sized([70.0, 26.0], egui::Button::new(RichText::new("POWER").strong().small().color(pwr_col)))
                         .on_hover_text("Toggle CRT television power")
                         .clicked()
                     {
@@ -6169,14 +6196,14 @@ impl CrtApp {
                         self.sim.set_power(on);
                     }
                     if ui
-                        .add_sized([66.0, 26.0], egui::Button::new(RichText::new("MUTE").small()).selected(self.muted))
+                        .add_sized([70.0, 26.0], egui::Button::new(RichText::new("MUTE").small()).selected(self.muted))
                         .on_hover_text("Mute / unmute audio (M)")
                         .clicked()
                     {
                         self.toggle_mute();
                     }
                     if ui
-                        .add_sized([66.0, 26.0], egui::Button::new(RichText::new("INFO").small()))
+                        .add_sized([70.0, 26.0], egui::Button::new(RichText::new("INFO").small()))
                         .on_hover_text("Show channel & program OSD banner (I)")
                         .clicked()
                     {
@@ -6184,14 +6211,14 @@ impl CrtApp {
                     }
                 });
 
-                ui.add_space(5.0);
+                ui.add_space(3.0);
 
-                // 0-9 Numeric Channel Keypad + Star Favorite + OK
+                // 0-9 Numeric Channel Keypad + Favorite + OK
                 let rows: [[(&str, &str); 3]; 4] = [
                     [("1", "1"), ("2", "2"), ("3", "3")],
                     [("4", "4"), ("5", "5"), ("6", "6")],
                     [("7", "7"), ("8", "8"), ("9", "9")],
-                    [("★ *", "star"), ("0", "0"), ("OK", "ok")],
+                    [("FAV *", "star"), ("0", "0"), ("OK", "ok")],
                 ];
                 for row in rows {
                     ui.horizontal(|ui| {
@@ -6202,7 +6229,7 @@ impl CrtApp {
                                 _ => "Dial channel number (0-9)",
                             };
                             if ui
-                                .add_sized([66.0, 24.0], egui::Button::new(RichText::new(lbl).monospace().strong()))
+                                .add_sized([70.0, 24.0], egui::Button::new(RichText::new(lbl).monospace().strong()))
                                 .on_hover_text(tip)
                                 .clicked()
                             {
@@ -6242,20 +6269,20 @@ impl CrtApp {
                     });
                 }
 
-                ui.add_space(5.0);
+                ui.add_space(3.0);
                 ui.separator();
 
                 // Guide / Episodes / Search strip
                 ui.horizontal(|ui| {
                     if ui
-                        .add_sized([66.0, 25.0], egui::Button::new(RichText::new("GUIDE").strong().small()).selected(self.guide.active))
+                        .add_sized([70.0, 25.0], egui::Button::new(RichText::new("GUIDE").strong().small()).selected(self.guide.active))
                         .on_hover_text("Toggle 90s Prevue Cable Guide (G)")
                         .clicked()
                     {
                         self.toggle_guide();
                     }
                     if ui
-                        .add_sized([66.0, 25.0], egui::Button::new(RichText::new("LIST").small()))
+                        .add_sized([70.0, 25.0], egui::Button::new(RichText::new("LIST").small()))
                         .on_hover_text("Browse episodes, movies, or games on this channel (E)")
                         .clicked()
                     {
@@ -6275,7 +6302,7 @@ impl CrtApp {
                         }
                     }
                     if ui
-                        .add_sized([66.0, 25.0], egui::Button::new(RichText::new("FIND /").small()))
+                        .add_sized([70.0, 25.0], egui::Button::new(RichText::new("FIND /").small()))
                         .on_hover_text("Search channels or episodes in the Guide (/)")
                         .clicked()
                     {
@@ -6286,20 +6313,20 @@ impl CrtApp {
                     }
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(2.0);
 
-                // VOL / D-Pad / CH rocker block
+                // VOL / D-Pad / CH rocker block (53 + 6 + 104 + 6 + 53 = 222px)
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         if ui
-                            .add_sized([54.0, 26.0], egui::Button::new(RichText::new("VOL +").small()))
+                            .add_sized([53.0, 25.0], egui::Button::new(RichText::new("VOL +").small()))
                             .on_hover_text("Volume up (+)")
                             .clicked()
                         {
                             self.adjust_volume(0.05);
                         }
                         if ui
-                            .add_sized([54.0, 26.0], egui::Button::new(RichText::new("VOL -").small()))
+                            .add_sized([53.0, 25.0], egui::Button::new(RichText::new("VOL -").small()))
                             .on_hover_text("Volume down (-)")
                             .clicked()
                         {
@@ -6307,13 +6334,10 @@ impl CrtApp {
                         }
                     });
                     ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                         ui.horizontal(|ui| {
-                            ui.add_space(28.0);
-                            if ui
-                                .add_sized([28.0, 22.0], egui::Button::new("▲"))
-                                .on_hover_text("Guide Up / Skip +60s")
-                                .clicked()
-                            {
+                            ui.add_space(36.0);
+                            if arrow_btn(ui, 0, "Guide Up / Skip +60s") {
                                 if self.guide.active {
                                     if let Some((pch, _)) = self.guide.picker_selected() {
                                         let len = self.guide_picker_items(pch).len();
@@ -6328,11 +6352,7 @@ impl CrtApp {
                             }
                         });
                         ui.horizontal(|ui| {
-                            if ui
-                                .add_sized([28.0, 22.0], egui::Button::new("◄"))
-                                .on_hover_text("Guide Left / Prev Season / -5s")
-                                .clicked()
-                            {
+                            if arrow_btn(ui, 2, "Guide Left / Prev Season / -5s") {
                                 if self.guide.active {
                                     if let Some((pch, _)) = self.guide.picker_selected() {
                                         let items = self.guide_picker_items(pch);
@@ -6344,11 +6364,7 @@ impl CrtApp {
                                     self.seek_video_rel(-5.0);
                                 }
                             }
-                            if ui
-                                .add_sized([28.0, 22.0], egui::Button::new("▼"))
-                                .on_hover_text("Guide Down / Skip -60s")
-                                .clicked()
-                            {
+                            if arrow_btn(ui, 1, "Guide Down / Skip -60s") {
                                 if self.guide.active {
                                     if let Some((pch, _)) = self.guide.picker_selected() {
                                         let len = self.guide_picker_items(pch).len();
@@ -6361,11 +6377,7 @@ impl CrtApp {
                                     self.seek_video_rel(-60.0);
                                 }
                             }
-                            if ui
-                                .add_sized([28.0, 22.0], egui::Button::new("►"))
-                                .on_hover_text("Guide Right / Next Season / +5s")
-                                .clicked()
-                            {
+                            if arrow_btn(ui, 3, "Guide Right / Next Season / +5s") {
                                 if self.guide.active {
                                     if let Some((pch, _)) = self.guide.picker_selected() {
                                         let items = self.guide_picker_items(pch);
@@ -6381,14 +6393,14 @@ impl CrtApp {
                     });
                     ui.vertical(|ui| {
                         if ui
-                            .add_sized([54.0, 26.0], egui::Button::new(RichText::new("CH +").small()))
+                            .add_sized([53.0, 25.0], egui::Button::new(RichText::new("CH +").small()))
                             .on_hover_text("Next channel (PgUp or ])")
                             .clicked()
                         {
                             self.surf_channel(1);
                         }
                         if ui
-                            .add_sized([54.0, 26.0], egui::Button::new(RichText::new("CH -").small()))
+                            .add_sized([53.0, 25.0], egui::Button::new(RichText::new("CH -").small()))
                             .on_hover_text("Previous channel (PgDn or [)")
                             .clicked()
                         {
@@ -6397,19 +6409,19 @@ impl CrtApp {
                     });
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(2.0);
 
-                // Episode & VCR Transport strip
+                // Episode & VCR Transport strip (4x51 + 3x6 = 222px)
                 ui.horizontal(|ui| {
                     if ui
-                        .add_sized([48.0, 24.0], egui::Button::new(RichText::new("<< RW").small()))
+                        .add_sized([51.0, 24.0], egui::Button::new(RichText::new("<< RW").small()))
                         .on_hover_text("VHS Rewind picture search (Shift+Left or ,)")
                         .clicked()
                     {
                         self.cycle_vcr_shuttle(-1.0);
                     }
                     if ui
-                        .add_sized([50.0, 24.0], egui::Button::new(RichText::new("PLAY/||").small()))
+                        .add_sized([51.0, 24.0], egui::Button::new(RichText::new("PLAY/||").small()))
                         .on_hover_text("Play / Pause (Space)")
                         .clicked()
                     {
@@ -6420,14 +6432,14 @@ impl CrtApp {
                         }
                     }
                     if ui
-                        .add_sized([48.0, 24.0], egui::Button::new(RichText::new("FF >>").small()))
+                        .add_sized([51.0, 24.0], egui::Button::new(RichText::new("FF >>").small()))
                         .on_hover_text("VHS Fast-Forward picture search (Shift+Right or .)")
                         .clicked()
                     {
                         self.cycle_vcr_shuttle(1.0);
                     }
                     if ui
-                        .add_sized([48.0, 24.0], egui::Button::new(RichText::new("0:00").small()))
+                        .add_sized([51.0, 24.0], egui::Button::new(RichText::new("0:00").small()))
                         .on_hover_text("Restart from beginning / Retry stream (R)")
                         .clicked()
                     {
@@ -6439,21 +6451,21 @@ impl CrtApp {
                 });
                 ui.horizontal(|ui| {
                     if ui
-                        .add_sized([66.0, 22.0], egui::Button::new(RichText::new("PREV (P)").small()))
+                        .add_sized([70.0, 22.0], egui::Button::new(RichText::new("PREV (P)").small()))
                         .on_hover_text("Previous episode (P)")
                         .clicked()
                     {
                         self.step_episode(-1);
                     }
                     if ui
-                        .add_sized([66.0, 22.0], egui::Button::new(RichText::new("NEXT (N)").small()))
+                        .add_sized([70.0, 22.0], egui::Button::new(RichText::new("NEXT (N)").small()))
                         .on_hover_text("Next episode (N)")
                         .clicked()
                     {
                         self.step_episode(1);
                     }
                     if ui
-                        .add_sized([66.0, 22.0], egui::Button::new(RichText::new("SEEN (W)").small()))
+                        .add_sized([70.0, 22.0], egui::Button::new(RichText::new("SEEN (W)").small()))
                         .on_hover_text("Toggle watched status (W)")
                         .clicked()
                     {
@@ -6463,27 +6475,27 @@ impl CrtApp {
                     }
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(3.0);
                 ui.separator();
 
-                // CRT & Display Shortcuts strip
-                ui.horizontal_wrapped(|ui| {
+                // CRT & Display Shortcuts strip (2 clean rows, flush to 222px)
+                ui.horizontal(|ui| {
                     if ui
-                        .add(egui::Button::new(RichText::new("4:3 Crop").small()).selected(self.crop))
+                        .add_sized([70.0, 22.0], egui::Button::new(RichText::new("4:3 Crop").small()).selected(self.crop))
                         .on_hover_text("Crop widescreen video to fill 4:3 (Shift+Z)")
                         .clicked()
                     {
                         self.toggle_crop();
                     }
                     if ui
-                        .small_button("1:1")
+                        .add_sized([70.0, 22.0], egui::Button::new(RichText::new("1:1").small()))
                         .on_hover_text("1:1 pixel-perfect phosphors (Ctrl+1)")
                         .clicked()
                     {
                         self.pixel_perfect_req = true;
                     }
                     if ui
-                        .small_button("Degauss")
+                        .add_sized([70.0, 22.0], egui::Button::new(RichText::new("Degauss").small()))
                         .on_hover_text("Fire the CRT degaussing coil")
                         .clicked()
                     {
@@ -6492,8 +6504,11 @@ impl CrtApp {
                             self.degauss_mag_start = Some(self.s.magnetization);
                         }
                     }
+                });
+                ui.horizontal(|ui| {
+                    let fs_w = if self.s.chaos { 108.0 } else { 222.0 };
                     if ui
-                        .small_button("FS (F11)")
+                        .add_sized([fs_w, 22.0], egui::Button::new(RichText::new("Fullscreen (F11)").small()))
                         .on_hover_text("Toggle fullscreen (F11)")
                         .clicked()
                     {
@@ -6501,7 +6516,7 @@ impl CrtApp {
                     }
                     if self.s.chaos
                         && ui
-                            .small_button("Whack (K)")
+                            .add_sized([108.0, 22.0], egui::Button::new(RichText::new("Whack (K)").small()))
                             .on_hover_text("Slap the cabinet back into sync (K)")
                             .clicked()
                     {
@@ -6509,9 +6524,9 @@ impl CrtApp {
                     }
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(3.0);
                 ui.label(
-                    RichText::new("Tip: Drag & drop any video, image, or ROM onto the TV · Scroll to zoom · Double-click to reset.")
+                    RichText::new("Drop any video, image, or ROM onto the TV · Scroll to zoom · Double-click to reset.")
                         .weak()
                         .small(),
                 );
