@@ -493,6 +493,8 @@ pub const BTN_A: u16 = 1 << 8;
 pub const BTN_X: u16 = 1 << 9;
 pub const BTN_L: u16 = 1 << 10;
 pub const BTN_R: u16 = 1 << 11;
+/// Xbox / PlayStation / Home / Guide button (`BTN_MODE`, evdev `0x13c`) for opening the 90s Cable Guide.
+pub const BTN_GUIDE: u16 = 1 << 12;
 
 // ------------------------------------------------------------------ Native Linux `/dev/input/js*` Gamepad Discovery & Reader
 
@@ -580,6 +582,7 @@ fn build_joydev_button_map(key_words: &[u64], nintendo_layout: bool) -> Vec<u16>
             0x137 | 0x139 => BTN_R, // BTN_TR / BTN_TR2
             0x13a => BTN_SELECT,    // BTN_SELECT
             0x13b => BTN_START,     // BTN_START
+            0x13c => BTN_GUIDE,     // BTN_MODE (Xbox / PS / Home)
             0x220 => BTN_UP,        // BTN_DPAD_UP
             0x221 => BTN_DOWN,      // BTN_DPAD_DOWN
             0x222 => BTN_LEFT,      // BTN_DPAD_LEFT
@@ -1074,6 +1077,7 @@ struct CoreRuntime {
     shared: Arc<Mutex<RetroShared>>,
     input_mask: u16,
     key_mask: Arc<AtomicU16>,
+    gamepad_paused: Arc<AtomicBool>,
     gamepad: LinuxGamepad,
 }
 
@@ -1291,7 +1295,11 @@ unsafe extern "C" fn cb_input_poll() {
     let ctx = unsafe { &mut *ctx_ptr };
     let kb = ctx.key_mask.load(Ordering::Relaxed);
     let gp = ctx.gamepad.poll_mask();
-    ctx.input_mask = kb | gp;
+    if ctx.gamepad_paused.load(Ordering::Relaxed) {
+        ctx.input_mask = kb;
+    } else {
+        ctx.input_mask = kb | (gp & !BTN_GUIDE);
+    }
 }
 
 unsafe extern "C" fn cb_input_state(port: c_uint, device: c_uint, _index: c_uint, id: c_uint) -> i16 {
@@ -1338,6 +1346,7 @@ enum RetroCmd {
 pub struct RetroPlayer {
     pub shared: Arc<Mutex<RetroShared>>,
     pub key_mask: Arc<AtomicU16>,
+    pub gamepad_paused: Arc<AtomicBool>,
     tx: Sender<RetroCmd>,
     stop: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
@@ -1373,6 +1382,7 @@ impl RetroPlayer {
         Self {
             shared,
             key_mask: Arc::new(AtomicU16::new(0)),
+            gamepad_paused: Arc::new(AtomicBool::new(false)),
             tx,
             stop: Arc::new(AtomicBool::new(true)),
             join: None,
@@ -1407,15 +1417,27 @@ impl RetroPlayer {
             running: true,
         }));
         let key_mask = Arc::new(AtomicU16::new(0));
+        let gamepad_paused = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = channel();
 
         let sh_bg = shared.clone();
         let km_bg = key_mask.clone();
+        let gp_paused_bg = gamepad_paused.clone();
         let stop_bg = stop.clone();
 
         let join = std::thread::spawn(move || {
-            if let Err(err) = run_core_loop(&core_path, &rom_path, ring, gamepad_device, &sh_bg, km_bg, &stop_bg, rx) {
+            if let Err(err) = run_core_loop(
+                &core_path,
+                &rom_path,
+                ring,
+                gamepad_device,
+                &sh_bg,
+                km_bg,
+                gp_paused_bg,
+                &stop_bg,
+                rx,
+            ) {
                 let mut g = sh_bg.lock().unwrap();
                 g.status = err.clone();
                 g.running = false;
@@ -1427,6 +1449,7 @@ impl RetroPlayer {
         Self {
             shared,
             key_mask,
+            gamepad_paused,
             tx,
             stop,
             join: Some(join),
@@ -1475,6 +1498,7 @@ fn run_core_loop(
     gamepad_device: String,
     shared: &Arc<Mutex<RetroShared>>,
     key_mask: Arc<AtomicU16>,
+    gamepad_paused: Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
     rx: Receiver<RetroCmd>,
 ) -> Result<(), String> {
@@ -1521,6 +1545,7 @@ fn run_core_loop(
         shared: shared.clone(),
         input_mask: 0,
         key_mask,
+        gamepad_paused,
         gamepad: LinuxGamepad::new(gamepad_device),
     });
     if let Some(summary) = ctx.gamepad.take_changed_summary() {

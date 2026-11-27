@@ -1086,9 +1086,99 @@ async function boot() {
 
   let lastTs = performance.now();
   let lastResumeSave = performance.now();
+
+  // Standard Gamepad API polling for couch-TV Guide/Picker navigation
+  let gpPrev = 0;
+  let gpRepeatDir = 0;
+  let gpRepeatNext = 0;
+  let gpChordFired = false;
+  function pollBrowserGamepad(now) {
+    if (!navigator.getGamepads) return;
+    const pads = navigator.getGamepads();
+    let mask = 0;
+    for (const p of pads) {
+      if (!p || !p.connected) continue;
+      const b = p.buttons || [];
+      const down = (i) => Boolean(b[i] && (b[i].pressed || b[i].value > 0.5));
+      if (down(0)) mask |= 1 << 0;  // A / Cross (Confirm)
+      if (down(1)) mask |= 1 << 1;  // B / Circle (Back)
+      if (down(2)) mask |= 1 << 2;  // X / Square (List / Watched)
+      if (down(3)) mask |= 1 << 3;  // Y / Triangle (Favorite)
+      if (down(4)) mask |= 1 << 4;  // LB
+      if (down(5)) mask |= 1 << 5;  // RB
+      if (down(8)) mask |= 1 << 6;  // Select / Back
+      if (down(9)) mask |= 1 << 7;  // Start
+      if (down(12) || (p.axes?.[1] ?? 0) < -0.5) mask |= 1 << 8;  // Up
+      if (down(13) || (p.axes?.[1] ?? 0) > 0.5)  mask |= 1 << 9;  // Down
+      if (down(14) || (p.axes?.[0] ?? 0) < -0.5) mask |= 1 << 10; // Left
+      if (down(15) || (p.axes?.[0] ?? 0) > 0.5)  mask |= 1 << 11; // Right
+      if (down(16)) mask |= 1 << 12; // Home / Guide
+    }
+    const pressed = mask & ~gpPrev;
+    gpPrev = mask;
+    const DIR_MASK = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
+    const dirBits = mask & DIR_MASK;
+    let dirFire = pressed & DIR_MASK;
+    if (dirBits === 0) {
+      gpRepeatDir = 0;
+    } else if (dirFire !== 0) {
+      gpRepeatDir = dirBits;
+      gpRepeatNext = now + 300;
+    } else if (dirBits === gpRepeatDir && now >= gpRepeatNext) {
+      dirFire = dirBits;
+      gpRepeatNext = now + 85;
+    }
+
+    const chord = (mask & ((1 << 6) | (1 << 7))) === ((1 << 6) | (1 << 7));
+    if (!chord) gpChordFired = false;
+    const chordFire = chord && !gpChordFired;
+    if (chordFire) gpChordFired = true;
+
+    if ((pressed & (1 << 12)) || chordFire) {
+      ensureAudioGraph();
+      victr.toggle_guide();
+      syncUiFromEngine();
+      return;
+    }
+
+    if (victr.is_guide_active()) {
+      if (pressed & (1 << 1)) { victr.guide_close_or_back(); syncUiFromEngine(); return; }
+      if (dirFire & (1 << 8)) victr.guide_move(-1);
+      else if (dirFire & (1 << 9)) victr.guide_move(1);
+      else if (pressed & (1 << 4)) victr.guide_move(-6);
+      else if (pressed & (1 << 5)) victr.guide_move(6);
+      if (dirFire & (1 << 10)) victr.guide_shift_h(-1);
+      else if (dirFire & (1 << 11)) victr.guide_shift_h(1);
+      if (pressed & (1 << 3)) { victr.guide_toggle_selected_favorite(); persistWatchState(); }
+      if (pressed & (1 << 2)) {
+        if (!victr.guide_toggle_selected_watched()) victr.guide_open_picker();
+        persistWatchState();
+      }
+      if (pressed & ((1 << 0) | (1 << 7))) {
+        handleGuideActionJson(victr.guide_confirm_json());
+      }
+    } else {
+      if (pressed & ((1 << 6) | (1 << 7))) { ensureAudioGraph(); victr.toggle_guide(); syncUiFromEngine(); return; }
+      if (pressed & (1 << 4)) surfChannel(-1);
+      if (pressed & (1 << 5)) surfChannel(1);
+      if (pressed & (1 << 3)) { victr.guide_open_picker(); syncUiFromEngine(); }
+      if (pressed & (1 << 2)) victr.show_osd_channel(currentSource.ch, currentSource.callsign, currentSource.title);
+      if (pressed & (1 << 1)) { victr.toggle_mute(); syncUiFromEngine(); }
+      if (pressed & (1 << 0)) {
+        if (video.src || video.srcObject) {
+          if (video.paused) { video.play().catch(() => {}); victr.show_osd_action("PLAY >"); }
+          else { video.pause(); victr.show_osd_action("PAUSE ||"); }
+        }
+      }
+      if (dirFire & (1 << 8)) { victr.adjust_volume(0.05); syncUiFromEngine(); }
+      else if (dirFire & (1 << 9)) { victr.adjust_volume(-0.05); syncUiFromEngine(); }
+    }
+  }
+
   function frame(now) {
     const dt = (now - lastTs) / 1000;
     lastTs = now;
+    pollBrowserGamepad(now);
     const dialed = victr.poll_digit_commit();
     if (dialed > 0) tuneChannelNumber(dialed);
 

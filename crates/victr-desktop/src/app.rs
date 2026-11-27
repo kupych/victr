@@ -283,6 +283,11 @@ pub struct CrtApp {
     sys_check: crate::sys_check::SystemCheck,
     sys_check_msg: String,
     ch_mgr: ChannelManagerUi,
+    ui_gamepad: retro::LinuxGamepad,
+    gp_prev_mask: u16,
+    gp_repeat_dir: u16,
+    gp_repeat_next: std::time::Instant,
+    gp_chord_fired: bool,
     tv_hovered: bool,
     fullscreen: bool,
     pending_fullscreen: Option<bool>,
@@ -669,6 +674,11 @@ impl CrtApp {
             sys_check: crate::sys_check::SystemCheck::default(),
             sys_check_msg: String::new(),
             ch_mgr: ChannelManagerUi::default(),
+            ui_gamepad: retro::LinuxGamepad::new(String::new()),
+            gp_prev_mask: 0,
+            gp_repeat_dir: 0,
+            gp_repeat_next: std::time::Instant::now(),
+            gp_chord_fired: false,
             tv_hovered: false,
             fullscreen: false,
             pending_fullscreen: None,
@@ -679,6 +689,9 @@ impl CrtApp {
             last_pointer_move: std::time::Instant::now(),
         };
         app.sys_check = crate::sys_check::SystemCheck::run(app.retro.cores.len());
+        if !app.retro.cfg.gamepad_device.is_empty() {
+            app.ui_gamepad.set_selected(app.retro.cfg.gamepad_device.clone());
+        }
         // First-run onboarding: on a completely fresh install with no configured sources yet,
         // auto-seed the curated free starter pack so flipping channels works within seconds,
         // and present the friendly Welcome & Setup overlay once.
@@ -2022,6 +2035,7 @@ impl CrtApp {
                     .unwrap_or_else(|| dev.clone())
             };
             self.retro.set_gamepad_device(dev.clone());
+            self.ui_gamepad.set_selected(dev.clone());
             if let Some(rp) = &self.retro_player {
                 rp.set_gamepad(dev.clone());
             }
@@ -5993,6 +6007,205 @@ impl CrtApp {
         }
     }
 
+    /// Polls Linux gamepads for couch-TV navigation of the 90s Prevue Cable Guide,
+    /// Episode/Game Picker, and live TV remote controls, while pausing game-core
+    /// gamepad forwarding whenever the Guide or a modal overlay is open.
+    fn poll_ui_gamepad(&mut self, retro_playing: bool, web_playing: bool) {
+        if self.screenshot.is_some() {
+            return;
+        }
+        let ui_owns_pad = self.guide.active || self.welcome_open || self.settings_open || self.save_preset_open;
+        if let Some(rp) = &self.retro_player {
+            rp.gamepad_paused.store(ui_owns_pad, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(wp) = &self.web_player {
+            wp.gamepad_paused.store(ui_owns_pad, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let mask = self.ui_gamepad.poll_mask();
+        let pressed = mask & !self.gp_prev_mask;
+        self.gp_prev_mask = mask;
+
+        // Smooth directional repeat for D-pad / Left Stick
+        let dir_bits = mask & (retro::BTN_UP | retro::BTN_DOWN | retro::BTN_LEFT | retro::BTN_RIGHT);
+        let now = std::time::Instant::now();
+        let mut dir_fire = pressed & (retro::BTN_UP | retro::BTN_DOWN | retro::BTN_LEFT | retro::BTN_RIGHT);
+        if dir_bits == 0 {
+            self.gp_repeat_dir = 0;
+        } else if dir_fire != 0 {
+            self.gp_repeat_dir = dir_bits;
+            self.gp_repeat_next = now + std::time::Duration::from_millis(300);
+        } else if dir_bits == self.gp_repeat_dir && now >= self.gp_repeat_next {
+            dir_fire = dir_bits;
+            self.gp_repeat_next = now + std::time::Duration::from_millis(85);
+        }
+
+        // Welcome modal dismiss on A/B/Start
+        if self.welcome_open {
+            if (pressed & (retro::BTN_B | retro::BTN_A | retro::BTN_START | retro::BTN_GUIDE)) != 0 {
+                self.dismiss_welcome();
+            }
+            return;
+        }
+        if self.save_preset_open || self.settings_open {
+            if (pressed & retro::BTN_A) != 0 {
+                self.save_preset_open = false;
+                self.settings_open = false;
+            }
+            return;
+        }
+
+        // Global Cable Guide toggle: Home/Guide button OR Select+Start chord (works even mid-game!)
+        let chord_down = (mask & (retro::BTN_SELECT | retro::BTN_START)) == (retro::BTN_SELECT | retro::BTN_START);
+        if !chord_down {
+            self.gp_chord_fired = false;
+        }
+        let chord_trigger = chord_down && !self.gp_chord_fired;
+        if chord_trigger {
+            self.gp_chord_fired = true;
+        }
+        if self.has_channels() && ((pressed & retro::BTN_GUIDE) != 0 || chord_trigger) {
+            self.toggle_guide();
+            return;
+        }
+
+        // Inside 90s Prevue Cable Guide & Episode/Game Picker
+        if self.guide.active && self.has_channels() {
+            let up = (dir_fire & retro::BTN_UP) != 0;
+            let down = (dir_fire & retro::BTN_DOWN) != 0;
+            let left = (dir_fire & retro::BTN_LEFT) != 0;
+            let right = (dir_fire & retro::BTN_RIGHT) != 0;
+            let page_up = (pressed & retro::BTN_L) != 0;
+            let page_down = (pressed & retro::BTN_R) != 0;
+            let confirm = (pressed & (retro::BTN_B | retro::BTN_START)) != 0;
+            let back = (pressed & retro::BTN_A) != 0;
+            let action_x = (pressed & retro::BTN_Y) != 0; // Xbox X / PS Square: List (Grid) or Mark Watched (Picker)
+            let fav_y = (pressed & retro::BTN_X) != 0;    // Xbox Y / PS Triangle: Favorite *
+
+            if back {
+                if self.guide.search_active || !self.guide.search_query.is_empty() {
+                    self.guide.clear_search();
+                } else if self.guide.picker_channel().is_some() {
+                    self.guide.close_picker();
+                } else {
+                    self.toggle_guide();
+                }
+                return;
+            }
+            if fav_y {
+                self.toggle_current_favorite();
+            }
+
+            if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
+                let items = self.guide_picker_items(pch_num);
+                if up {
+                    self.guide.picker_move(-1, items.len());
+                } else if down {
+                    self.guide.picker_move(1, items.len());
+                } else if page_up {
+                    self.guide.picker_move(-6, items.len());
+                } else if page_down {
+                    self.guide.picker_move(6, items.len());
+                }
+                if left {
+                    self.guide.picker_jump_season(-1, &items);
+                } else if right {
+                    self.guide.picker_jump_season(1, &items);
+                }
+                if action_x {
+                    if let Some((iid, played)) = items.get(sel_idx).map(|m| (m.id.clone(), !m.played)) {
+                        self.set_channel_item_played(pch_num, &iid, played);
+                        self.osd.show_action(if played { "MARKED WATCHED" } else { "MARKED UNWATCHED" });
+                    }
+                } else if confirm {
+                    if let Some(item) = items.get(sel_idx).cloned() {
+                        self.tune_specific(pch_num, item, false);
+                    }
+                }
+            } else {
+                let vis_len = self.guide_visible_channels().len();
+                if up {
+                    self.guide.move_selection(-1, vis_len);
+                } else if down {
+                    self.guide.move_selection(1, vis_len);
+                } else if page_up {
+                    self.guide.move_selection(-6, vis_len);
+                } else if page_down {
+                    self.guide.move_selection(6, vis_len);
+                }
+                if left {
+                    self.guide.shift_time(-1);
+                } else if right {
+                    self.guide.shift_time(1);
+                }
+                if action_x {
+                    let sel_ch = self
+                        .guide_visible_channels()
+                        .get(self.guide.selected_idx)
+                        .map(|c| c.number);
+                    if let Some(n) = sel_ch.filter(|&n| n > 1) {
+                        self.open_episode_picker(n);
+                    }
+                } else if confirm {
+                    let target_ch = self
+                        .guide_visible_channels()
+                        .get(self.guide.selected_idx)
+                        .map(|c| c.number);
+                    if let Some(n) = target_ch {
+                        if n == 1 {
+                            self.toggle_guide();
+                        } else {
+                            self.tune_channel(n);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Watching TV / videos / streams (not playing a retro or web game): couch TV remote controls!
+        if !retro_playing && !web_playing {
+            if self.has_channels() && (pressed & (retro::BTN_START | retro::BTN_SELECT)) != 0 {
+                self.toggle_guide();
+                return;
+            }
+            if self.has_channels() && (pressed & retro::BTN_L) != 0 {
+                self.surf_channel(-1);
+            }
+            if self.has_channels() && (pressed & retro::BTN_R) != 0 {
+                self.surf_channel(1);
+            }
+            if self.has_channels() && (pressed & retro::BTN_X) != 0 {
+                if let Some(cur) = self.current_channel.filter(|&n| n > 1) {
+                    self.open_episode_picker(cur);
+                }
+            }
+            if (pressed & retro::BTN_Y) != 0 {
+                self.show_info_osd();
+            }
+            if (pressed & retro::BTN_A) != 0 {
+                self.toggle_mute();
+            }
+            if (pressed & retro::BTN_B) != 0 {
+                if let Some(p) = &self.player {
+                    p.toggle_pause();
+                    let paused = p.shared.lock().unwrap().paused;
+                    self.osd.show_action(if paused { "PLAY >" } else { "PAUSE ||" });
+                }
+            }
+            if (dir_fire & retro::BTN_UP) != 0 {
+                self.adjust_volume(0.05);
+            } else if (dir_fire & retro::BTN_DOWN) != 0 {
+                self.adjust_volume(-0.05);
+            }
+            if (pressed & retro::BTN_LEFT) != 0 {
+                self.seek_video_rel(-10.0);
+            } else if (pressed & retro::BTN_RIGHT) != 0 {
+                self.seek_video_rel(10.0);
+            }
+        }
+    }
+
     fn show_welcome_window(&mut self, ctx: &egui::Context) {
         if !self.welcome_open {
             self.welcome_rect = None;
@@ -6573,6 +6786,11 @@ impl CrtApp {
 
                 ui.add_space(3.0);
                 ui.label(
+                    RichText::new("Gamepad: Home or Select+Start = Guide · D-Pad = Move · A = Tune · B = Back · X = List/Seen · Y = Fav · LB/RB = Page.")
+                        .weak()
+                        .small(),
+                );
+                ui.label(
                     RichText::new("Drop any video, image, or ROM onto the TV · Scroll to zoom · Double-click to reset.")
                         .weak()
                         .small(),
@@ -6975,6 +7193,7 @@ impl CrtApp {
 
         let retro_playing = self.retro_player.as_ref().is_some_and(|rp| rp.shared.lock().unwrap().running);
         let web_playing = self.web_player.as_ref().is_some_and(|wp| wp.shared.lock().unwrap().running);
+        self.poll_ui_gamepad(retro_playing, web_playing);
         if let Some(rp) = &self.retro_player {
             if !self.guide.active && !ctx.egui_wants_keyboard_input() && !self.save_preset_open {
                 let mask = ctx.input(|i| {

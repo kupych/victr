@@ -152,6 +152,7 @@ pub struct WebShared {
 
 pub struct WebPlayer {
     pub shared: Arc<Mutex<WebShared>>,
+    pub gamepad_paused: Arc<AtomicBool>,
     tx: Sender<WebInput>,
     stop: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
@@ -183,6 +184,7 @@ impl WebPlayer {
         }));
         let (tx, rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let gamepad_paused = Arc::new(AtomicBool::new(false));
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
 
         let ts = std::time::SystemTime::now()
@@ -193,6 +195,7 @@ impl WebPlayer {
 
         let sh_bg = shared.clone();
         let stop_bg = stop.clone();
+        let gp_paused_bg = gamepad_paused.clone();
         let child_bg = child_slot.clone();
         let prof_bg = profile_dir.clone();
 
@@ -204,6 +207,7 @@ impl WebPlayer {
                 &prof_bg,
                 &sh_bg,
                 rx,
+                &gp_paused_bg,
                 &stop_bg,
                 &child_bg,
             ) {
@@ -215,6 +219,7 @@ impl WebPlayer {
 
         Self {
             shared,
+            gamepad_paused,
             tx,
             stop,
             child: child_slot,
@@ -309,6 +314,7 @@ fn run_web_channel(
     profile_dir: &Path,
     shared: &Arc<Mutex<WebShared>>,
     rx: Receiver<WebInput>,
+    gamepad_paused: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
     child_slot: &Arc<Mutex<Option<Child>>>,
 ) -> Result<(), String> {
@@ -525,10 +531,15 @@ fn run_web_channel(
                 }
             }
         }
-        let gp_mask = gamepad.poll_mask();
+        let raw_gp_mask = gamepad.poll_mask();
         if let Some(summary) = gamepad.take_changed_summary() {
             shared.lock().unwrap().active_gamepad = summary;
         }
+        let gp_mask = if gamepad_paused.load(Ordering::Relaxed) {
+            0
+        } else {
+            raw_gp_mask & !retro::BTN_GUIDE
+        };
         let diff = gp_mask ^ *prev_gp_mask;
         if diff != 0 {
             for &(bit, key, code, vk, text) in gp_bindings {
