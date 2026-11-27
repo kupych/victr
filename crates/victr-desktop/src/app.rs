@@ -260,6 +260,9 @@ pub struct CrtApp {
     custom_ep_url: String,
     custom_ep_auth: String,
     custom_msg: String,
+    web_profile_msg: String,
+    web_profile_err: bool,
+    web_profile_confirm_wipe: bool,
     new_type_name: String,
     channels_file_msg: String,
     retro_selected_core: String,
@@ -654,6 +657,9 @@ impl CrtApp {
             custom_ep_url: String::new(),
             custom_ep_auth: String::new(),
             custom_msg: String::new(),
+            web_profile_msg: String::new(),
+            web_profile_err: false,
+            web_profile_confirm_wipe: false,
             new_type_name: String::new(),
             channels_file_msg: String::new(),
             retro_selected_core: String::new(),
@@ -4069,6 +4075,96 @@ impl CrtApp {
                             });
                             if clear_err {
                                 self.custom.last_error.clear();
+                            }
+                        }
+                    });
+
+                // ---- Source 6: Web Channels & Persistent Chromium Profile (PuzzleScript / PICO-8 / WeatherStar saves)
+                egui::CollapsingHeader::new(RichText::new("Web Channels & Browser Saves").strong().small())
+                    .id_salt("src_web_profile")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Interactive web channels (PuzzleScript, PICO-8, WeatherStar 4000+) share a persistent Chromium profile so game checkpoints, localStorage & cookies survive channel switches and restarts.")
+                                .weak()
+                                .small(),
+                        );
+                        let prof_path = web_channel::persistent_profile_dir();
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(format!("Profile: {}", prof_path.display()))
+                                .monospace()
+                                .small()
+                                .weak(),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .small_button("Open chrome://settings")
+                                .on_hover_text("Closes any running headless web channel and opens a normal Chromium window at chrome://settings for this profile")
+                                .clicked()
+                            {
+                                self.web_profile_confirm_wipe = false;
+                                // Gracefully stop active web channel so Chromium releases SingletonLock & flushes localStorage
+                                self.web_player = None;
+                                match web_channel::open_profile_settings() {
+                                    Ok(msg) => {
+                                        self.web_profile_msg = msg;
+                                        self.web_profile_err = false;
+                                    }
+                                    Err(err) => {
+                                        self.web_profile_msg = err;
+                                        self.web_profile_err = true;
+                                    }
+                                }
+                            }
+                            if !self.web_profile_confirm_wipe {
+                                if ui
+                                    .small_button("Wipe Web Data")
+                                    .on_hover_text("Delete all saved localStorage, cookies, IndexedDB & cache for web channels")
+                                    .clicked()
+                                {
+                                    self.web_profile_confirm_wipe = true;
+                                }
+                            } else {
+                                if ui
+                                    .small_button(RichText::new("Confirm Wipe").color(Color32::from_rgb(248, 122, 108)).strong())
+                                    .clicked()
+                                {
+                                    self.web_profile_confirm_wipe = false;
+                                    self.web_player = None;
+                                    match web_channel::wipe_profile_data() {
+                                        Ok(msg) => {
+                                            self.web_profile_msg = msg;
+                                            self.web_profile_err = false;
+                                        }
+                                        Err(err) => {
+                                            self.web_profile_msg = err;
+                                            self.web_profile_err = true;
+                                        }
+                                    }
+                                }
+                                if ui.small_button("Cancel").clicked() {
+                                    self.web_profile_confirm_wipe = false;
+                                }
+                            }
+                        });
+                        if !self.web_profile_msg.is_empty() {
+                            let mut clear_msg = false;
+                            let col = if self.web_profile_err {
+                                Color32::from_rgb(248, 122, 108)
+                            } else {
+                                Color32::from_rgb(112, 236, 184)
+                            };
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(&self.web_profile_msg).small().color(col));
+                                if ui.small_button("×").on_hover_text("Dismiss message").clicked() {
+                                    clear_msg = true;
+                                }
+                            });
+                            if clear_msg {
+                                self.web_profile_msg.clear();
+                                self.web_profile_err = false;
                             }
                         }
                     });

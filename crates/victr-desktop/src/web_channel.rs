@@ -156,18 +156,142 @@ pub struct WebPlayer {
     tx: Sender<WebInput>,
     stop: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
-    profile_dir: Option<PathBuf>,
+}
+
+fn graceful_stop_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        unsafe { kill(child.id() as i32, 15) }; // SIGTERM so Chromium flushes localStorage & removes SingletonLock
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(700) {
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Persistent Chromium profile directory shared by interactive web channels so
+/// PuzzleScript checkpoints, PICO-8 web saves, WeatherStar settings & cookies
+/// survive channel switches and restarts.
+pub fn persistent_profile_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+            return PathBuf::from(local).join("victr").join("web_profile");
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(xdg).join("victr").join("web_profile");
+        }
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(home).join(".local").join("share").join("victr").join("web_profile");
+        }
+    }
+    if let Some(cfg) = crate::settings::config_dir() {
+        return cfg.join("web_profile");
+    }
+    std::env::temp_dir().join("victr-web-profile")
+}
+
+#[cfg(unix)]
+fn is_pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    if unsafe { kill(pid, 0) } == 0 {
+        true
+    } else {
+        std::io::Error::last_os_error().raw_os_error() == Some(1) // EPERM: alive, owned by another user
+    }
+}
+
+/// Returns the live PID holding Chromium's `SingletonLock` in `dir`, if any.
+#[cfg(unix)]
+fn active_profile_lock_pid(dir: &Path) -> Option<i32> {
+    let lock = dir.join("SingletonLock");
+    let target = std::fs::read_link(&lock).ok()?;
+    let s = target.to_string_lossy();
+    let (_, pid_str) = s.rsplit_once('-')?;
+    let pid: i32 = pid_str.parse().ok()?;
+    if is_pid_alive(pid) { Some(pid) } else { None }
+}
+
+#[cfg(not(unix))]
+fn active_profile_lock_pid(_dir: &Path) -> Option<i32> {
+    None
+}
+
+fn clear_stale_singleton_locks(dir: &Path) {
+    if active_profile_lock_pid(dir).is_some() {
+        return;
+    }
+    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        let p = dir.join(name);
+        if p.symlink_metadata().is_ok() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Opens a visible Chromium window at `chrome://settings` pointing at ViCTR's
+/// persistent web-channel profile so the user can inspect cookies, site data,
+/// or sign in to sites. Caller should drop any active `WebPlayer` first.
+pub fn open_profile_settings() -> Result<String, String> {
+    let browser = find_chromium_binary().ok_or_else(|| {
+        "Needs Chromium, Chrome, Brave, or Edge installed (or set VICTR_BROWSER).".to_string()
+    })?;
+    let dir = persistent_profile_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't create web profile dir: {e}"))?;
+    clear_stale_singleton_locks(&dir);
+    let mut cmd = Command::new(&browser);
+    cmd.args([
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-session-crashed-bubble",
+        &format!("--user-data-dir={}", dir.display()),
+        "chrome://settings",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    cmd.spawn()
+        .map_err(|e| format!("Failed to open {}: {e}", browser.display()))?;
+    Ok("Opened chrome://settings for ViCTR's web profile (close that window before tuning a web channel).".into())
+}
+
+fn wipe_profile_dir_at(dir: &Path) -> Result<String, String> {
+    if active_profile_lock_pid(dir).is_some() {
+        return Err("Web profile is currently open in a browser window — close Browser Settings first.".into());
+    }
+    if dir.exists() {
+        std::fs::remove_dir_all(dir).map_err(|e| format!("Couldn't wipe web profile: {e}"))?;
+    }
+    Ok("Web channel browser data cleared (localStorage, cookies & cache wiped).".into())
+}
+
+/// Deletes ViCTR's persistent web-channel Chromium profile (localStorage, cookies,
+/// IndexedDB, cache). Caller should drop any active `WebPlayer` first.
+pub fn wipe_profile_data() -> Result<String, String> {
+    wipe_profile_dir_at(&persistent_profile_dir())
 }
 
 impl Drop for WebPlayer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(mut child) = self.child.lock().unwrap().take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(dir) = self.profile_dir.take() {
-            let _ = std::fs::remove_dir_all(dir);
+            graceful_stop_child(&mut child);
         }
     }
 }
@@ -187,17 +311,13 @@ impl WebPlayer {
         let gamepad_paused = Arc::new(AtomicBool::new(false));
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
 
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let profile_dir = std::env::temp_dir().join(format!("victr-web-{}-{ts}", std::process::id()));
+        let profile_dir = persistent_profile_dir();
 
         let sh_bg = shared.clone();
         let stop_bg = stop.clone();
         let gp_paused_bg = gamepad_paused.clone();
         let child_bg = child_slot.clone();
-        let prof_bg = profile_dir.clone();
+        let prof_bg = profile_dir;
 
         std::thread::spawn(move || {
             if let Err(err) = run_web_channel(
@@ -223,7 +343,6 @@ impl WebPlayer {
             tx,
             stop,
             child: child_slot,
-            profile_dir: Some(profile_dir),
         }
     }
 
@@ -322,6 +441,10 @@ fn run_web_channel(
         "Web channel needs Chromium, Chrome, Brave, or Edge installed (or set VICTR_BROWSER).".to_string()
     })?;
     let _ = std::fs::create_dir_all(profile_dir);
+    if active_profile_lock_pid(profile_dir).is_some() {
+        return Err("Web channel profile is currently open in Browser Settings — close that window and re-tune.".into());
+    }
+    clear_stale_singleton_locks(profile_dir);
 
     let mut cmd = Command::new(&browser);
     cmd.args([
@@ -380,6 +503,15 @@ fn run_web_channel(
         }
         if let Some(p) = *port_box.lock().unwrap() {
             break p;
+        }
+        if child_slot
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|c| c.try_wait().ok().flatten())
+            .is_some()
+        {
+            return Err("Web browser exited early (if Browser Settings is open, close it and re-tune).".into());
         }
         if Instant::now() >= deadline {
             return Err("Timed out waiting for headless browser DevTools.".into());
@@ -1318,5 +1450,35 @@ pdat=[
         let mask = &frame[2..6];
         let unmasked: Vec<u8> = frame[6..].iter().enumerate().map(|(i, b)| b ^ mask[i & 3]).collect();
         assert_eq!(unmasked, b"hi");
+    }
+
+    #[test]
+    fn persistent_profile_stale_lock_and_wipe_work() {
+        let p = persistent_profile_dir();
+        assert!(p.ends_with("web_profile"));
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = std::env::temp_dir().join(format!("victr-web-test-prof-{}-{ts}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("Preferences"), "{}").unwrap();
+        #[cfg(unix)]
+        {
+            // Dead PID symlink should be cleared as stale
+            let _ = std::os::unix::fs::symlink("localhost-99999999", tmp.join("SingletonLock"));
+            assert!(active_profile_lock_pid(&tmp).is_none());
+            clear_stale_singleton_locks(&tmp);
+            assert!(tmp.join("SingletonLock").symlink_metadata().is_err());
+
+            // Current live PID should block wipe
+            let live_target = format!("localhost-{}", std::process::id());
+            let _ = std::os::unix::fs::symlink(&live_target, tmp.join("SingletonLock"));
+            assert_eq!(active_profile_lock_pid(&tmp), Some(std::process::id() as i32));
+            assert!(wipe_profile_dir_at(&tmp).is_err());
+            let _ = std::fs::remove_file(tmp.join("SingletonLock"));
+        }
+        assert!(wipe_profile_dir_at(&tmp).is_ok());
+        assert!(!tmp.exists());
     }
 }
