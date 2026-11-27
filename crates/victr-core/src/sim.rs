@@ -29,6 +29,8 @@ struct ChaosState {
     t_ripple: f32,
     // Countdown until the next cold-solder / signal glitch
     next_glitch_s: f32,
+    // Countdown until active faults naturally settle/heal back to lock on their own
+    self_heal_s: f32,
     whack_streak: u8,
 }
 
@@ -43,6 +45,7 @@ impl ChaosState {
         self.v_hold = 0.0;
         self.hum = 0.0;
         self.ripple = 0.0;
+        self.self_heal_s = 0.0;
         self.clear_targets();
     }
 
@@ -56,6 +59,18 @@ impl ChaosState {
         self.t_v_hold = 0.0;
         self.t_hum = 0.0;
         self.t_ripple = 0.0;
+    }
+
+    fn has_targets(&self) -> bool {
+        self.t_signal_drop_db > 0.01
+            || self.t_noise > 0.001
+            || self.t_ghost.abs() > 0.001
+            || self.t_tracking.abs() > 0.001
+            || self.t_warble > 0.001
+            || self.t_h_hold.abs() > 0.001
+            || self.t_v_hold.abs() > 0.001
+            || self.t_hum > 0.001
+            || self.t_ripple > 0.001
     }
 
     fn scale_all(&mut self, k: f32) {
@@ -81,13 +96,13 @@ impl ChaosState {
 
     fn active_faults(&self) -> Vec<&'static str> {
         let mut f = Vec::new();
-        if self.signal_drop_db > 3.0 || self.noise > 0.018 { f.push("weak signal / snow"); }
-        if self.ghost.abs() > 0.06 { f.push("multipath ghost"); }
-        if self.tracking.abs() > 0.06 { f.push("tracking drift"); }
-        if self.warble > 0.08 { f.push("timebase warble"); }
-        if self.v_hold.abs() > 0.015 { f.push("V-hold roll"); }
-        if self.h_hold.abs() > 0.025 { f.push("H-hold tear"); }
-        if self.hum > 0.08 || self.ripple > 0.12 { f.push("hum / supply ripple"); }
+        if self.signal_drop_db > 2.5 || self.noise > 0.012 { f.push("weak signal / snow"); }
+        if self.ghost.abs() > 0.05 { f.push("multipath ghost"); }
+        if self.tracking.abs() > 0.045 { f.push("tracking drift"); }
+        if self.warble > 0.06 { f.push("timebase warble"); }
+        if self.v_hold.abs() > 0.010 { f.push("V-hold slip"); }
+        if self.h_hold.abs() > 0.008 { f.push("H-hold pull"); }
+        if self.hum > 0.05 || self.ripple > 0.08 { f.push("hum / supply ripple"); }
         f
     }
 }
@@ -340,8 +355,8 @@ impl Sim {
             return;
         }
         let rate = s.chaos_rate.clamp(0.1, 2.0);
-        // Smoothly drift live values toward their fault targets
-        let slew = (dt * 0.65).min(1.0);
+        // Smoothly drift live values toward their fault targets (slower settle when self-healing)
+        let slew = (dt * if self.chaos.has_targets() { 0.65 } else { 0.95 }).min(1.0);
         self.chaos.signal_drop_db += (self.chaos.t_signal_drop_db - self.chaos.signal_drop_db) * slew;
         self.chaos.noise += (self.chaos.t_noise - self.chaos.noise) * slew;
         self.chaos.ghost += (self.chaos.t_ghost - self.chaos.ghost) * slew;
@@ -352,49 +367,76 @@ impl Sim {
         self.chaos.hum += (self.chaos.t_hum - self.chaos.hum) * slew;
         self.chaos.ripple += (self.chaos.t_ripple - self.chaos.ripple) * slew;
 
+        // Snap tiny residual tails cleanly to zero once settled
+        if !self.chaos.has_targets() {
+            if self.chaos.signal_drop_db < 0.05 { self.chaos.signal_drop_db = 0.0; }
+            if self.chaos.noise < 0.001 { self.chaos.noise = 0.0; }
+            if self.chaos.ghost.abs() < 0.002 { self.chaos.ghost = 0.0; }
+            if self.chaos.tracking.abs() < 0.002 { self.chaos.tracking = 0.0; }
+            if self.chaos.warble < 0.002 { self.chaos.warble = 0.0; }
+            if self.chaos.h_hold.abs() < 0.0005 { self.chaos.h_hold = 0.0; }
+            if self.chaos.v_hold.abs() < 0.0005 { self.chaos.v_hold = 0.0; }
+            if self.chaos.hum < 0.002 { self.chaos.hum = 0.0; }
+            if self.chaos.ripple < 0.002 { self.chaos.ripple = 0.0; }
+        }
+
+        // Self-healing timer: if you don't whack the TV, passing interference / thermal drift
+        // settles back into clean lock on its own after ~9-20 seconds.
+        if self.chaos.has_targets() {
+            self.chaos.self_heal_s -= dt;
+            if self.chaos.self_heal_s <= 0.0 {
+                self.chaos.clear_targets();
+                self.chaos.whack_streak = 0;
+                self.chaos.next_glitch_s = 14.0 + self.next() * 18.0;
+                return;
+            }
+        }
+
         self.chaos.next_glitch_s -= dt * rate;
         if self.chaos.next_glitch_s <= 0.0 {
             self.chaos.whack_streak = 0;
-            self.chaos.next_glitch_s = 10.0 + self.next() * 16.0;
-            // Cap concurrent faults at 2 so it stays fun/watchable until whacked
-            if self.chaos.active_faults().len() >= 2 {
+            self.chaos.next_glitch_s = 12.0 + self.next() * 18.0;
+            // Keep at most 1 active fault episode at a time so chaos adds charming
+            // analog character without ever stacking into an unwatchable mess.
+            if self.chaos.has_targets() || !self.chaos.active_faults().is_empty() {
                 return;
             }
+            self.chaos.self_heal_s = 9.0 + self.next() * 11.0;
             let sign = if self.next() > 0.5 { 1.0 } else { -1.0 };
             let pick = (self.next() * 6.0) as u32;
             match pick {
                 0 => {
-                    // Weak / loose antenna signal strength drop & snow
-                    self.chaos.t_signal_drop_db = 14.0 + 14.0 * self.next();
-                    self.chaos.t_noise = 0.045 + 0.085 * self.next();
+                    // Moderate atmospheric RF fade & snow (clearly visible, still watchable)
+                    self.chaos.t_signal_drop_db = 6.0 + 6.0 * self.next();
+                    self.chaos.t_noise = 0.022 + 0.028 * self.next();
                 }
                 1 => {
-                    // VCR tracking slip (when VCR on) or loose cable noise + slight multipath
+                    // Gentle VCR tracking band (when VCR on) or mild multipath ghosting / cable snow
                     if s.vcr {
-                        self.chaos.t_tracking = sign * (0.18 + 0.24 * self.next());
+                        self.chaos.t_tracking = sign * (0.09 + 0.09 * self.next());
                     } else if s.input == Input::Rf {
-                        self.chaos.t_ghost = sign * (0.18 + 0.22 * self.next());
-                        self.chaos.t_signal_drop_db = 8.0 + 10.0 * self.next();
+                        self.chaos.t_ghost = sign * (0.10 + 0.12 * self.next());
+                        self.chaos.t_signal_drop_db = 4.0 + 4.5 * self.next();
                     } else {
-                        self.chaos.t_noise = 0.04 + 0.07 * self.next();
+                        self.chaos.t_noise = 0.020 + 0.025 * self.next();
                     }
                 }
                 2 => {
-                    // Timebase warble (tape wow/flutter or unstable sync lines)
-                    self.chaos.t_warble = 0.45 + 0.65 * self.next();
+                    // Mild timebase warble (vintage tape / sync flutter without unreadable shear)
+                    self.chaos.t_warble = 0.18 + 0.24 * self.next();
                 }
                 3 => {
-                    // Classic vertical hold slip (slow picture roll)
-                    self.chaos.t_v_hold = sign * (0.042 + 0.052 * self.next());
+                    // Gentle vertical hold slip (slow picture drift rather than frantic spinning)
+                    self.chaos.t_v_hold = sign * (0.016 + 0.014 * self.next());
                 }
                 4 => {
-                    // Horizontal hold AFC slip (diagonal tearing)
-                    self.chaos.t_h_hold = sign * (0.055 + 0.075 * self.next());
+                    // Mild horizontal hold AFC pull (subtle skew/wobble, picture stays legible)
+                    self.chaos.t_h_hold = sign * (0.014 + 0.014 * self.next());
                 }
                 _ => {
-                    // Mains hum bar + dried-out capacitor supply ripple warble
-                    self.chaos.t_hum = 0.22 + 0.34 * self.next();
-                    self.chaos.t_ripple = 0.35 + 0.50 * self.next();
+                    // Subtle mains hum bar + warm capacitor supply ripple breathing
+                    self.chaos.t_hum = 0.10 + 0.14 * self.next();
+                    self.chaos.t_ripple = 0.14 + 0.20 * self.next();
                 }
             }
         }
@@ -905,18 +947,46 @@ mod tests {
         // Advance simulated time until at least one fault drifts in
         for _ in 0..600 {
             sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 30.0);
+            if !sim.chaos_active_faults().is_empty() {
+                break;
+            }
         }
         assert!(!sim.chaos_active_faults().is_empty(), "chaos engine should introduce at least one drift fault");
+        assert!(sim.chaos.h_hold.abs() <= 0.030, "H-hold fault should stay watchable");
+        assert!(sim.chaos.v_hold.abs() <= 0.032, "V-hold fault should stay watchable");
+        assert!(sim.chaos.noise <= 0.055, "noise fault should stay watchable");
+        assert!(sim.chaos.signal_drop_db <= 12.5, "signal drop should stay watchable");
 
-        // Two whacks always guarantee 100% clean lock
+        // Without whacking, faults should naturally self-resolve back to clean lock
+        let mut healed = false;
+        for _ in 0..900 {
+            sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 30.0);
+            if sim.chaos_active_faults().is_empty() {
+                healed = true;
+                break;
+            }
+        }
+        assert!(healed, "chaos faults should self-resolve after a short time");
+
+        // Wait for another fault, then verify two whacks always guarantee 100% clean lock
+        for _ in 0..1200 {
+            sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 30.0);
+            if !sim.chaos_active_faults().is_empty() {
+                break;
+            }
+        }
+        assert!(!sim.chaos_active_faults().is_empty());
         sim.whack();
         sim.whack();
         assert!(sim.chaos_active_faults().is_empty(), "whacking should knock faults back into gear");
         assert!(sim.whack_t < 0.05);
 
         // Turning chaos off clears all drift immediately
-        for _ in 0..600 {
+        for _ in 0..1200 {
             sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 30.0);
+            if !sim.chaos_active_faults().is_empty() {
+                break;
+            }
         }
         s.chaos = false;
         sim.field(&s, [0.0, 0.0, 1.0], 1.0 / 60.0);
