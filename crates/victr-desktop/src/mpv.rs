@@ -672,11 +672,17 @@ fn run_libmpv(
             // never accumulate a backlog of overlapping range requests.
             let mut pending_seek = 0.0f64;
             let mut pending_seek_fast = false;
-            let flush_seek = |pending_seek: &mut f64, pending_seek_fast: &mut bool, in_shuttle: bool| {
+            let flush_seek = |pending_seek: &mut f64,
+                                  pending_seek_fast: &mut bool,
+                                  in_shuttle: bool,
+                                  silent_play_since: &mut Option<Instant>,
+                                  stall_recoveries: &mut u32| {
                 if pending_seek.abs() > 0.001 {
                     let mode = if *pending_seek_fast { "relative+keyframes" } else { "relative" };
                     if !in_shuttle {
                         audio.drain_pipe();
+                        *silent_play_since = None;
+                        *stall_recoveries = 0;
                     }
                     cmd(&["seek", &format!("{:.3}", *pending_seek), mode]);
                     audio.clear();
@@ -697,7 +703,13 @@ fn run_libmpv(
                         continue;
                     }
                     other => {
-                        flush_seek(&mut pending_seek, &mut pending_seek_fast, shuttle_active);
+                        flush_seek(
+                            &mut pending_seek,
+                            &mut pending_seek_fast,
+                            shuttle_active,
+                            &mut silent_play_since,
+                            &mut stall_recoveries,
+                        );
                         match other {
                             Cmd::Stop => break 'outer,
                             Cmd::TogglePause => {
@@ -791,7 +803,13 @@ fn run_libmpv(
                     }
                 }
             }
-            flush_seek(&mut pending_seek, &mut pending_seek_fast, shuttle_active);
+            flush_seek(
+                &mut pending_seek,
+                &mut pending_seek_fast,
+                shuttle_active,
+                &mut silent_play_since,
+                &mut stall_recoveries,
+            );
             loop {
                 let ev = (lib.wait_event)(h, 0.0);
                 if ev.is_null() || (*ev).event_id == 0 {
@@ -934,7 +952,11 @@ fn run_libmpv(
                         audio.drain_pipe();
                         if is_seekable {
                             let start_opt = format!("start={cur_pos:.2}");
-                            cmd(&["loadfile", src, "replace", &start_opt]);
+                            // mpv >= 0.38 expects `loadfile <url> <flags> <index> <options>`;
+                            // fall back to the legacy 3-arg form for older libmpv releases.
+                            if cmd(&["loadfile", src, "replace", "-1", &start_opt]) < 0 {
+                                cmd(&["loadfile", src, "replace", &start_opt]);
+                            }
                         } else {
                             cmd(&["loadfile", src, "replace"]);
                         }
