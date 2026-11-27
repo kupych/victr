@@ -1080,6 +1080,9 @@ pub struct AppConfig {
     /// Favorited channels keyed by `<provider_id>:<source_key>`.
     #[serde(default)]
     pub favorite_channels: std::collections::BTreeSet<String>,
+    /// True once the first-run Welcome & Setup overlay has been dismissed.
+    #[serde(default)]
+    pub welcome_dismissed: bool,
 }
 
 impl Default for AppConfig {
@@ -1093,12 +1096,17 @@ impl Default for AppConfig {
             last_watched: None,
             favorite_items: std::collections::BTreeSet::new(),
             favorite_channels: std::collections::BTreeSet::new(),
+            welcome_dismissed: false,
         }
     }
 }
 
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    presets_dir().and_then(|d| d.parent().map(|p| p.to_path_buf()))
+}
+
 pub fn app_config_path() -> Option<std::path::PathBuf> {
-    presets_dir().and_then(|d| d.parent().map(|p| p.join("app.json")))
+    config_dir().map(|p| p.join("app.json"))
 }
 
 pub fn load_app_config_from(path: &std::path::Path) -> AppConfig {
@@ -1224,6 +1232,7 @@ mod tests {
             }),
             favorite_items: ["ps:6841210".to_string()].into_iter().collect(),
             favorite_channels: ["channels:cfg:pzls".to_string()].into_iter().collect(),
+            welcome_dismissed: true,
         };
         save_app_config_to(&path, &cfg).unwrap();
         let loaded = load_app_config_from(&path);
@@ -1235,6 +1244,7 @@ mod tests {
         assert_eq!(loaded.last_watched.as_ref().map(|w| w.label()), Some("The Simpsons".into()));
         assert!(loaded.favorite_items.contains("ps:6841210"));
         assert!(loaded.favorite_channels.contains("channels:cfg:pzls"));
+        assert!(loaded.welcome_dismissed);
 
         let cfg2 = AppConfig {
             default_preset: Some(StartupPreset::BuiltIn(4)),
@@ -1245,6 +1255,7 @@ mod tests {
             last_watched: None,
             favorite_items: Default::default(),
             favorite_channels: Default::default(),
+            welcome_dismissed: false,
         };
         save_app_config_to(&path, &cfg2).unwrap();
         let loaded2 = load_app_config_from(&path);

@@ -68,6 +68,98 @@ impl SettingsTab {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum AddChKind {
+    #[default]
+    LiveStream,
+    WebPage,
+    VideoFolder,
+    BlockMix,
+}
+
+impl AddChKind {
+    const ALL: [AddChKind; 4] = [
+        AddChKind::LiveStream,
+        AddChKind::WebPage,
+        AddChKind::VideoFolder,
+        AddChKind::BlockMix,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            AddChKind::LiveStream => "Live Stream / YouTube",
+            AddChKind::WebPage => "Website / Arcade",
+            AddChKind::VideoFolder => "Video Folder",
+            AddChKind::BlockMix => "TV Block (Mix)",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ChannelManagerUi {
+    add_open: bool,
+    add_kind: AddChKind,
+    add_name: String,
+    add_callsign: String,
+    add_number: String,
+    add_url: String,
+    add_path: String,
+    add_profile: String,
+    add_block_shows: Vec<String>,
+    add_block_custom_show: String,
+    add_block_shuffle: bool,
+    add_block_live: bool,
+    add_block_hide_sources: bool,
+    add_msg: String,
+    search: String,
+    show_hidden: bool,
+    edit_key: Option<String>,
+    edit_inline_idx: Option<usize>,
+    edit_match_text: String,
+    edit_provider: String,
+    edit_number: String,
+    edit_name: String,
+    edit_callsign: String,
+    edit_profile: String,
+    edit_url: String,
+    edit_path: String,
+    edit_hidden: bool,
+}
+
+impl Default for ChannelManagerUi {
+    fn default() -> Self {
+        Self {
+            add_open: false,
+            add_kind: AddChKind::LiveStream,
+            add_name: String::new(),
+            add_callsign: String::new(),
+            add_number: String::new(),
+            add_url: String::new(),
+            add_path: String::new(),
+            add_profile: String::new(),
+            add_block_shows: Vec::new(),
+            add_block_custom_show: String::new(),
+            add_block_shuffle: false,
+            add_block_live: true,
+            add_block_hide_sources: false,
+            add_msg: String::new(),
+            search: String::new(),
+            show_hidden: false,
+            edit_key: None,
+            edit_inline_idx: None,
+            edit_match_text: String::new(),
+            edit_provider: String::new(),
+            edit_number: String::new(),
+            edit_name: String::new(),
+            edit_callsign: String::new(),
+            edit_profile: String::new(),
+            edit_url: String::new(),
+            edit_path: String::new(),
+            edit_hidden: false,
+        }
+    }
+}
+
 pub struct CrtApp {
     s: Settings,
     sim: Sim,
@@ -183,6 +275,14 @@ pub struct CrtApp {
     use_my_mpv: bool,
     link_msg: String,
     about_msg: String,
+    // Layperson onboarding, visual channel manager, clickable TV remote & system checks
+    welcome_open: bool,
+    welcome_rect: Option<egui::Rect>,
+    remote_open: bool,
+    remote_rect: Option<egui::Rect>,
+    sys_check: crate::sys_check::SystemCheck,
+    sys_check_msg: String,
+    ch_mgr: ChannelManagerUi,
     tv_hovered: bool,
     fullscreen: bool,
     pending_fullscreen: Option<bool>,
@@ -562,6 +662,13 @@ impl CrtApp {
             use_my_mpv: true,
             link_msg: String::new(),
             about_msg: String::new(),
+            welcome_open: false,
+            welcome_rect: None,
+            remote_open: false,
+            remote_rect: None,
+            sys_check: crate::sys_check::SystemCheck::default(),
+            sys_check_msg: String::new(),
+            ch_mgr: ChannelManagerUi::default(),
             tv_hovered: false,
             fullscreen: false,
             pending_fullscreen: None,
@@ -571,6 +678,21 @@ impl CrtApp {
             fs_since: std::time::Instant::now(),
             last_pointer_move: std::time::Instant::now(),
         };
+        app.sys_check = crate::sys_check::SystemCheck::run(app.retro.cores.len());
+        // First-run onboarding: on a completely fresh install with no configured sources yet,
+        // auto-seed the curated free starter pack so flipping channels works within seconds,
+        // and present the friendly Welcome & Setup overlay once.
+        let has_any_source = app.channels_file.file_exists
+            || !app.folders.cfg.roots.is_empty()
+            || !app.jellyfin.cfg.server_url.trim().is_empty()
+            || !app.plex.cfg.server_url.trim().is_empty()
+            || app.m3u.cfg.has_enabled_sources()
+            || app.custom.has_enabled_sources()
+            || !app.retro.cfg.rom_dirs.is_empty();
+        if !screenshot_mode && !cli_has_media && !app.app_cfg.welcome_dismissed && !has_any_source {
+            let _ = app.channels_file.install_starter_pack();
+            app.welcome_open = true;
+        }
         // Seed audio parameters immediately so cold power-on crackle & degauss play from frame 0.
         app.rebuild_lineup();
         app.update_audio();
@@ -1746,6 +1868,18 @@ impl CrtApp {
         }
     }
 
+    fn pick_channel_folder(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            let p_str = path.to_string_lossy().to_string();
+            if self.ch_mgr.add_name.trim().is_empty() {
+                if let Some(base) = path.file_name().and_then(|n| n.to_str()) {
+                    self.ch_mgr.add_name = base.to_string();
+                }
+            }
+            self.ch_mgr.add_path = p_str;
+        }
+    }
+
     fn pick_m3u_playlist(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("M3U / M3U8 Playlists", &["m3u", "m3u8"])
@@ -1957,12 +2091,797 @@ impl CrtApp {
         self.settings_open = true;
     }
 
+    fn render_preset_picker(&self, ui: &mut egui::Ui, id: &str, value: &mut String, width: f32) {
+        let sel_text = if value.trim().is_empty() {
+            "(Default TV look)".to_string()
+        } else {
+            value.clone()
+        };
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(&sel_text)
+            .width(width)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(value.trim().is_empty(), "(Default TV look)").clicked() {
+                    value.clear();
+                }
+                if !self.user_presets.is_empty() {
+                    ui.separator();
+                    ui.label(RichText::new("Saved presets").weak().small());
+                    for p in &self.user_presets {
+                        if ui.selectable_label(value.eq_ignore_ascii_case(&p.name), &p.name).clicked() {
+                            *value = p.name.clone();
+                        }
+                    }
+                }
+                ui.separator();
+                ui.label(RichText::new("Built-in presets").weak().small());
+                for b in settings::PRESETS {
+                    if ui.selectable_label(value.eq_ignore_ascii_case(b), b).clicked() {
+                        *value = b.to_string();
+                    }
+                }
+            });
+    }
+
+    fn channel_manager_controls(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            let add_lbl = if self.ch_mgr.add_open && self.ch_mgr.add_kind != AddChKind::BlockMix {
+                "Close Add Form"
+            } else {
+                "+ Add Channel"
+            };
+            if ui
+                .add(
+                    egui::Button::new(RichText::new(add_lbl).strong().color(Color32::from_rgb(138, 240, 178)))
+                        .selected(self.ch_mgr.add_open && self.ch_mgr.add_kind != AddChKind::BlockMix),
+                )
+                .on_hover_text("Add a live stream, YouTube Live URL, web channel, or video folder — no JSON editing needed")
+                .clicked()
+            {
+                if self.ch_mgr.add_open && self.ch_mgr.add_kind != AddChKind::BlockMix {
+                    self.ch_mgr.add_open = false;
+                } else {
+                    self.ch_mgr.add_open = true;
+                    if self.ch_mgr.add_kind == AddChKind::BlockMix {
+                        self.ch_mgr.add_kind = AddChKind::LiveStream;
+                    }
+                    self.ch_mgr.add_msg.clear();
+                }
+            }
+            let blk_open = self.ch_mgr.add_open && self.ch_mgr.add_kind == AddChKind::BlockMix;
+            if ui
+                .add(egui::Button::new("+ Create TV Block").selected(blk_open))
+                .on_hover_text("Combine multiple shows from your library into a 24/7 themed channel (e.g. Saturday Morning Cartoons)")
+                .clicked()
+            {
+                if blk_open {
+                    self.ch_mgr.add_open = false;
+                } else {
+                    self.ch_mgr.add_open = true;
+                    self.ch_mgr.add_kind = AddChKind::BlockMix;
+                    self.ch_mgr.add_msg.clear();
+                }
+            }
+            if ui
+                .button("Load Starter Pack")
+                .on_hover_text("Adds free channels (WeatherStar 4000+, PICO-8 Arcade, PuzzleScript, NHK World, DW News) without duplicating existing ones")
+                .clicked()
+            {
+                match self.channels_file.install_starter_pack() {
+                    Ok(0) => {
+                        self.ch_mgr.add_msg = "Starter channels are already in your lineup.".into();
+                    }
+                    Ok(n) => {
+                        self.rebuild_lineup();
+                        self.ch_mgr.add_msg = format!("Added {n} free starter channel{} — press G for Guide!", if n == 1 { "" } else { "s" });
+                        self.osd.show_action("STARTER PACK ADDED");
+                    }
+                    Err(e) => self.ch_mgr.add_msg = e,
+                }
+            }
+        });
+
+        if !self.ch_mgr.add_msg.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(&self.ch_mgr.add_msg).small().color(Color32::from_rgb(245, 206, 120)));
+                if ui.small_button("×").clicked() {
+                    self.ch_mgr.add_msg.clear();
+                }
+            });
+        }
+
+        // ---- Visual Add Channel / TV Block Form
+        if self.ch_mgr.add_open {
+            ui.add_space(4.0);
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(34, 31, 28))
+                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(138, 114, 78)))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for k in AddChKind::ALL {
+                            if ui.selectable_label(self.ch_mgr.add_kind == k, k.label()).clicked() {
+                                self.ch_mgr.add_kind = k;
+                                self.ch_mgr.add_msg.clear();
+                            }
+                        }
+                    });
+                    ui.separator();
+
+                    // Quick 1-click presets for Website / Arcade
+                    if self.ch_mgr.add_kind == AddChKind::WebPage {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Quick picks:").weak().small());
+                            if ui.small_button("WeatherStar 4000+").clicked() {
+                                self.ch_mgr.add_name = "WeatherStar 4000+".into();
+                                self.ch_mgr.add_callsign = "WS4K".into();
+                                self.ch_mgr.add_number = "36".into();
+                                self.ch_mgr.add_url = web_channel::WEATHERSTAR_PRESET_URL.into();
+                            }
+                            if ui.small_button("PICO-8 Arcade").clicked() {
+                                self.ch_mgr.add_name = "PICO-8 BBS Arcade".into();
+                                self.ch_mgr.add_callsign = "PICO8".into();
+                                self.ch_mgr.add_number = "70".into();
+                                self.ch_mgr.add_url = "https://www.lexaloffle.com/bbs/".into();
+                            }
+                            if ui.small_button("PuzzleScript Gallery").clicked() {
+                                self.ch_mgr.add_name = "PuzzleScript Gallery".into();
+                                self.ch_mgr.add_callsign = "PZLS".into();
+                                self.ch_mgr.add_number = "71".into();
+                                self.ch_mgr.add_url = "https://www.puzzlescript.net/Gallery/index.html".into();
+                            }
+                        });
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label("Name");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ch_mgr.add_name)
+                                .hint_text(match self.ch_mgr.add_kind {
+                                    AddChKind::LiveStream => "e.g. Tokyo Live Cam / NASA TV",
+                                    AddChKind::WebPage => "e.g. WeatherStar 4000+",
+                                    AddChKind::VideoFolder => "e.g. 90s Cartoons",
+                                    AddChKind::BlockMix => "e.g. Saturday Morning Cartoons",
+                                })
+                                .desired_width(210.0),
+                        );
+                        ui.label("Ch #");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ch_mgr.add_number)
+                                .hint_text("Auto")
+                                .desired_width(48.0),
+                        );
+                        ui.label("Tag");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ch_mgr.add_callsign)
+                                .hint_text("Auto")
+                                .desired_width(58.0),
+                        );
+                    });
+
+                    match self.ch_mgr.add_kind {
+                        AddChKind::LiveStream => {
+                            ui.horizontal(|ui| {
+                                ui.label("Stream URL");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.ch_mgr.add_url)
+                                        .hint_text("YouTube Live link or https://.../stream.m3u8")
+                                        .desired_width(340.0),
+                                );
+                            });
+                        }
+                        AddChKind::WebPage => {
+                            ui.horizontal(|ui| {
+                                ui.label("Website URL");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.ch_mgr.add_url)
+                                        .hint_text("https://4000.weatherstar.dev or any web page")
+                                        .desired_width(340.0),
+                                );
+                            });
+                        }
+                        AddChKind::VideoFolder => {
+                            ui.horizontal(|ui| {
+                                ui.label("Folder");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.ch_mgr.add_path)
+                                        .hint_text("/path/to/videos")
+                                        .desired_width(280.0),
+                                );
+                                if ui.button("Browse…").clicked() {
+                                    self.message = "pickchfolder".into();
+                                }
+                            });
+                        }
+                        AddChKind::BlockMix => {
+                            let available_shows: Vec<String> = self
+                                .lineup
+                                .iter()
+                                .filter(|c| {
+                                    c.number > 1
+                                        && matches!(c.kind, ChannelKind::Series { .. } | ChannelKind::MovieGenre { .. })
+                                })
+                                .map(|c| c.name.clone())
+                                .collect();
+                            if !available_shows.is_empty() {
+                                ui.label(RichText::new("Pick shows from your library to mix into this channel:").small().weak());
+                                egui::ScrollArea::vertical()
+                                    .id_salt("ch_mgr_block_shows")
+                                    .max_height(110.0)
+                                    .show(ui, |ui| {
+                                        for show in &available_shows {
+                                            let mut checked = self
+                                                .ch_mgr
+                                                .add_block_shows
+                                                .iter()
+                                                .any(|s| s.eq_ignore_ascii_case(show));
+                                            if ui.checkbox(&mut checked, show).changed() {
+                                                if checked {
+                                                    self.ch_mgr.add_block_shows.push(show.clone());
+                                                } else {
+                                                    self.ch_mgr
+                                                        .add_block_shows
+                                                        .retain(|s| !s.eq_ignore_ascii_case(show));
+                                                }
+                                            }
+                                        }
+                                    });
+                            } else {
+                                ui.label(
+                                    RichText::new("Tip: Connect a Local Folder, Jellyfin, or Plex first so your shows appear here, or type show names below.")
+                                        .weak()
+                                        .small(),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.ch_mgr.add_block_custom_show)
+                                        .hint_text("Or type a show name and click Add…")
+                                        .desired_width(230.0),
+                                );
+                                if ui.small_button("Add show").clicked() && !self.ch_mgr.add_block_custom_show.trim().is_empty() {
+                                    let s = std::mem::take(&mut self.ch_mgr.add_block_custom_show).trim().to_string();
+                                    if !self.ch_mgr.add_block_shows.iter().any(|x| x.eq_ignore_ascii_case(&s)) {
+                                        self.ch_mgr.add_block_shows.push(s);
+                                    }
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(&mut self.ch_mgr.add_block_shuffle, "Shuffle order")
+                                    .on_hover_text("Off = alternate shows cleanly in round-robin order");
+                                ui.checkbox(&mut self.ch_mgr.add_block_live, "24/7 Live broadcast clock")
+                                    .on_hover_text("Drop in mid-episode like real cable TV (off = play next unwatched from 0:00)");
+                                ui.checkbox(&mut self.ch_mgr.add_block_hide_sources, "Hide individual shows")
+                                    .on_hover_text("Hide the separate channels for these shows so they only appear in this block");
+                            });
+                        }
+                    }
+
+                    let mut prof_val = self.ch_mgr.add_profile.clone();
+                    ui.horizontal(|ui| {
+                        ui.label("TV Look");
+                        self.render_preset_picker(ui, "ch_mgr_add_preset", &mut prof_val, 190.0);
+                    });
+                    self.ch_mgr.add_profile = prof_val;
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new("Save Channel").strong().color(Color32::from_rgb(138, 240, 178)))
+                            .clicked()
+                        {
+                            let name = self.ch_mgr.add_name.trim().to_string();
+                            let num = self.ch_mgr.add_number.trim().parse::<u16>().ok().filter(|&n| n >= 2);
+                            let cs = self.ch_mgr.add_callsign.trim().to_string();
+                            let prof = if self.ch_mgr.add_profile.trim().is_empty() {
+                                None
+                            } else {
+                                Some(self.ch_mgr.add_profile.trim().to_string())
+                            };
+                            let mut err: Option<String> = None;
+                            let def_opt: Option<channels_file::FileChannelDef> = match self.ch_mgr.add_kind {
+                                AddChKind::LiveStream => {
+                                    let u = self.ch_mgr.add_url.trim().to_string();
+                                    if name.is_empty() || u.is_empty() {
+                                        err = Some("Enter both a channel name and a stream URL.".into());
+                                        None
+                                    } else {
+                                        Some(channels_file::FileChannelDef {
+                                            number: num,
+                                            id: String::new(),
+                                            name,
+                                            callsign: cs,
+                                            kind: "live".into(),
+                                            channel_type: "live".into(),
+                                            profile: prof,
+                                            stream_url: u,
+                                            path: String::new(),
+                                            group: "Live".into(),
+                                            genre: String::new(),
+                                            now_title: String::new(),
+                                            overview: String::new(),
+                                            artwork_url: String::new(),
+                                            is_favorite: false,
+                                            enabled: true,
+                                            items: Vec::new(),
+                                            shows: Vec::new(),
+                                            genres: Vec::new(),
+                                            mode: String::new(),
+                                            live: true,
+                                            hide_sources: false,
+                                        })
+                                    }
+                                }
+                                AddChKind::WebPage => {
+                                    let raw_u = self.ch_mgr.add_url.trim().to_string();
+                                    if name.is_empty() || raw_u.is_empty() {
+                                        err = Some("Enter both a channel name and a website URL.".into());
+                                        None
+                                    } else {
+                                        let kind = if web_channel::is_pico8_gallery_url(&raw_u) {
+                                            "pico8"
+                                        } else if web_channel::is_puzzlescript_gallery_url(&raw_u) {
+                                            "puzzlescript"
+                                        } else {
+                                            "web"
+                                        };
+                                        let u = if kind == "web" {
+                                            web_channel::ensure_web_prefix(&raw_u)
+                                        } else {
+                                            raw_u
+                                        };
+                                        Some(channels_file::FileChannelDef {
+                                            number: num,
+                                            id: String::new(),
+                                            name,
+                                            callsign: cs,
+                                            kind: kind.into(),
+                                            channel_type: "web".into(),
+                                            profile: prof,
+                                            stream_url: u,
+                                            path: String::new(),
+                                            group: "Web".into(),
+                                            genre: String::new(),
+                                            now_title: String::new(),
+                                            overview: String::new(),
+                                            artwork_url: String::new(),
+                                            is_favorite: false,
+                                            enabled: true,
+                                            items: Vec::new(),
+                                            shows: Vec::new(),
+                                            genres: Vec::new(),
+                                            mode: String::new(),
+                                            live: true,
+                                            hide_sources: false,
+                                        })
+                                    }
+                                }
+                                AddChKind::VideoFolder => {
+                                    let p = self.ch_mgr.add_path.trim().to_string();
+                                    if p.is_empty() {
+                                        err = Some("Pick or enter a folder path.".into());
+                                        None
+                                    } else {
+                                        let folder_name = if name.is_empty() {
+                                            std::path::Path::new(&p)
+                                                .file_name()
+                                                .and_then(|n| n.to_str())
+                                                .unwrap_or("Local Videos")
+                                                .to_string()
+                                        } else {
+                                            name
+                                        };
+                                        Some(channels_file::FileChannelDef {
+                                            number: num,
+                                            id: String::new(),
+                                            name: folder_name,
+                                            callsign: cs,
+                                            kind: "folder".into(),
+                                            channel_type: "series".into(),
+                                            profile: prof,
+                                            stream_url: String::new(),
+                                            path: p,
+                                            group: String::new(),
+                                            genre: String::new(),
+                                            now_title: String::new(),
+                                            overview: String::new(),
+                                            artwork_url: String::new(),
+                                            is_favorite: false,
+                                            enabled: true,
+                                            items: Vec::new(),
+                                            shows: Vec::new(),
+                                            genres: Vec::new(),
+                                            mode: String::new(),
+                                            live: true,
+                                            hide_sources: false,
+                                        })
+                                    }
+                                }
+                                AddChKind::BlockMix => {
+                                    if name.is_empty() || self.ch_mgr.add_block_shows.is_empty() {
+                                        err = Some("Give the block a name and select at least one show.".into());
+                                        None
+                                    } else {
+                                        Some(channels_file::FileChannelDef {
+                                            number: num,
+                                            id: String::new(),
+                                            name,
+                                            callsign: cs,
+                                            kind: "block".into(),
+                                            channel_type: "series".into(),
+                                            profile: prof,
+                                            stream_url: String::new(),
+                                            path: String::new(),
+                                            group: "Blocks".into(),
+                                            genre: String::new(),
+                                            now_title: String::new(),
+                                            overview: String::new(),
+                                            artwork_url: String::new(),
+                                            is_favorite: false,
+                                            enabled: true,
+                                            items: Vec::new(),
+                                            shows: self.ch_mgr.add_block_shows.clone(),
+                                            genres: Vec::new(),
+                                            mode: if self.ch_mgr.add_block_shuffle { "shuffle" } else { "alternate" }.into(),
+                                            live: self.ch_mgr.add_block_live,
+                                            hide_sources: self.ch_mgr.add_block_hide_sources,
+                                        })
+                                    }
+                                }
+                            };
+                            if let Some(e) = err {
+                                self.ch_mgr.add_msg = e;
+                            } else if let Some(def) = def_opt {
+                                match self.channels_file.upsert_inline_channel(None, def) {
+                                    Ok(()) => {
+                                        self.rebuild_lineup();
+                                        self.osd.show_action("CHANNEL ADDED");
+                                        self.ch_mgr.add_open = false;
+                                        self.ch_mgr.add_name.clear();
+                                        self.ch_mgr.add_callsign.clear();
+                                        self.ch_mgr.add_number.clear();
+                                        self.ch_mgr.add_url.clear();
+                                        self.ch_mgr.add_path.clear();
+                                        self.ch_mgr.add_profile.clear();
+                                        self.ch_mgr.add_block_shows.clear();
+                                        self.ch_mgr.add_msg = "Channel added to your lineup!".into();
+                                    }
+                                    Err(e) => self.ch_mgr.add_msg = e,
+                                }
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.ch_mgr.add_open = false;
+                        }
+                    });
+                });
+        }
+
+        // ---- Visual Channel Lineup Manager (Pin #, Rename, Assign TV Look, Hide/Unhide)
+        let ch_count = self.lineup.iter().filter(|c| c.number > 1).count();
+        let hidden_count = self.channels_file.cfg.overrides.iter().filter(|r| r.hidden).count();
+        let mgr_hdr = if hidden_count > 0 {
+            format!("Manage Channel Lineup ({ch_count} active · {hidden_count} hidden)")
+        } else {
+            format!("Manage Channel Lineup ({ch_count} channels)")
+        };
+        egui::CollapsingHeader::new(RichText::new(mgr_hdr).strong().small())
+            .id_salt("src_channel_manager")
+            .default_open(ch_count > 0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ch_mgr.search)
+                            .hint_text("Filter channels…")
+                            .desired_width(200.0),
+                    );
+                    if !self.ch_mgr.search.is_empty() && ui.small_button("×").clicked() {
+                        self.ch_mgr.search.clear();
+                    }
+                    if hidden_count > 0 {
+                        ui.checkbox(&mut self.ch_mgr.show_hidden, format!("Show hidden ({hidden_count})"));
+                    }
+                });
+
+                let q = self.ch_mgr.search.trim().to_ascii_lowercase();
+                let channels_snap: Vec<Channel> = self
+                    .lineup
+                    .iter()
+                    .filter(|c| c.number > 1)
+                    .filter(|c| {
+                        q.is_empty()
+                            || c.name.to_ascii_lowercase().contains(&q)
+                            || c.callsign.to_ascii_lowercase().contains(&q)
+                            || format!("{:02}", c.number).contains(&q)
+                    })
+                    .cloned()
+                    .collect();
+
+                let mut tune_req: Option<u16> = None;
+                let mut hide_req: Option<(String, String)> = None;
+                let mut unhide_req: Option<(String, String)> = None;
+                let mut save_edit = false;
+                let mut delete_inline_req: Option<usize> = None;
+
+                egui::ScrollArea::vertical()
+                    .id_salt("ch_mgr_list_scroll")
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        if channels_snap.is_empty() {
+                            ui.label(
+                                RichText::new("No channels yet. Click \"+ Add Channel\" or \"Load Starter Pack\" above, or connect a source below.")
+                                    .weak()
+                                    .small(),
+                            );
+                        }
+                        for ch in &channels_snap {
+                            let row_key = format!("{}:{}", ch.provider_id, ch.source_key);
+                            let is_editing = self.ch_mgr.edit_key.as_deref() == Some(row_key.as_str());
+                            let badge = provider::source_badge(&ch.provider_id);
+
+                            // Find matching inline channels.json index (if this channel comes from channels.json)
+                            let inline_idx = if ch.provider_id == "channels" {
+                                self.channels_file.cfg.channels.iter().enumerate().position(|(idx, def)| {
+                                    let expected_id = if def.id.trim().is_empty() {
+                                        format!("cfg:{idx}:{}", if def.name.trim().is_empty() { "ch" } else { def.name.trim() })
+                                    } else {
+                                        format!("cfg:{}", def.id.trim())
+                                    };
+                                    let block_id = format!("block:{idx}:{}", def.name.trim());
+                                    ch.source_key == expected_id
+                                        || ch.source_key == block_id
+                                        || def.name.eq_ignore_ascii_case(&ch.name)
+                                })
+                            } else {
+                                None
+                            };
+
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("CH {:02}", ch.number))
+                                        .monospace()
+                                        .strong()
+                                        .small()
+                                        .color(Color32::from_rgb(242, 198, 108)),
+                                );
+                                ui.label(RichText::new(format!("{:<5}", ch.callsign)).monospace().small().weak());
+                                ui.label(RichText::new(&ch.name).small());
+                                ui.label(RichText::new(format!("[{badge}]")).small().weak());
+                                if let Some(ref prof) = ch.profile_override {
+                                    ui.label(
+                                        RichText::new(format!("· {prof}"))
+                                            .small()
+                                            .color(Color32::from_rgb(138, 220, 238)),
+                                    );
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui
+                                        .small_button("Hide")
+                                        .on_hover_text("Hide this channel from your Guide")
+                                        .clicked()
+                                    {
+                                        hide_req = Some((ch.source_key.clone(), ch.provider_id.clone()));
+                                    }
+                                    if ui
+                                        .add(egui::Button::new(if is_editing { "Close" } else { "Edit" }).selected(is_editing).small())
+                                        .on_hover_text("Pin channel #, rename, or pick a TV preset for this channel")
+                                        .clicked()
+                                    {
+                                        if is_editing {
+                                            self.ch_mgr.edit_key = None;
+                                        } else {
+                                            self.ch_mgr.edit_key = Some(row_key.clone());
+                                            self.ch_mgr.edit_inline_idx = inline_idx;
+                                            self.ch_mgr.edit_match_text = ch.source_key.clone();
+                                            self.ch_mgr.edit_provider = ch.provider_id.clone();
+                                            if let Some(i) = inline_idx {
+                                                let def = &self.channels_file.cfg.channels[i];
+                                                self.ch_mgr.edit_number = def.number.map(|n| n.to_string()).unwrap_or_default();
+                                                self.ch_mgr.edit_name = def.name.clone();
+                                                self.ch_mgr.edit_callsign = def.callsign.clone();
+                                                self.ch_mgr.edit_profile = def.profile.clone().unwrap_or_default();
+                                                self.ch_mgr.edit_url = def.stream_url.clone();
+                                                self.ch_mgr.edit_path = def.path.clone();
+                                                self.ch_mgr.edit_hidden = !def.enabled;
+                                            } else {
+                                                let existing_ov = self
+                                                    .channels_file
+                                                    .find_override(&ch.source_key, &ch.provider_id)
+                                                    .cloned();
+                                                self.ch_mgr.edit_number = existing_ov
+                                                    .as_ref()
+                                                    .and_then(|o| o.number)
+                                                    .map(|n| n.to_string())
+                                                    .unwrap_or_default();
+                                                self.ch_mgr.edit_name = existing_ov
+                                                    .as_ref()
+                                                    .and_then(|o| o.name.clone())
+                                                    .unwrap_or_else(|| ch.name.clone());
+                                                self.ch_mgr.edit_callsign = existing_ov
+                                                    .as_ref()
+                                                    .and_then(|o| o.callsign.clone())
+                                                    .unwrap_or_else(|| ch.callsign.clone());
+                                                self.ch_mgr.edit_profile = existing_ov
+                                                    .as_ref()
+                                                    .and_then(|o| o.profile.clone())
+                                                    .or_else(|| ch.profile_override.clone())
+                                                    .unwrap_or_default();
+                                                self.ch_mgr.edit_url.clear();
+                                                self.ch_mgr.edit_path.clear();
+                                                self.ch_mgr.edit_hidden = existing_ov.as_ref().is_some_and(|o| o.hidden);
+                                            }
+                                        }
+                                    }
+                                    if ui.small_button("Tune").clicked() {
+                                        tune_req = Some(ch.number);
+                                    }
+                                });
+                            });
+
+                            if is_editing {
+                                egui::Frame::group(ui.style())
+                                    .fill(Color32::from_rgb(36, 33, 30))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Ch #");
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.ch_mgr.edit_number)
+                                                    .hint_text("Auto")
+                                                    .desired_width(48.0),
+                                            );
+                                            ui.label("Name");
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.ch_mgr.edit_name)
+                                                    .desired_width(175.0),
+                                            );
+                                            ui.label("Tag");
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.ch_mgr.edit_callsign)
+                                                    .desired_width(54.0),
+                                            );
+                                        });
+                                        if self.ch_mgr.edit_inline_idx.is_some() {
+                                            if !self.ch_mgr.edit_url.is_empty() {
+                                                ui.horizontal(|ui| {
+                                                    ui.label("URL");
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(&mut self.ch_mgr.edit_url)
+                                                            .desired_width(330.0),
+                                                    );
+                                                });
+                                            }
+                                            if !self.ch_mgr.edit_path.is_empty() {
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Folder");
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(&mut self.ch_mgr.edit_path)
+                                                            .desired_width(320.0),
+                                                    );
+                                                });
+                                            }
+                                        }
+                                        let mut edit_prof = self.ch_mgr.edit_profile.clone();
+                                        ui.horizontal(|ui| {
+                                            ui.label("TV Look");
+                                            self.render_preset_picker(ui, "ch_mgr_edit_preset", &mut edit_prof, 185.0);
+                                            if ui
+                                                .button(RichText::new("Save").strong().color(Color32::from_rgb(138, 240, 178)))
+                                                .clicked()
+                                            {
+                                                save_edit = true;
+                                            }
+                                            if let Some(i) = self.ch_mgr.edit_inline_idx {
+                                                if ui
+                                                    .button(RichText::new("Delete").color(Color32::from_rgb(242, 132, 120)))
+                                                    .clicked()
+                                                {
+                                                    delete_inline_req = Some(i);
+                                                }
+                                            }
+                                        });
+                                        self.ch_mgr.edit_profile = edit_prof;
+                                    });
+                            }
+                        }
+
+                        if self.ch_mgr.show_hidden && hidden_count > 0 {
+                            ui.separator();
+                            ui.label(RichText::new("Hidden channels").weak().small().strong());
+                            let hidden_rules: Vec<(String, String)> = self
+                                .channels_file
+                                .cfg
+                                .overrides
+                                .iter()
+                                .filter(|r| r.hidden)
+                                .map(|r| (r.match_text.clone(), r.provider.clone()))
+                                .collect();
+                            for (m, p) in hidden_rules {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("{m}  [{p}]")).weak().small());
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("Unhide").clicked() {
+                                            unhide_req = Some((m, p));
+                                        }
+                                    });
+                                });
+                            }
+                        }
+                    });
+
+                if let Some(n) = tune_req {
+                    self.tune_channel(n);
+                }
+                if let Some((m, p)) = hide_req {
+                    let _ = self.channels_file.set_channel_hidden(&m, &p, true);
+                    self.rebuild_lineup();
+                    self.osd.show_action("CHANNEL HIDDEN");
+                }
+                if let Some((m, p)) = unhide_req {
+                    let _ = self.channels_file.set_channel_hidden(&m, &p, false);
+                    self.rebuild_lineup();
+                    self.osd.show_action("CHANNEL RESTORED");
+                }
+                if let Some(idx) = delete_inline_req {
+                    let _ = self.channels_file.remove_inline_channel(idx);
+                    self.ch_mgr.edit_key = None;
+                    self.rebuild_lineup();
+                    self.osd.show_action("CHANNEL REMOVED");
+                }
+                if save_edit {
+                    let num = self.ch_mgr.edit_number.trim().parse::<u16>().ok().filter(|&n| n >= 2);
+                    let prof = if self.ch_mgr.edit_profile.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.ch_mgr.edit_profile.trim().to_string())
+                    };
+                    if let Some(idx) = self.ch_mgr.edit_inline_idx {
+                        if let Some(mut def) = self.channels_file.cfg.channels.get(idx).cloned() {
+                            def.number = num;
+                            if !self.ch_mgr.edit_name.trim().is_empty() {
+                                def.name = self.ch_mgr.edit_name.trim().to_string();
+                            }
+                            def.callsign = self.ch_mgr.edit_callsign.trim().to_string();
+                            def.profile = prof;
+                            if !self.ch_mgr.edit_url.trim().is_empty() {
+                                def.stream_url = self.ch_mgr.edit_url.trim().to_string();
+                            }
+                            if !self.ch_mgr.edit_path.trim().is_empty() {
+                                def.path = self.ch_mgr.edit_path.trim().to_string();
+                            }
+                            let _ = self.channels_file.upsert_inline_channel(Some(idx), def);
+                        }
+                    } else {
+                        let rule = channels_file::ChannelOverride {
+                            match_text: self.ch_mgr.edit_match_text.clone(),
+                            provider: self.ch_mgr.edit_provider.clone(),
+                            kind: String::new(),
+                            number: num,
+                            name: (!self.ch_mgr.edit_name.trim().is_empty())
+                                .then(|| self.ch_mgr.edit_name.trim().to_string()),
+                            callsign: (!self.ch_mgr.edit_callsign.trim().is_empty())
+                                .then(|| self.ch_mgr.edit_callsign.trim().to_string()),
+                            channel_type: None,
+                            profile: prof,
+                            favorite: None,
+                            hidden: self.ch_mgr.edit_hidden,
+                        };
+                        let _ = self.channels_file.upsert_override(rule);
+                    }
+                    self.ch_mgr.edit_key = None;
+                    self.rebuild_lineup();
+                    self.osd.show_action("CHANNEL SAVED");
+                }
+            });
+        ui.separator();
+    }
+
     fn channels_sources_controls(&mut self, ui: &mut egui::Ui) {
         ui.label(
-            RichText::new("Combine Jellyfin, Plex, nested local folders, M3U8 live streams, live web pages, and custom integrators into one 90s Prevue Cable Guide.")
+            RichText::new("Build your cable lineup from local video folders, Jellyfin, Plex, free live streams, and interactive web channels.")
                 .weak()
                 .small(),
         );
+        self.channel_manager_controls(ui);
 
         // ---- Unified Guide & On-Air controls (shown whenever any source has channels)
         if self.has_channels() {
@@ -2171,16 +3090,16 @@ impl CrtApp {
                     ui.separator();
                 }
 
-                // ---- Editable channels.json & Channel Type -> TV Profile Automation
+                // ---- Editable channels.json & Channel Type -> TV Profile Automation (collapsed by default for laypeople)
                 let tp_count = self.channels_file.cfg.type_profiles.values().filter(|v| !v.trim().is_empty()).count();
-                let cf_hdr = if tp_count > 0 || self.channels_file.file_exists {
-                    format!("channels.json & TV Profiles ({tp_count} auto)")
+                let cf_hdr = if tp_count > 0 {
+                    format!("Advanced: Auto TV Profiles & channels.json ({tp_count} auto)")
                 } else {
-                    "channels.json & TV Profiles".to_string()
+                    "Advanced: Auto TV Profiles & channels.json".to_string()
                 };
                 egui::CollapsingHeader::new(RichText::new(cf_hdr).strong().small())
                     .id_salt("src_channels_file")
-                    .default_open(self.channels_file.file_exists || tp_count > 0)
+                    .default_open(false)
                     .show(ui, |ui| {
                         ui.label(
                             RichText::new("Auto-switch TV presets by channel type (e.g. series -> Broadcast, movies -> VHS) and pin/define/override channels in channels.json (auto-reloads on save).")
@@ -2345,6 +3264,17 @@ impl CrtApp {
                                 if ui.small_button("Copy path").clicked() {
                                     ui.ctx().copy_text(path.display().to_string());
                                     self.channels_file_msg = "Copied channels.json path.".into();
+                                }
+                                if ui
+                                    .small_button("Open Config Folder")
+                                    .on_hover_text("Open ViCTR's config folder in your file manager")
+                                    .clicked()
+                                {
+                                    if let Some(dir) = path.parent() {
+                                        if let Err(e) = crate::sys_check::open_path_in_file_manager(dir) {
+                                            self.channels_file_msg = e;
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -4368,6 +5298,75 @@ impl CrtApp {
             });
     }
 
+    fn system_check_controls(&mut self, ui: &mut egui::Ui) {
+        let (ready, opt, missing) = self.sys_check.summary_counts();
+        let hdr = if missing > 0 {
+            format!("System Check ({ready} ready · {missing} missing)")
+        } else if opt > 0 {
+            format!("System Check ({ready} ready · {opt} optional)")
+        } else {
+            format!("System Check (All {ready} ready)")
+        };
+        egui::CollapsingHeader::new(RichText::new(hdr).strong())
+            .id_salt("system_check_section")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Optional helper tools that power video playback, YouTube/web channels, retro cores, and sound.")
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(4.0);
+                for it in &self.sys_check.items {
+                    let (dot, col) = match it.level {
+                        crate::sys_check::CheckLevel::Ready => ("●", Color32::from_rgb(112, 236, 172)),
+                        crate::sys_check::CheckLevel::Optional => ("●", Color32::from_rgb(244, 198, 102)),
+                        crate::sys_check::CheckLevel::Missing => ("●", Color32::from_rgb(246, 118, 106)),
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(dot).color(col).strong());
+                        ui.label(RichText::new(it.label).strong().small());
+                        ui.label(RichText::new("—").weak().small());
+                        ui.label(RichText::new(&it.detail).small().color(col));
+                    });
+                    if !it.hint.is_empty() {
+                        ui.indent(format!("syscheck_hint_{}", it.label), |ui| {
+                            ui.label(RichText::new(it.hint).weak().small());
+                        });
+                    }
+                }
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.small_button("Re-check").clicked() {
+                        self.retro.rescan();
+                        self.sys_check = crate::sys_check::SystemCheck::run(self.retro.cores.len());
+                        self.sys_check_msg = "System check refreshed.".into();
+                    }
+                    if let Some(dir) = settings::config_dir() {
+                        if ui
+                            .small_button("Open Config Folder")
+                            .on_hover_text(format!("Open {}", dir.display()))
+                            .clicked()
+                        {
+                            match crate::sys_check::open_path_in_file_manager(&dir) {
+                                Ok(()) => self.sys_check_msg.clear(),
+                                Err(e) => self.sys_check_msg = e,
+                            }
+                        }
+                    }
+                    if ui.small_button("Welcome & Setup…").clicked() {
+                        self.welcome_open = true;
+                    }
+                    if ui.small_button("TV Remote (?)").clicked() {
+                        self.remote_open = !self.remote_open;
+                    }
+                });
+                if !self.sys_check_msg.is_empty() {
+                    ui.label(RichText::new(&self.sys_check_msg).small().color(Color32::from_rgb(235, 175, 100)));
+                }
+            });
+    }
+
     fn about_controls(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new(RichText::new("About ViCTR").strong())
             .default_open(false)
@@ -4671,6 +5670,25 @@ impl CrtApp {
                     if !self.fullscreen && ui.small_button("Fullscreen").clicked() {
                         self.set_fullscreen(true);
                     }
+                    let rem_lbl = if self.remote_open {
+                        RichText::new("Remote (?)").color(Color32::from_rgb(138, 240, 178)).strong()
+                    } else {
+                        RichText::new("Remote (?)")
+                    };
+                    if ui
+                        .add(egui::Button::new(rem_lbl).selected(self.remote_open).small())
+                        .on_hover_text("Open the clickable retro TV remote & keyboard shortcut reference (?)")
+                        .clicked()
+                    {
+                        self.remote_open = !self.remote_open;
+                    }
+                    if ui
+                        .small_button("Setup…")
+                        .on_hover_text("Open the Welcome & Quick Setup Guide")
+                        .clicked()
+                    {
+                        self.welcome_open = true;
+                    }
                 });
 
                 ui.add_space(4.0);
@@ -4808,6 +5826,7 @@ impl CrtApp {
                     && self.message != "pick"
                     && self.message != "pickvideo"
                     && self.message != "pickfolder"
+                    && self.message != "pickchfolder"
                     && self.message != "pickm3u"
                     && self.message != "pickrom"
                     && self.message != "pickromdir"
@@ -4819,7 +5838,7 @@ impl CrtApp {
 
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new("Scroll to zoom · Drag to pan · Double-click to reset · G: Guide · Shift+Z: 4:3 Crop · Ctrl+1: 1:1.")
+                    RichText::new("Scroll: zoom · Drag: pan · G: Guide · ?: Remote · Shift+Z: 4:3 Crop · Ctrl+1: 1:1.")
                         .weak()
                         .small(),
                 );
@@ -4882,6 +5901,7 @@ impl CrtApp {
                             }
                             SettingsTab::Sound => {
                                 self.sound_controls(ui);
+                                self.system_check_controls(ui);
                                 self.about_controls(ui);
                             }
                         }
@@ -4890,6 +5910,614 @@ impl CrtApp {
             });
         self.settings_rect = win_resp.map(|r| r.response.rect);
         self.settings_open = open;
+    }
+
+    fn dismiss_welcome(&mut self) {
+        self.welcome_open = false;
+        self.welcome_rect = None;
+        if !self.app_cfg.welcome_dismissed {
+            self.app_cfg.welcome_dismissed = true;
+            let _ = settings::save_app_config(&self.app_cfg);
+        }
+    }
+
+    fn toggle_current_favorite(&mut self) {
+        if self.guide.active {
+            if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
+                if let Some(item) = self.guide_picker_items(pch_num).get(sel_idx).cloned() {
+                    self.toggle_favorite_item(&item.id, &item.short_label());
+                }
+            } else if let Some(ch) = self.guide_visible_channels().get(self.guide.selected_idx).cloned().cloned() {
+                if ch.number > 1 {
+                    self.toggle_favorite_channel(&ch);
+                }
+            }
+        } else if let Some(w) = self.active_watch.clone() {
+            if !w.item_id.is_empty() {
+                self.toggle_favorite_item(&w.item_id, &w.title);
+            } else if let Some(ch) = self.channel_by_number(w.channel_number).cloned() {
+                self.toggle_favorite_channel(&ch);
+            }
+        } else if let Some(ch) = self.current_channel.and_then(|n| self.channel_by_number(n).cloned()) {
+            if ch.number > 1 {
+                self.toggle_favorite_channel(&ch);
+            }
+        }
+    }
+
+    fn show_welcome_window(&mut self, ctx: &egui::Context) {
+        if !self.welcome_open {
+            self.welcome_rect = None;
+            return;
+        }
+        let mut open = self.welcome_open;
+        let mut action: Option<&'static str> = None;
+        let win_resp = egui::Window::new("Welcome to ViCTR")
+            .id(egui::Id::unique("victr_welcome_win"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_width(500.0);
+                ui.label(
+                    RichText::new("Your virtual CRT television receiver")
+                        .strong()
+                        .size(16.0)
+                        .color(Color32::from_rgb(245, 204, 118)),
+                );
+                ui.label(
+                    RichText::new("Flip through free starter channels right away, drag-and-drop any video, picture, or ROM onto the screen, or connect your own library below.")
+                        .small(),
+                );
+                ui.add_space(10.0);
+
+                // 4 friendly quick-start cards in a 2x2 grid
+                egui::Grid::new("welcome_cards_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 10.0])
+                    .show(ui, |ui| {
+                        let card_w = 236.0;
+                        let card = |ui: &mut egui::Ui,
+                                    title: &str,
+                                    desc: &str,
+                                    btn: &str,
+                                    accent: Color32|
+                         -> bool {
+                            let mut clicked = false;
+                            egui::Frame::group(ui.style())
+                                .fill(Color32::from_rgb(35, 32, 28))
+                                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(108, 92, 68)))
+                                .show(ui, |ui| {
+                                    ui.set_width(card_w);
+                                    ui.set_min_height(88.0);
+                                    ui.label(RichText::new(title).strong().color(accent));
+                                    ui.label(RichText::new(desc).weak().small());
+                                    ui.add_space(6.0);
+                                    if ui.button(btn).clicked() {
+                                        clicked = true;
+                                    }
+                                });
+                            clicked
+                        };
+
+                        if card(
+                            ui,
+                            "1. Start Flipping Channels",
+                            "Open the 90s Cable Guide with free WeatherStar, PICO-8 Arcade, PuzzleScript & live news.",
+                            "Open Cable Guide (G)",
+                            Color32::from_rgb(138, 240, 178),
+                        ) {
+                            action = Some("guide");
+                        }
+                        if card(
+                            ui,
+                            "2. Add a Video Folder",
+                            "Point at a folder of TV shows or movies on your computer — turns into channels automatically.",
+                            "Pick Video Folder…",
+                            Color32::from_rgb(245, 204, 118),
+                        ) {
+                            action = Some("folder");
+                        }
+                        ui.end_row();
+
+                        if card(
+                            ui,
+                            "3. Connect Jellyfin / Plex",
+                            "Sign in to Jellyfin or Plex, add YouTube/live streams, or build custom TV blocks visually.",
+                            "Open Channel Manager…",
+                            Color32::from_rgb(142, 212, 245),
+                        ) {
+                            action = Some("channels");
+                        }
+                        if card(
+                            ui,
+                            "4. Play Retro Games",
+                            "Run NES, SNES, GBA, Genesis, or Arcade ROMs directly on CH 03 with gamepad support.",
+                            "Open Games & Consoles…",
+                            Color32::from_rgb(236, 162, 128),
+                        ) {
+                            action = Some("games");
+                        }
+                        ui.end_row();
+                    });
+
+                ui.add_space(10.0);
+                // Compact System Check strip
+                egui::Frame::group(ui.style())
+                    .fill(Color32::from_rgb(28, 26, 23))
+                    .show(ui, |ui| {
+                        ui.set_width(484.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("System:").strong().small());
+                            for it in &self.sys_check.items {
+                                let col = match it.level {
+                                    crate::sys_check::CheckLevel::Ready => Color32::from_rgb(112, 236, 172),
+                                    crate::sys_check::CheckLevel::Optional => Color32::from_rgb(244, 198, 102),
+                                    crate::sys_check::CheckLevel::Missing => Color32::from_rgb(246, 118, 106),
+                                };
+                                let short = match it.label {
+                                    "Video Playback" => "Video",
+                                    "YouTube & Web Streams" => "Streams",
+                                    "Web & Arcade Channels" => "Web",
+                                    "Retro Console (CH 03)" => "Retro",
+                                    "Analog TV Sound DSP" => "Audio",
+                                    _ => "Capture",
+                                };
+                                let resp = ui.label(RichText::new(format!("● {short}")).small().color(col));
+                                let tip = if it.hint.is_empty() {
+                                    format!("{}: {}", it.label, it.detail)
+                                } else {
+                                    format!("{}: {}\n{}", it.label, it.detail, it.hint)
+                                };
+                                resp.on_hover_text(tip);
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("Details…").clicked() {
+                                    action = Some("syscheck");
+                                }
+                            });
+                        });
+                    });
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Handy keys:  G Guide  ·  ? Clickable Remote  ·  E Episodes  ·  Shift+Z 4:3 Crop  ·  Ctrl+1 1:1  ·  F11 Fullscreen")
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Open Clickable Remote (?)").clicked() {
+                        action = Some("remote");
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button(RichText::new("Start Watching").strong().color(Color32::from_rgb(245, 204, 118)))
+                            .clicked()
+                        {
+                            action = Some("dismiss");
+                        }
+                    });
+                });
+            });
+        self.welcome_rect = win_resp.map(|r| r.response.rect);
+        if !open {
+            self.dismiss_welcome();
+        }
+        if let Some(act) = action {
+            self.dismiss_welcome();
+            match act {
+                "guide" => {
+                    if !self.has_channels() {
+                        let _ = self.channels_file.install_starter_pack();
+                        self.rebuild_lineup();
+                    }
+                    if !self.guide.active {
+                        self.toggle_guide();
+                    }
+                }
+                "folder" => {
+                    self.open_settings_tab(SettingsTab::Channels);
+                    self.message = "pickfolder".into();
+                }
+                "channels" => {
+                    self.open_settings_tab(SettingsTab::Channels);
+                }
+                "games" => {
+                    self.open_settings_tab(SettingsTab::Games);
+                }
+                "syscheck" => {
+                    self.open_settings_tab(SettingsTab::Sound);
+                }
+                "remote" => {
+                    self.remote_open = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn show_remote_window(&mut self, ctx: &egui::Context) {
+        if !self.remote_open {
+            self.remote_rect = None;
+            return;
+        }
+        let mut open = self.remote_open;
+        let win_resp = egui::Window::new("TV Remote  (?)")
+            .id(egui::Id::unique("victr_remote_win"))
+            .open(&mut open)
+            .collapsible(true)
+            .resizable(false)
+            .default_pos([26.0, 72.0])
+            .show(ctx, |ui| {
+                ui.set_width(214.0);
+
+                // Top power / mute / info row
+                ui.horizontal(|ui| {
+                    let pwr_col = if self.sim.power_on {
+                        Color32::from_rgb(248, 122, 112)
+                    } else {
+                        Color32::from_rgb(138, 240, 178)
+                    };
+                    if ui
+                        .add_sized([66.0, 26.0], egui::Button::new(RichText::new("POWER").strong().small().color(pwr_col)))
+                        .on_hover_text("Toggle CRT television power")
+                        .clicked()
+                    {
+                        let on = !self.sim.power_on;
+                        self.sim.set_power(on);
+                    }
+                    if ui
+                        .add_sized([66.0, 26.0], egui::Button::new(RichText::new("MUTE").small()).selected(self.muted))
+                        .on_hover_text("Mute / unmute audio (M)")
+                        .clicked()
+                    {
+                        self.toggle_mute();
+                    }
+                    if ui
+                        .add_sized([66.0, 26.0], egui::Button::new(RichText::new("INFO").small()))
+                        .on_hover_text("Show channel & program OSD banner (I)")
+                        .clicked()
+                    {
+                        self.show_info_osd();
+                    }
+                });
+
+                ui.add_space(5.0);
+
+                // 0-9 Numeric Channel Keypad + Star Favorite + OK
+                let rows: [[(&str, &str); 3]; 4] = [
+                    [("1", "1"), ("2", "2"), ("3", "3")],
+                    [("4", "4"), ("5", "5"), ("6", "6")],
+                    [("7", "7"), ("8", "8"), ("9", "9")],
+                    [("★ *", "star"), ("0", "0"), ("OK", "ok")],
+                ];
+                for row in rows {
+                    ui.horizontal(|ui| {
+                        for (lbl, code) in row {
+                            let tip = match code {
+                                "star" => "Toggle favorite on current channel or episode (*)",
+                                "ok" => "Tune entered channel or select highlighted item (Enter)",
+                                _ => "Dial channel number (0-9)",
+                            };
+                            if ui
+                                .add_sized([66.0, 24.0], egui::Button::new(RichText::new(lbl).monospace().strong()))
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                match code {
+                                    "star" => self.toggle_current_favorite(),
+                                    "ok" => {
+                                        if let Some(ch_num) = self.osd.commit_digits() {
+                                            self.tune_channel(ch_num);
+                                        } else if self.guide.active {
+                                            if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
+                                                if let Some(item) = self.guide_picker_items(pch_num).get(sel_idx).cloned() {
+                                                    self.tune_specific(pch_num, item, false);
+                                                }
+                                            } else if let Some(n) = self
+                                                .guide_visible_channels()
+                                                .get(self.guide.selected_idx)
+                                                .map(|c| c.number)
+                                            {
+                                                if n == 1 {
+                                                    self.toggle_guide();
+                                                } else {
+                                                    self.tune_channel(n);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    d => {
+                                        if let Some(ch) = d.chars().next() {
+                                            if let Some(ch_num) = self.osd.push_digit(ch) {
+                                                self.tune_channel(ch_num);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                ui.add_space(5.0);
+                ui.separator();
+
+                // Guide / Episodes / Search strip
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized([66.0, 25.0], egui::Button::new(RichText::new("GUIDE").strong().small()).selected(self.guide.active))
+                        .on_hover_text("Toggle 90s Prevue Cable Guide (G)")
+                        .clicked()
+                    {
+                        self.toggle_guide();
+                    }
+                    if ui
+                        .add_sized([66.0, 25.0], egui::Button::new(RichText::new("LIST").small()))
+                        .on_hover_text("Browse episodes, movies, or games on this channel (E)")
+                        .clicked()
+                    {
+                        if self.guide.active {
+                            if self.guide.picker_channel().is_some() {
+                                self.guide.close_picker();
+                            } else if let Some(n) = self
+                                .guide_visible_channels()
+                                .get(self.guide.selected_idx)
+                                .map(|c| c.number)
+                                .filter(|&n| n > 1)
+                            {
+                                self.open_episode_picker(n);
+                            }
+                        } else if let Some(cur) = self.current_channel.filter(|&n| n > 1) {
+                            self.open_episode_picker(cur);
+                        }
+                    }
+                    if ui
+                        .add_sized([66.0, 25.0], egui::Button::new(RichText::new("FIND /").small()))
+                        .on_hover_text("Search channels or episodes in the Guide (/)")
+                        .clicked()
+                    {
+                        if !self.guide.active {
+                            self.toggle_guide();
+                        }
+                        self.guide.start_search();
+                    }
+                });
+
+                ui.add_space(4.0);
+
+                // VOL / D-Pad / CH rocker block
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        if ui
+                            .add_sized([54.0, 26.0], egui::Button::new(RichText::new("VOL +").small()))
+                            .on_hover_text("Volume up (+)")
+                            .clicked()
+                        {
+                            self.adjust_volume(0.05);
+                        }
+                        if ui
+                            .add_sized([54.0, 26.0], egui::Button::new(RichText::new("VOL -").small()))
+                            .on_hover_text("Volume down (-)")
+                            .clicked()
+                        {
+                            self.adjust_volume(-0.05);
+                        }
+                    });
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.add_space(28.0);
+                            if ui
+                                .add_sized([28.0, 22.0], egui::Button::new("▲"))
+                                .on_hover_text("Guide Up / Skip +60s")
+                                .clicked()
+                            {
+                                if self.guide.active {
+                                    if let Some((pch, _)) = self.guide.picker_selected() {
+                                        let len = self.guide_picker_items(pch).len();
+                                        self.guide.picker_move(-1, len);
+                                    } else {
+                                        let len = self.guide_visible_channels().len();
+                                        self.guide.move_selection(-1, len);
+                                    }
+                                } else {
+                                    self.seek_video_rel(60.0);
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_sized([28.0, 22.0], egui::Button::new("◄"))
+                                .on_hover_text("Guide Left / Prev Season / -5s")
+                                .clicked()
+                            {
+                                if self.guide.active {
+                                    if let Some((pch, _)) = self.guide.picker_selected() {
+                                        let items = self.guide_picker_items(pch);
+                                        self.guide.picker_jump_season(-1, &items);
+                                    } else {
+                                        self.guide.shift_time(-1);
+                                    }
+                                } else {
+                                    self.seek_video_rel(-5.0);
+                                }
+                            }
+                            if ui
+                                .add_sized([28.0, 22.0], egui::Button::new("▼"))
+                                .on_hover_text("Guide Down / Skip -60s")
+                                .clicked()
+                            {
+                                if self.guide.active {
+                                    if let Some((pch, _)) = self.guide.picker_selected() {
+                                        let len = self.guide_picker_items(pch).len();
+                                        self.guide.picker_move(1, len);
+                                    } else {
+                                        let len = self.guide_visible_channels().len();
+                                        self.guide.move_selection(1, len);
+                                    }
+                                } else {
+                                    self.seek_video_rel(-60.0);
+                                }
+                            }
+                            if ui
+                                .add_sized([28.0, 22.0], egui::Button::new("►"))
+                                .on_hover_text("Guide Right / Next Season / +5s")
+                                .clicked()
+                            {
+                                if self.guide.active {
+                                    if let Some((pch, _)) = self.guide.picker_selected() {
+                                        let items = self.guide_picker_items(pch);
+                                        self.guide.picker_jump_season(1, &items);
+                                    } else {
+                                        self.guide.shift_time(1);
+                                    }
+                                } else {
+                                    self.seek_video_rel(5.0);
+                                }
+                            }
+                        });
+                    });
+                    ui.vertical(|ui| {
+                        if ui
+                            .add_sized([54.0, 26.0], egui::Button::new(RichText::new("CH +").small()))
+                            .on_hover_text("Next channel (PgUp or ])")
+                            .clicked()
+                        {
+                            self.surf_channel(1);
+                        }
+                        if ui
+                            .add_sized([54.0, 26.0], egui::Button::new(RichText::new("CH -").small()))
+                            .on_hover_text("Previous channel (PgDn or [)")
+                            .clicked()
+                        {
+                            self.surf_channel(-1);
+                        }
+                    });
+                });
+
+                ui.add_space(4.0);
+
+                // Episode & VCR Transport strip
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized([48.0, 24.0], egui::Button::new(RichText::new("<< RW").small()))
+                        .on_hover_text("VHS Rewind picture search (Shift+Left or ,)")
+                        .clicked()
+                    {
+                        self.cycle_vcr_shuttle(-1.0);
+                    }
+                    if ui
+                        .add_sized([50.0, 24.0], egui::Button::new(RichText::new("PLAY/||").small()))
+                        .on_hover_text("Play / Pause (Space)")
+                        .clicked()
+                    {
+                        if self.vcr_shuttle_speed != 0.0 {
+                            self.set_vcr_shuttle(0.0);
+                        } else if let Some(p) = &self.player {
+                            p.toggle_pause();
+                        }
+                    }
+                    if ui
+                        .add_sized([48.0, 24.0], egui::Button::new(RichText::new("FF >>").small()))
+                        .on_hover_text("VHS Fast-Forward picture search (Shift+Right or .)")
+                        .clicked()
+                    {
+                        self.cycle_vcr_shuttle(1.0);
+                    }
+                    if ui
+                        .add_sized([48.0, 24.0], egui::Button::new(RichText::new("0:00").small()))
+                        .on_hover_text("Restart from beginning / Retry stream (R)")
+                        .clicked()
+                    {
+                        if let Some(p) = &self.player {
+                            p.seek_abs(0.0);
+                            self.osd.show_action("RESTART 0:00");
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized([66.0, 22.0], egui::Button::new(RichText::new("PREV (P)").small()))
+                        .on_hover_text("Previous episode (P)")
+                        .clicked()
+                    {
+                        self.step_episode(-1);
+                    }
+                    if ui
+                        .add_sized([66.0, 22.0], egui::Button::new(RichText::new("NEXT (N)").small()))
+                        .on_hover_text("Next episode (N)")
+                        .clicked()
+                    {
+                        self.step_episode(1);
+                    }
+                    if ui
+                        .add_sized([66.0, 22.0], egui::Button::new(RichText::new("SEEN (W)").small()))
+                        .on_hover_text("Toggle watched status (W)")
+                        .clicked()
+                    {
+                        if self.active_watch.is_some() {
+                            self.toggle_current_watched();
+                        }
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.separator();
+
+                // CRT & Display Shortcuts strip
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add(egui::Button::new(RichText::new("4:3 Crop").small()).selected(self.crop))
+                        .on_hover_text("Crop widescreen video to fill 4:3 (Shift+Z)")
+                        .clicked()
+                    {
+                        self.toggle_crop();
+                    }
+                    if ui
+                        .small_button("1:1")
+                        .on_hover_text("1:1 pixel-perfect phosphors (Ctrl+1)")
+                        .clicked()
+                    {
+                        self.pixel_perfect_req = true;
+                    }
+                    if ui
+                        .small_button("Degauss")
+                        .on_hover_text("Fire the CRT degaussing coil")
+                        .clicked()
+                    {
+                        self.sim.degauss();
+                        if self.s.magnetization > 0.0 {
+                            self.degauss_mag_start = Some(self.s.magnetization);
+                        }
+                    }
+                    if ui
+                        .small_button("FS (F11)")
+                        .on_hover_text("Toggle fullscreen (F11)")
+                        .clicked()
+                    {
+                        self.set_fullscreen(!self.fullscreen);
+                    }
+                    if self.s.chaos
+                        && ui
+                            .small_button("Whack (K)")
+                            .on_hover_text("Slap the cabinet back into sync (K)")
+                            .clicked()
+                    {
+                        self.sim.whack();
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Tip: Drag & drop any video, image, or ROM onto the TV · Scroll to zoom · Double-click to reset.")
+                        .weak()
+                        .small(),
+                );
+            });
+        self.remote_rect = win_resp.map(|r| r.response.rect);
+        self.remote_open = open;
     }
 }
 
@@ -5237,7 +6865,12 @@ impl CrtApp {
 
         // fullscreen: F11 toggles, Esc leaves; Ctrl+1 snaps screen size; Ctrl+Q cleanly saves progress & quits
         let f11 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11));
-        let esc = (self.fullscreen || self.save_preset_open || self.settings_open || self.guide.active)
+        let esc = (self.fullscreen
+            || self.save_preset_open
+            || self.welcome_open
+            || self.remote_open
+            || self.settings_open
+            || self.guide.active)
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let ctrl_1 = !ctx.egui_wants_keyboard_input()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num1));
@@ -5256,6 +6889,10 @@ impl CrtApp {
         } else if esc {
             if self.save_preset_open {
                 self.save_preset_open = false;
+            } else if self.welcome_open {
+                self.dismiss_welcome();
+            } else if self.remote_open {
+                self.remote_open = false;
             } else if self.settings_open {
                 self.settings_open = false;
             } else if self.guide.active {
@@ -5400,8 +7037,23 @@ impl CrtApp {
                     }
                 }
             } else {
-            // Check `/` (search in Guide) and `*` (favorite toggle) via Text/Key events before digits/shortcuts
-            let typed_slash = self.guide.active
+            // Check `?` (clickable TV Remote / shortcuts), `/` (search in Guide), and `*` (favorite toggle)
+            let typed_qmark = !retro_playing
+                && !web_playing
+                && ctx.input_mut(|i| {
+                    let mut hit = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Slash)
+                        || i.consume_key(egui::Modifiers::NONE, egui::Key::Questionmark);
+                    if !hit {
+                        hit = i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "?"));
+                    }
+                    hit
+                });
+            if typed_qmark {
+                self.remote_open = !self.remote_open;
+                remote_consumed = true;
+            }
+            let typed_slash = !typed_qmark
+                && self.guide.active
                 && ctx.input_mut(|i| {
                     let mut hit = i.consume_key(egui::Modifiers::NONE, egui::Key::Slash);
                     if !hit {
@@ -5413,7 +7065,8 @@ impl CrtApp {
                 self.guide.start_search();
                 remote_consumed = true;
             }
-            let typed_star = !typed_slash
+            let typed_star = !typed_qmark
+                && !typed_slash
                 && ctx.input_mut(|i| {
                     let mut hit = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num8);
                     if !hit {
@@ -5423,27 +7076,7 @@ impl CrtApp {
                 });
             if typed_star {
                 remote_consumed = true;
-                if self.guide.active {
-                    if let Some((pch_num, sel_idx)) = self.guide.picker_selected() {
-                        if let Some(item) = self.guide_picker_items(pch_num).get(sel_idx).cloned() {
-                            self.toggle_favorite_item(&item.id, &item.short_label());
-                        }
-                    } else if let Some(ch) = self.guide_visible_channels().get(self.guide.selected_idx).cloned().cloned() {
-                        if ch.number > 1 {
-                            self.toggle_favorite_channel(&ch);
-                        }
-                    }
-                } else if let Some(w) = self.active_watch.clone() {
-                    if !w.item_id.is_empty() {
-                        self.toggle_favorite_item(&w.item_id, &w.title);
-                    } else if let Some(ch) = self.channel_by_number(w.channel_number).cloned() {
-                        self.toggle_favorite_channel(&ch);
-                    }
-                } else if let Some(ch) = self.current_channel.and_then(|n| self.channel_by_number(n).cloned()) {
-                    if ch.number > 1 {
-                        self.toggle_favorite_channel(&ch);
-                    }
-                }
+                self.toggle_current_favorite();
             }
 
             // Volume (- / +) and Mute (M) always work like a real TV remote
@@ -6158,6 +7791,10 @@ impl CrtApp {
             self.message.clear();
             self.pick_folder();
         }
+        if self.message == "pickchfolder" {
+            self.message.clear();
+            self.pick_channel_folder();
+        }
         if self.message == "pickm3u" {
             self.message.clear();
             self.pick_m3u_playlist();
@@ -6217,7 +7854,22 @@ impl CrtApp {
                     && self
                         .settings_rect
                         .is_some_and(|r| ptr_pos.is_some_and(|p| r.expand(6.0).contains(p)));
-                let overlay_active = over_drawer || over_handle || self.sidebar_resizing || self.save_preset_open || over_settings;
+                let over_remote = self.remote_open
+                    && self
+                        .remote_rect
+                        .is_some_and(|r| ptr_pos.is_some_and(|p| r.expand(6.0).contains(p)));
+                let over_welcome = self.welcome_open
+                    && self
+                        .welcome_rect
+                        .is_some_and(|r| ptr_pos.is_some_and(|p| r.expand(6.0).contains(p)));
+                let overlay_active = over_drawer
+                    || over_handle
+                    || self.sidebar_resizing
+                    || self.save_preset_open
+                    || self.welcome_open
+                    || over_welcome
+                    || over_remote
+                    || over_settings;
 
                 let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
                 self.tv_hovered = resp.hovered() && !overlay_active;
@@ -6819,8 +8471,10 @@ impl CrtApp {
             self.sidebar_resizing = false;
         }
 
-        // Floating tabbed full-controls window
+        // Floating tabbed full-controls window, clickable TV Remote & first-run Welcome guide
         self.show_settings_window(&ctx);
+        self.show_remote_window(&ctx);
+        self.show_welcome_window(&ctx);
 
         // Save-preset modal dialog
         if self.save_preset_open {

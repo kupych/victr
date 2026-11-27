@@ -245,7 +245,7 @@ impl WebPlayer {
     }
 }
 
-fn find_chromium_binary() -> Option<PathBuf> {
+pub(crate) fn find_chromium_binary() -> Option<PathBuf> {
     if let Some(env_bin) = std::env::var_os("VICTR_BROWSER").filter(|v| !v.is_empty()) {
         let p = PathBuf::from(env_bin);
         if p.exists() {
@@ -291,7 +291,7 @@ fn find_chromium_binary() -> Option<PathBuf> {
     None
 }
 
-fn which_in_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn which_in_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let cand = dir.join(name);

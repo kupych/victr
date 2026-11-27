@@ -1048,57 +1048,245 @@ impl ChannelsFileManager {
         self.status = format!("{n_ch} channels, {n_ov} overrides, {n_tp} type profiles");
         Ok(())
     }
+}
 
+/// Curated pack of free, legal, always-on starter channels so a brand-new install
+/// is immediately fun to surf right out of the box.
+pub fn starter_channel_defs() -> Vec<FileChannelDef> {
+    vec![
+        FileChannelDef {
+            number: Some(36),
+            id: "weatherstar-4000".into(),
+            name: "WeatherStar 4000+".into(),
+            callsign: "WS4K".into(),
+            kind: "web".into(),
+            channel_type: "web".into(),
+            profile: None,
+            stream_url: crate::web_channel::WEATHERSTAR_PRESET_URL.into(),
+            path: String::new(),
+            group: "Weather".into(),
+            genre: String::new(),
+            now_title: "Local Forecast".into(),
+            overview: "Classic 1990s Weather Channel emulator (edit URL to add your local forecast permalink).".into(),
+            artwork_url: String::new(),
+            is_favorite: false,
+            enabled: true,
+            items: Vec::new(),
+            shows: Vec::new(),
+            genres: Vec::new(),
+            mode: String::new(),
+            live: true,
+            hide_sources: false,
+        },
+        FileChannelDef {
+            number: Some(70),
+            id: "pico8-bbs-arcade".into(),
+            name: "PICO-8 BBS Arcade".into(),
+            callsign: "PICO8".into(),
+            kind: "pico8".into(),
+            channel_type: "web".into(),
+            profile: None,
+            stream_url: String::new(),
+            path: String::new(),
+            group: "Games".into(),
+            genre: String::new(),
+            now_title: "Featured Carts".into(),
+            overview: "Playable PICO-8 indie arcade carts right on the CRT — press E to browse games.".into(),
+            artwork_url: String::new(),
+            is_favorite: false,
+            enabled: true,
+            items: Vec::new(),
+            shows: Vec::new(),
+            genres: Vec::new(),
+            mode: String::new(),
+            live: true,
+            hide_sources: false,
+        },
+        FileChannelDef {
+            number: Some(71),
+            id: "puzzlescript-gallery".into(),
+            name: "PuzzleScript Gallery".into(),
+            callsign: "PZLS".into(),
+            kind: "puzzlescript".into(),
+            channel_type: "web".into(),
+            profile: None,
+            stream_url: String::new(),
+            path: String::new(),
+            group: "Games".into(),
+            genre: String::new(),
+            now_title: "Indie Puzzle Arcade".into(),
+            overview: "Hundreds of instant-play retro puzzle games — press E to browse, Arrows + X/Z to play.".into(),
+            artwork_url: String::new(),
+            is_favorite: false,
+            enabled: true,
+            items: Vec::new(),
+            shows: Vec::new(),
+            genres: Vec::new(),
+            mode: String::new(),
+            live: true,
+            hide_sources: false,
+        },
+        FileChannelDef {
+            number: Some(80),
+            id: "nhk-world-live".into(),
+            name: "NHK World-Japan".into(),
+            callsign: "NHK".into(),
+            kind: "live".into(),
+            channel_type: "live".into(),
+            profile: None,
+            stream_url: "https://nhkwlive-ojp.akamaized.net/hls/live/2003459/nhkwlive-ojp-en/index.m3u8".into(),
+            path: String::new(),
+            group: "News & Culture".into(),
+            genre: String::new(),
+            now_title: "24/7 Live Broadcast".into(),
+            overview: "Free international public broadcast from Japan — news, documentaries, and culture.".into(),
+            artwork_url: String::new(),
+            is_favorite: false,
+            enabled: true,
+            items: Vec::new(),
+            shows: Vec::new(),
+            genres: Vec::new(),
+            mode: String::new(),
+            live: true,
+            hide_sources: false,
+        },
+        FileChannelDef {
+            number: Some(81),
+            id: "dw-news-live".into(),
+            name: "DW News".into(),
+            callsign: "DW".into(),
+            kind: "live".into(),
+            channel_type: "live".into(),
+            profile: None,
+            stream_url: "https://dwamdstream102.akamaized.net/hls/live/2015525/dwstream102/index.m3u8".into(),
+            path: String::new(),
+            group: "News & Culture".into(),
+            genre: String::new(),
+            now_title: "24/7 International News".into(),
+            overview: "Free 24/7 English international news and documentary broadcast from Deutsche Welle.".into(),
+            artwork_url: String::new(),
+            is_favorite: false,
+            enabled: true,
+            items: Vec::new(),
+            shows: Vec::new(),
+            genres: Vec::new(),
+            mode: String::new(),
+            live: true,
+            hide_sources: false,
+        },
+    ]
+}
+
+impl ChannelsFileManager {
+    /// Merges the free starter channel pack into `channels.json` without duplicating
+    /// any channels already present. Returns how many new channels were added.
+    pub fn install_starter_pack(&mut self) -> Result<usize, String> {
+        if self.cfg.type_profiles.is_empty() {
+            self.cfg.type_profiles.insert("series".into(), String::new());
+            self.cfg.type_profiles.insert("movies".into(), "Worn VHS rental".into());
+            self.cfg.type_profiles.insert("live".into(), String::new());
+            self.cfg.type_profiles.insert("web".into(), String::new());
+        }
+        let mut added = 0usize;
+        for def in starter_channel_defs() {
+            let exists = self.cfg.channels.iter().any(|c| {
+                (!def.id.is_empty() && c.id.eq_ignore_ascii_case(&def.id))
+                    || (!def.stream_url.is_empty() && c.stream_url.eq_ignore_ascii_case(&def.stream_url))
+                    || c.name.eq_ignore_ascii_case(&def.name)
+            });
+            if !exists {
+                self.cfg.channels.push(def);
+                added += 1;
+            }
+        }
+        if added > 0 || !self.file_exists {
+            self.save_to_disk()?;
+        }
+        Ok(added)
+    }
+
+    pub fn upsert_inline_channel(&mut self, idx: Option<usize>, def: FileChannelDef) -> Result<(), String> {
+        match idx {
+            Some(i) if i < self.cfg.channels.len() => {
+                self.cfg.channels[i] = def;
+            }
+            _ => {
+                self.cfg.channels.push(def);
+            }
+        }
+        self.save_to_disk()
+    }
+
+    pub fn remove_inline_channel(&mut self, idx: usize) -> Result<(), String> {
+        if idx < self.cfg.channels.len() {
+            self.cfg.channels.remove(idx);
+            self.save_to_disk()?;
+        }
+        Ok(())
+    }
+
+    /// Inserts or updates a per-channel override matched by `match_text` + `provider`.
+    pub fn upsert_override(&mut self, rule: ChannelOverride) -> Result<(), String> {
+        let key_m = rule.match_text.trim().to_ascii_lowercase();
+        let key_p = rule.provider.trim().to_ascii_lowercase();
+        let is_noop = rule.number.is_none()
+            && rule.name.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && rule.callsign.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && rule.channel_type.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && rule.profile.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && rule.favorite.is_none()
+            && !rule.hidden;
+        if let Some(pos) = self.cfg.overrides.iter().position(|r| {
+            r.match_text.trim().to_ascii_lowercase() == key_m
+                && r.provider.trim().to_ascii_lowercase() == key_p
+        }) {
+            if is_noop {
+                self.cfg.overrides.remove(pos);
+            } else {
+                self.cfg.overrides[pos] = rule;
+            }
+        } else if !is_noop {
+            self.cfg.overrides.push(rule);
+        }
+        self.save_to_disk()
+    }
+
+    pub fn set_channel_hidden(&mut self, match_text: &str, provider: &str, hidden: bool) -> Result<(), String> {
+        let key_m = match_text.trim().to_ascii_lowercase();
+        let key_p = provider.trim().to_ascii_lowercase();
+        let mut rule = self
+            .cfg
+            .overrides
+            .iter()
+            .find(|r| {
+                r.match_text.trim().to_ascii_lowercase() == key_m
+                    && r.provider.trim().to_ascii_lowercase() == key_p
+            })
+            .cloned()
+            .unwrap_or_else(|| ChannelOverride {
+                match_text: match_text.trim().to_string(),
+                provider: provider.trim().to_string(),
+                ..Default::default()
+            });
+        rule.hidden = hidden;
+        self.upsert_override(rule)
+    }
+
+    pub fn find_override(&self, match_text: &str, provider: &str) -> Option<&ChannelOverride> {
+        let key_m = match_text.trim().to_ascii_lowercase();
+        let key_p = provider.trim().to_ascii_lowercase();
+        self.cfg.overrides.iter().find(|r| {
+            r.match_text.trim().to_ascii_lowercase() == key_m
+                && r.provider.trim().to_ascii_lowercase() == key_p
+        })
+    }
+}
+
+impl ChannelsFileManager {
     pub fn create_starter_file(&mut self) -> Result<PathBuf, String> {
         let path = config_path().ok_or_else(|| "Couldn't locate config folder.".to_string())?;
         if !self.file_exists {
-            if self.cfg.type_profiles.is_empty() {
-                self.cfg.type_profiles.insert("series".into(), String::new());
-                self.cfg.type_profiles.insert("movies".into(), "Worn VHS rental".into());
-                self.cfg.type_profiles.insert("live".into(), String::new());
-                self.cfg.type_profiles.insert("web".into(), String::new());
-            }
-            if self.cfg.channels.is_empty() {
-                self.cfg.channels.push(FileChannelDef {
-                    number: Some(36),
-                    id: "weatherstar-4000".into(),
-                    name: "WeatherStar 4000+".into(),
-                    callsign: "WS4K".into(),
-                    kind: "web".into(),
-                    channel_type: "web".into(),
-                    profile: None,
-                    stream_url: crate::web_channel::WEATHERSTAR_PRESET_URL.into(),
-                    path: String::new(),
-                    group: "Weather".into(),
-                    genre: String::new(),
-                    now_title: "Local Forecast".into(),
-                    overview: "Classic 1990s Weather Channel emulator (edit URL to add your latLonQuery permalink).".into(),
-                    artwork_url: String::new(),
-                    is_favorite: false,
-                    enabled: true,
-                    items: Vec::new(),
-                    shows: Vec::new(),
-                    genres: Vec::new(),
-                    mode: String::new(),
-                    live: true,
-                    hide_sources: false,
-                });
-            }
-            if self.cfg.overrides.is_empty() {
-                self.cfg.overrides.push(ChannelOverride {
-                    match_text: "Movies".into(),
-                    provider: String::new(),
-                    kind: "movies".into(),
-                    number: None,
-                    name: None,
-                    callsign: None,
-                    channel_type: Some("movies".into()),
-                    profile: None,
-                    favorite: None,
-                    hidden: false,
-                });
-            }
-            self.save_to_disk()?;
+            let _ = self.install_starter_pack()?;
         }
         Ok(path)
     }
@@ -1411,5 +1599,20 @@ mod tests {
         assert!(target.is_live_clock);
         let next = blk.next_after("s1").expect("next_after should advance to Futurama");
         assert_eq!(next.item.id, "f1");
+    }
+
+    #[test]
+    fn starter_channel_pack_builds_clean_inline_lineup() {
+        let defs = starter_channel_defs();
+        assert!(defs.len() >= 5);
+        let cfg = ChannelsFileConfig {
+            channels: defs,
+            ..Default::default()
+        };
+        let built = build_inline_channels(&cfg);
+        assert_eq!(built.len(), cfg.channels.len());
+        assert!(built.iter().any(|c| c.callsign == "WS4K" && c.number == 36));
+        assert!(built.iter().any(|c| c.callsign == "PICO8" && c.number == 70));
+        assert!(built.iter().any(|c| c.callsign == "PZLS" && c.number == 71));
     }
 }

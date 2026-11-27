@@ -17,6 +17,7 @@ mod m3u;
 mod mpv;
 mod plex;
 mod retro;
+mod sys_check;
 mod web_channel;
 
 use crate::app::CrtApp;

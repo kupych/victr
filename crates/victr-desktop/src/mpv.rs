@@ -387,6 +387,11 @@ mod dl {
     pub const NAMES: &[&str] = &["libmpv-2.dll", "mpv-2.dll", "mpv-1.dll"];
 }
 
+/// Returns true if a usable `libmpv` shared library can be loaded on this system.
+pub fn has_libmpv() -> bool {
+    dl::open(dl::NAMES).is_some()
+}
+
 #[repr(C)]
 struct RenderParam {
     kind: c_int,
