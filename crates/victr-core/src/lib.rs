@@ -18,3 +18,4 @@ pub mod settings;
 pub mod shaders;
 pub mod sim;
 pub mod splash;
+pub mod teletext;

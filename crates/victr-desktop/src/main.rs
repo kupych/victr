@@ -2,7 +2,7 @@
 
 // Platform-agnostic CRT core re-exported at the desktop crate root so all
 // desktop backends and UI modules can reference `crate::sim`, `crate::gpu`, etc.
-pub use victr_core::{gpu, guide, osd, provider, settings, shaders, sim, splash};
+pub use victr_core::{gpu, guide, osd, provider, settings, shaders, sim, splash, teletext};
 
 mod about;
 mod app;

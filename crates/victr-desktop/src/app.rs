@@ -15,6 +15,7 @@ use crate::retro::{self, RetroManager, RetroPlayer};
 use crate::settings::{self, AppConfig, Input, LastWatched, Mask, Pattern, PhosphorSet, Settings, StartupDestination, StartupPreset, TapeSpeed, UserPreset};
 use crate::sim::Sim;
 use crate::splash::{SplashEvent, SplashState};
+use crate::teletext::{self, TeletextInfo, TeletextMode, TeletextRenderer};
 use crate::web_channel::{self, WebPlayer};
 use egui::{Color32, RichText, Slider};
 use std::path::PathBuf;
@@ -142,6 +143,9 @@ pub struct CrtApp {
     guide: GuideState,
     osd: TvOsd,
     splash: SplashState,
+    teletext: TeletextRenderer,
+    tune_started_at: std::time::Instant,
+    last_tune_start_secs: f64,
     startup_dest_pending: bool,
     current_channel: Option<u16>,
     pending_tune_channel: Option<u16>,
@@ -520,6 +524,9 @@ impl CrtApp {
             guide: GuideState::new(),
             osd: TvOsd::new(),
             splash: SplashState::new(show_splash),
+            teletext: TeletextRenderer::new(),
+            tune_started_at: std::time::Instant::now(),
+            last_tune_start_secs: 0.0,
             startup_dest_pending,
             current_channel: None,
             pending_tune_channel: None,
@@ -3371,6 +3378,9 @@ impl CrtApp {
         self.capture_player = None;
         self.video_image = None;
         self.video_frame_no = 0;
+        self.video_url = src.clone();
+        self.tune_started_at = std::time::Instant::now();
+        self.last_tune_start_secs = start;
         let _ = self.splash.skip();
         self.startup_dest_pending = false;
         if self.current_channel.is_none() && self.screenshot.is_none() {
@@ -3780,9 +3790,7 @@ impl CrtApp {
             });
     }
 
-    /// True while tuning into a new channel or buffering a newly loaded stream's first frame:
-    /// errs on the side of authentic CRT static snow + hiss instead of flashing the old frame or audio blip.
-    fn is_tuning_static(&self) -> bool {
+    fn is_waiting_for_first_frame(&self) -> bool {
         if self.guide.active || self.splash.is_active() {
             return false;
         }
@@ -3794,6 +3802,92 @@ impl CrtApp {
             || self.retro_player.is_some()
             || self.capture_player.is_some();
         self.s.pattern == Pattern::Video && has_active_stream && self.video_image.is_none()
+    }
+
+    /// Computes Teletext data-channel state (`Loading` or `Inactive`) while waiting for a
+    /// channel/stream to deliver its first video frame (after the brief 0.35s RF static burst).
+    fn teletext_status(&self) -> Option<(TeletextMode, String, &'static str)> {
+        if !self.is_waiting_for_first_frame() {
+            return None;
+        }
+        let elapsed = self.tune_started_at.elapsed().as_secs_f32();
+        let (mode, status, kind) = if let Some(p) = &self.player {
+            let (running, ended, st) = {
+                let sh = p.shared.lock().unwrap();
+                (sh.running, sh.ended, sh.status.clone())
+            };
+            let is_live = {
+                let low = self.video_url.to_ascii_lowercase();
+                low.contains(".m3u8") || low.contains("youtube.com") || low.contains("youtu.be") || low.ends_with("/live")
+            };
+            let kind = if is_live {
+                "LIVE STREAM"
+            } else if self.video_url.starts_with("http://") || self.video_url.starts_with("https://") {
+                "MEDIA STREAM"
+            } else {
+                "LOCAL VIDEO"
+            };
+            if ended || !running {
+                let reason = if st.is_empty() || st == "Loading…" || st == "Playing" {
+                    "Stream offline or unavailable".to_string()
+                } else {
+                    st
+                };
+                (TeletextMode::Inactive, reason, kind)
+            } else if elapsed >= 18.0 {
+                (TeletextMode::Inactive, "Timed out waiting for stream signal".to_string(), kind)
+            } else {
+                let msg = if st.is_empty() || st == "Starting mpv…" || st == "Loading…" {
+                    "Connecting & buffering stream…".to_string()
+                } else {
+                    st
+                };
+                (TeletextMode::Loading, msg, kind)
+            }
+        } else if let Some(wp) = &self.web_player {
+            let (running, st) = {
+                let sh = wp.shared.lock().unwrap();
+                (sh.running, sh.status.clone())
+            };
+            if !running {
+                (TeletextMode::Inactive, st, "WEB RECEIVER")
+            } else if elapsed >= 20.0 {
+                (TeletextMode::Inactive, "Timed out waiting for web page render".to_string(), "WEB RECEIVER")
+            } else {
+                (TeletextMode::Loading, st, "WEB RECEIVER")
+            }
+        } else if let Some(cp) = &self.capture_player {
+            let (running, st) = {
+                let sh = cp.shared.lock().unwrap();
+                (sh.running, sh.status.clone())
+            };
+            if !running {
+                (TeletextMode::Inactive, st, "VIDEO CAPTURE")
+            } else {
+                (TeletextMode::Loading, st, "VIDEO CAPTURE")
+            }
+        } else if self.pending_tune_channel.is_some() {
+            if elapsed >= 15.0 {
+                (TeletextMode::Inactive, "Channel lineup fetch timed out".to_string(), "DATA CHANNEL")
+            } else {
+                (TeletextMode::Loading, "Fetching channel schedule…".to_string(), "DATA CHANNEL")
+            }
+        } else {
+            return None;
+        };
+
+        // Keep a crisp ~0.35s authentic RF static burst on initial channel change before
+        // cutting cleanly to the Teletext status page (or immediately on error/inactive).
+        if mode == TeletextMode::Loading && elapsed < 0.35 {
+            return None;
+        }
+        Some((mode, status, kind))
+    }
+
+    /// True during the brief initial RF static snow burst (~0.35s) right after switching channels
+    /// before either frame #1 arrives or the Teletext tuning/buffering screen takes over.
+    fn is_tuning_static(&self) -> bool {
+        self.is_waiting_for_first_frame() && self.teletext_status().is_none()
     }
 
     fn update_audio(&mut self) {
@@ -5396,7 +5490,8 @@ impl CrtApp {
                     self.refresh_all_sources();
                     remote_consumed = true;
                 }
-                if (!web_playing || self.guide.active) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R)) {
+                let teletext_showing = self.teletext_status().is_some();
+                if (!web_playing || self.guide.active || teletext_showing) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R)) {
                     if self.guide.active && self.guide.picker_selected().is_none() {
                         self.refresh_all_sources();
                         remote_consumed = true;
@@ -5406,6 +5501,17 @@ impl CrtApp {
                             self.osd.show_action("RESTART 0:00");
                             remote_consumed = true;
                         }
+                    } else if teletext_showing {
+                        if !self.video_url.is_empty() {
+                            let url = self.video_url.clone();
+                            let start = self.last_tune_start_secs;
+                            self.sim.switch_channel();
+                            self.start_video_at(url, start);
+                        } else if let Some(ch) = self.current_channel {
+                            self.tune_channel(ch);
+                        }
+                        self.osd.show_action("RE-TUNING...");
+                        remote_consumed = true;
                     } else if let Some(p) = &self.player {
                         p.seek_abs(0.0);
                         self.osd.show_action("RESTART 0:00");
@@ -6371,6 +6477,34 @@ impl CrtApp {
                     fi.image = None;
                     fi.u.pattern = Pattern::FlatField.id();
                     fi.u.flat = [0.16, 0.16, 0.16];
+                } else if let Some((tt_mode, tt_status, tt_kind)) = self.teletext_status() {
+                    let ch_num = self.pending_tune_channel.or(self.current_channel);
+                    let (callsign, title, subtitle) = if let Some(w) = &self.active_watch {
+                        let ch_name = self
+                            .channel_by_number(w.channel_number)
+                            .map(|c| c.name.clone())
+                            .unwrap_or_else(|| w.callsign.clone());
+                        (w.callsign.clone(), ch_name, w.title.clone())
+                    } else if let Some(ch) = ch_num.and_then(|n| self.channel_by_number(n)) {
+                        (ch.callsign.clone(), ch.name.clone(), String::new())
+                    } else {
+                        (String::new(), self.video_name.clone(), String::new())
+                    };
+                    let host = teletext::extract_source_host(&self.video_url);
+                    let elapsed = self.tune_started_at.elapsed().as_secs_f32();
+                    let tt_frame = self.teletext.render(&TeletextInfo {
+                        mode: tt_mode,
+                        channel_number: ch_num,
+                        callsign: &callsign,
+                        title: &title,
+                        subtitle: &subtitle,
+                        source_kind: tt_kind,
+                        source_host: &host,
+                        status_line: &tt_status,
+                        elapsed_secs: elapsed,
+                    });
+                    fi.image = Some(tt_frame);
+                    fi.u.pattern = Pattern::Image.id();
                 } else {
                     fi.image = if self.s.pattern == Pattern::Video { self.video_image.clone() } else { self.image.clone() };
                 }
