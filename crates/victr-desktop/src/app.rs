@@ -4050,6 +4050,7 @@ impl CrtApp {
             format!("Pixel-perfect 1× phosphors: screen size {:.2}\" ({:.2} mm pitch)", inches, self.s.pitch_mm),
             std::time::Instant::now(),
         ));
+        self.osd.show_action(&format!("1:1 PIXEL {:.1}\"", inches));
     }
 
     fn picture_signal_controls(&mut self, ui: &mut egui::Ui) {
@@ -4638,6 +4639,30 @@ impl CrtApp {
                     {
                         self.toggle_crop();
                     }
+                    let pp_active = self.last_vis_rect.width() > 0.0
+                        && self.last_full_h_px > 0.0
+                        && (self.zoom - 1.0).abs() < 0.01
+                        && (self.s.screen_inches
+                            - pixel_perfect_screen_inches(
+                                self.s.pitch_mm,
+                                self.s.mask,
+                                self.last_full_h_px,
+                                self.view_half_at_zoom(self.last_vis_rect, 1.0),
+                            ))
+                        .abs()
+                            < 0.08;
+                    let pp_lbl = if pp_active {
+                        RichText::new("1:1").color(Color32::from_rgb(255, 214, 96)).strong()
+                    } else {
+                        RichText::new("1:1")
+                    };
+                    if ui
+                        .add(egui::Button::new(pp_lbl).selected(pp_active).small())
+                        .on_hover_text("Snap screen size so each phosphor is 1:1 pixel-perfect at 1× zoom (Ctrl+1)")
+                        .clicked()
+                    {
+                        self.pixel_perfect_req = true;
+                    }
                     if ui.small_button("Reset view").clicked() {
                         self.zoom = 1.0;
                         self.pan = [0.0, 0.0];
@@ -4794,7 +4819,7 @@ impl CrtApp {
 
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new("Scroll to zoom · Drag to pan · Double-click to reset · G: Guide · Shift+Z: 4:3 Crop.")
+                    RichText::new("Scroll to zoom · Drag to pan · Double-click to reset · G: Guide · Shift+Z: 4:3 Crop · Ctrl+1: 1:1.")
                         .weak()
                         .small(),
                 );
