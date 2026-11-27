@@ -3804,10 +3804,32 @@ impl CrtApp {
         self.s.pattern == Pattern::Video && has_active_stream && self.video_image.is_none()
     }
 
-    /// Computes Teletext data-channel state (`Loading` or `Inactive`) while waiting for a
-    /// channel/stream to deliver its first video frame (after the brief 0.35s RF static burst).
+    /// True when the active stream is an online web/live stream (YouTube Live, M3U8/HLS,
+    /// or `web://` channel) rather than local files, Jellyfin, Plex, retro console, or capture.
+    fn is_web_stream_source(&self) -> bool {
+        if self.web_player.is_some() {
+            return true;
+        }
+        if self.player.is_some() {
+            let is_http = self.video_url.starts_with("http://") || self.video_url.starts_with("https://");
+            if !is_http {
+                return false;
+            }
+            if let Some(w) = &self.active_watch {
+                if matches!(w.provider_id.as_str(), "jellyfin" | "plex" | "folders") {
+                    return false;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Computes Teletext data-channel state (`Loading` or `Inactive`) ONLY for online web
+    /// stream videos and `web://` channels while waiting for frame #1 (after a brief 0.35s RF static pop).
+    /// Jellyfin, Plex, local files, retro consoles, and capture stay pure classic RF static.
     fn teletext_status(&self) -> Option<(TeletextMode, String, &'static str)> {
-        if !self.is_waiting_for_first_frame() {
+        if !self.is_waiting_for_first_frame() || !self.is_web_stream_source() {
             return None;
         }
         let elapsed = self.tune_started_at.elapsed().as_secs_f32();
@@ -3816,29 +3838,19 @@ impl CrtApp {
                 let sh = p.shared.lock().unwrap();
                 (sh.running, sh.ended, sh.status.clone())
             };
-            let is_live = {
-                let low = self.video_url.to_ascii_lowercase();
-                low.contains(".m3u8") || low.contains("youtube.com") || low.contains("youtu.be") || low.ends_with("/live")
-            };
-            let kind = if is_live {
-                "LIVE STREAM"
-            } else if self.video_url.starts_with("http://") || self.video_url.starts_with("https://") {
-                "MEDIA STREAM"
-            } else {
-                "LOCAL VIDEO"
-            };
+            let kind = "WEB STREAM";
             if ended || !running {
                 let reason = if st.is_empty() || st == "Loading…" || st == "Playing" {
-                    "Stream offline or unavailable".to_string()
+                    "OFF AIR / STREAM UNAVAILABLE".to_string()
                 } else {
                     st
                 };
                 (TeletextMode::Inactive, reason, kind)
             } else if elapsed >= 18.0 {
-                (TeletextMode::Inactive, "Timed out waiting for stream signal".to_string(), kind)
+                (TeletextMode::Inactive, "TIMED OUT - NO SIGNAL".to_string(), kind)
             } else {
                 let msg = if st.is_empty() || st == "Starting mpv…" || st == "Loading…" {
-                    "Connecting & buffering stream…".to_string()
+                    "CONNECTING & BUFFERING...".to_string()
                 } else {
                     st
                 };
@@ -3850,27 +3862,11 @@ impl CrtApp {
                 (sh.running, sh.status.clone())
             };
             if !running {
-                (TeletextMode::Inactive, st, "WEB RECEIVER")
+                (TeletextMode::Inactive, st, "WEB CHANNEL")
             } else if elapsed >= 20.0 {
-                (TeletextMode::Inactive, "Timed out waiting for web page render".to_string(), "WEB RECEIVER")
+                (TeletextMode::Inactive, "TIMED OUT - NO RESPONSE".to_string(), "WEB CHANNEL")
             } else {
-                (TeletextMode::Loading, st, "WEB RECEIVER")
-            }
-        } else if let Some(cp) = &self.capture_player {
-            let (running, st) = {
-                let sh = cp.shared.lock().unwrap();
-                (sh.running, sh.status.clone())
-            };
-            if !running {
-                (TeletextMode::Inactive, st, "VIDEO CAPTURE")
-            } else {
-                (TeletextMode::Loading, st, "VIDEO CAPTURE")
-            }
-        } else if self.pending_tune_channel.is_some() {
-            if elapsed >= 15.0 {
-                (TeletextMode::Inactive, "Channel lineup fetch timed out".to_string(), "DATA CHANNEL")
-            } else {
-                (TeletextMode::Loading, "Fetching channel schedule…".to_string(), "DATA CHANNEL")
+                (TeletextMode::Loading, st, "WEB CHANNEL")
             }
         } else {
             return None;

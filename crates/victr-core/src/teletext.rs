@@ -1,9 +1,9 @@
-//! Classic 1980s/90s Ceefax / World System Teletext (WST) data-channel renderer (640x480).
+//! Authentic 1980s World System Teletext (WST / BBC Ceefax / SAA5050) 40x24 cell renderer.
 //!
-//! Used for ViCTR's live stream tuning/buffering splash, off-air / stream-inactive
-//! diagnostics, and future Teletext data pages. Rendered at 640x480 inside SMPTE
-//! title-safe margins using the authentic 8-color RGBYCMW Teletext palette so it
-//! passes through real NTSC chroma bleed, scanlines, shadow mask, and phosphor bloom.
+//! Strictly locked to a rigid 40-column x 24-row character/mosaic grid inside SMPTE
+//! title-safe margins using ONLY the raw 8-color 3-bit RGB Teletext palette (no mid-tones,
+//! no gradients, no modern UI panels) with authentic 2x3 separated sixel mosaic blocks and
+//! double-height Teletext headlines.
 
 use crate::osd::Canvas;
 use chrono::Local;
@@ -12,27 +12,29 @@ use std::sync::Arc;
 pub const TT_W: usize = 640;
 pub const TT_H: usize = 480;
 
-const SAFE_X: i32 = 32;
-const SAFE_Y: i32 = 24;
-const SAFE_W: i32 = TT_W as i32 - SAFE_X * 2; // 576px
+// Rigid 40x24 Teletext character cell grid (40*14 = 560px wide, 24*18 = 432px tall)
+const COLS: i32 = 40;
+const CELL_W: i32 = 14;
+const CELL_H: i32 = 18;
+const ORIGIN_X: i32 = (TT_W as i32 - COLS * CELL_W) / 2; // 40px
+const ORIGIN_Y: i32 = (TT_H as i32 - 24 * CELL_H) / 2;   // 24px
 
-// Authentic 3-bit RGB World System Teletext (Ceefax / ORACLE) 8-color palette
-const BLACK: [u8; 4] = [6, 6, 12, 255];
-const RED: [u8; 4] = [232, 34, 34, 255];
-const GREEN: [u8; 4] = [38, 228, 68, 255];
-const YELLOW: [u8; 4] = [248, 232, 44, 255];
-const BLUE: [u8; 4] = [24, 58, 208, 255];
-const MAGENTA: [u8; 4] = [218, 46, 212, 255];
-const CYAN: [u8; 4] = [44, 224, 238, 255];
-const WHITE: [u8; 4] = [242, 244, 248, 255];
-const DIM_BLUE: [u8; 4] = [14, 28, 92, 255];
-const DIM_RED: [u8; 4] = [96, 14, 18, 255];
+// Strict 8-color 1-bit-per-channel World System Teletext palette (pure RGBYCMW + Black)
+const BLACK: [u8; 4] = [0, 0, 0, 255];
+const RED: [u8; 4] = [235, 24, 24, 255];
+const GREEN: [u8; 4] = [28, 232, 40, 255];
+const YELLOW: [u8; 4] = [248, 236, 28, 255];
+const BLUE: [u8; 4] = [24, 44, 224, 255];
+#[allow(dead_code)]
+const MAGENTA: [u8; 4] = [230, 32, 224, 255];
+const CYAN: [u8; 4] = [28, 232, 238, 255];
+const WHITE: [u8; 4] = [244, 244, 244, 255];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TeletextMode {
-    /// Actively connecting / resolving / buffering a channel or live stream.
+    /// Actively connecting / resolving / buffering a web stream or web channel.
     Loading,
-    /// Stream failed, went offline, or timed out with no incoming video frames.
+    /// Web stream failed, went offline, or timed out with no incoming video frames.
     Inactive,
 }
 
@@ -68,262 +70,251 @@ impl TeletextRenderer {
         }
     }
 
-    /// Renders a 640x480 authentic Ceefax/Teletext status frame.
+    /// Fills a cell span `[col..col+len)` on `row` with a solid 8-color Teletext background.
+    fn fill_cells(&mut self, col: i32, row: i32, len: i32, bg: [u8; 4]) {
+        self.canvas.fill_rect(
+            ORIGIN_X + col * CELL_W,
+            ORIGIN_Y + row * CELL_H,
+            len * CELL_W,
+            CELL_H,
+            bg,
+        );
+    }
+
+    /// Draws strict 40-column fixed-width Teletext text snapped to cell boundaries (`14x18` cells).
+    fn put_text(&mut self, col: i32, row: i32, text: &str, fg: [u8; 4], bg: Option<[u8; 4]>) {
+        let max_chars = (COLS - col).max(0) as usize;
+        let clipped: String = text.chars().take(max_chars).collect();
+        if let Some(b) = bg {
+            self.fill_cells(col, row, clipped.chars().count() as i32, b);
+        }
+        for (i, ch) in clipped.chars().enumerate() {
+            let x = ORIGIN_X + (col + i as i32) * CELL_W + 2;
+            let y = ORIGIN_Y + row * CELL_H + 1;
+            let mut s = [0u8; 4];
+            let s = ch.encode_utf8(&mut s);
+            self.canvas.draw_text(x, y, s, 1, 2, fg, None);
+        }
+    }
+
+    /// Draws authentic WST **double-height** Teletext text spanning `row` and `row + 1` (14x36 per cell!).
+    fn put_double_height(&mut self, col: i32, row: i32, text: &str, fg: [u8; 4], bg: Option<[u8; 4]>) {
+        let max_chars = (COLS - col).max(0) as usize;
+        let clipped: String = text.chars().take(max_chars).collect();
+        if let Some(b) = bg {
+            self.fill_cells(col, row, clipped.chars().count() as i32, b);
+            self.fill_cells(col, row + 1, clipped.chars().count() as i32, b);
+        }
+        for (i, ch) in clipped.chars().enumerate() {
+            let x = ORIGIN_X + (col + i as i32) * CELL_W + 2;
+            let y = ORIGIN_Y + row * CELL_H + 2;
+            let mut s = [0u8; 4];
+            let s = ch.encode_utf8(&mut s);
+            // Tall 1x4 double-height SAA5050 proportions inside 14x36 cell
+            self.canvas.draw_text(x, y, s, 1, 4, fg, None);
+        }
+    }
+
+    /// Draws a single WST 2x3 separated sixel mosaic character (`bits`: bit0=TL, bit1=TR, bit2=ML, bit3=MR, bit4=BL, bit5=BR).
+    fn put_sixel(&mut self, col: i32, row: i32, bits: u8, fg: [u8; 4], separated: bool) {
+        let cx = ORIGIN_X + col * CELL_W;
+        let cy = ORIGIN_Y + row * CELL_H;
+        let gap = if separated { 2 } else { 0 };
+        let sub_w = CELL_W / 2;
+        let sub_h = CELL_H / 3;
+        for sy in 0..3 {
+            for sx in 0..2 {
+                let bit = 1u8 << (sy * 2 + sx);
+                if (bits & bit) != 0 {
+                    self.canvas.fill_rect(
+                        cx + sx * sub_w + gap / 2,
+                        cy + sy * sub_h + gap / 2,
+                        (sub_w - gap).max(1),
+                        (sub_h - gap).max(1),
+                        fg,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Renders a 640x480 authentic 1980s 40x24 Ceefax/Teletext status frame.
     pub fn render(&mut self, info: &TeletextInfo<'_>) -> (u64, Arc<(usize, usize, Vec<u8>)>) {
         self.frame_counter = self.frame_counter.wrapping_add(1);
         let tick = self.frame_counter;
         let now = Local::now();
 
-        // Deep Teletext black background (full-bleed behind overscan)
+        // Pure Teletext black field (full-bleed behind overscan)
         self.canvas.fill_rect(0, 0, TT_W as i32, TT_H as i32, BLACK);
 
-        // ---- Row 0: Classic Teletext Header Bar (`P100  ViCTR-TEXT  Thu 26 Nov 22:16:04`)
-        let hdr_y = SAFE_Y;
+        // ---- Row 0: Classic BBC Ceefax / WST Page Header (`P104  VICTR 104  Thu 26 Nov 22:57:43`)
         let (page_str, page_col) = match info.mode {
             TeletextMode::Loading => {
-                // Classic Ceefax rolling page-hunt counter while acquiring lock
-                let roll = 100 + ((tick / 4) % 99);
+                // Classic rolling Teletext page-search counter (`P100`..`P199`)
+                let roll = 100 + ((tick / 5) % 99);
                 (format!("P{roll:03}"), GREEN)
             }
             TeletextMode::Inactive => ("P888".to_string(), RED),
         };
-        self.canvas.draw_text(SAFE_X, hdr_y, &page_str, 1, 2, page_col, None);
-        self.canvas.draw_text(SAFE_X + 46, hdr_y, "VICTR-TEXT", 1, 2, WHITE, None);
-        if let Some(ch) = info.channel_number.filter(|&n| n > 0) {
-            let cs = if info.callsign.is_empty() {
-                format!("CH {:02}", ch)
-            } else {
-                format!("CH {:02} {}", ch, info.callsign)
-            };
-            self.canvas.draw_text_clipped(SAFE_X + 144, hdr_y, &cs, 160, 1, 2, CYAN, None);
-        }
+        self.put_text(0, 0, &page_str, page_col, None);
+        let ch_tag = match info.channel_number.filter(|&n| n > 0) {
+            Some(n) if !info.callsign.is_empty() => format!("VICTR {:02} {}", n, info.callsign),
+            Some(n) => format!("VICTR CH {:02}", n),
+            None => "VICTR DATA".to_string(),
+        };
+        self.put_text(6, 0, &ch_tag, WHITE, None);
         let clock = now.format("%a %d %b %H:%M:%S").to_string().to_ascii_uppercase();
-        let clock_w = clock.len() as i32 * 8;
-        self.canvas
-            .draw_text(SAFE_X + SAFE_W - clock_w, hdr_y, &clock, 1, 2, YELLOW, None);
+        let clock_col = (COLS - clock.len() as i32).max(20);
+        self.put_text(clock_col, 0, &clock, YELLOW, None);
 
-        // ---- Rows 1-3: Double-Height Teletext Masthead Banner with Mosaic Blocks
-        let ban_y = SAFE_Y + 24;
-        let ban_h = 68;
+        // ---- Rows 2-4: Classic Full-Width Teletext Block Masthead (NO rounded cards, pure edge-to-edge strip)
         let ban_bg = match info.mode {
             TeletextMode::Loading => BLUE,
-            TeletextMode::Inactive => DIM_RED,
+            TeletextMode::Inactive => RED,
         };
-        self.canvas.fill_rect(SAFE_X, ban_y, SAFE_W, ban_h, ban_bg);
-        // Classic 2x3 Teletext mosaic pixel blocks on the left of the masthead
-        let mosaic_colors = match info.mode {
-            TeletextMode::Loading => [YELLOW, CYAN, GREEN, CYAN, MAGENTA, YELLOW],
-            TeletextMode::Inactive => [RED, YELLOW, RED, YELLOW, RED, YELLOW],
-        };
-        for r in 0..3 {
-            for c in 0..2 {
-                let col = mosaic_colors[r * 2 + c];
-                self.canvas.fill_rect(
-                    SAFE_X + 10 + c as i32 * 16,
-                    ban_y + 10 + r as i32 * 16,
-                    12,
-                    12,
-                    col,
-                );
-            }
+        for r in 2..=4 {
+            self.fill_cells(0, r, COLS, ban_bg);
         }
-        let title_x = SAFE_X + 52;
-        let title_w = SAFE_W - 64;
+        // Chunky 2x3 separated sixel Teletext graphics emblem on columns 1..6 (like Ceefax / ORACLE header art)
+        let emblem_col = match info.mode {
+            TeletextMode::Loading => YELLOW,
+            TeletextMode::Inactive => WHITE,
+        };
+        let emblem: &[(i32, i32, u8)] = &[
+            (1, 2, 0b111111), (2, 2, 0b110011), (3, 2, 0b111111),
+            (1, 3, 0b111111), (2, 3, 0b001100), (3, 3, 0b111111),
+            (1, 4, 0b001111), (2, 4, 0b111111), (3, 4, 0b001111),
+        ];
+        for &(ec, er, bits) in emblem {
+            self.put_sixel(ec, er, bits, emblem_col, true);
+        }
         let title_txt = if info.title.trim().is_empty() {
-            "DATA CHANNEL"
+            "WEB DATA CHANNEL"
         } else {
             info.title.trim()
         };
-        // Double-height Teletext headline (scale 2x3 = tall iconic Teletext font!)
-        self.canvas
-            .draw_text_clipped(title_x, ban_y + 8, title_txt, title_w, 2, 3, YELLOW, None);
-        if !info.subtitle.trim().is_empty() {
-            self.canvas.draw_text_clipped(
-                title_x,
-                ban_y + 44,
-                info.subtitle.trim(),
-                title_w,
-                1,
-                2,
-                WHITE,
-                None,
-            );
+        // Double-height Teletext headline across rows 2-3 + subtitle on row 4
+        self.put_double_height(5, 2, title_txt, YELLOW, None);
+        let sub_txt = if !info.subtitle.trim().is_empty() {
+            info.subtitle.trim()
+        } else if !info.source_host.trim().is_empty() {
+            info.source_host.trim()
+        } else {
+            info.source_kind
+        };
+        self.put_text(5, 4, sub_txt, if info.mode == TeletextMode::Loading { CYAN } else { WHITE }, None);
+
+        // ---- Row 5: Full-Width Separated Sixel Mosaic Rule
+        let rule_col = match info.mode {
+            TeletextMode::Loading => YELLOW,
+            TeletextMode::Inactive => YELLOW,
+        };
+        for c in 0..COLS {
+            self.put_sixel(c, 5, 0b001100, rule_col, true);
         }
 
-        // ---- Mosaic Divider Strip
-        let sep_y = ban_y + ban_h + 8;
-        let seg_colors = match info.mode {
-            TeletextMode::Loading => [CYAN, BLUE, YELLOW, BLUE],
-            TeletextMode::Inactive => [RED, YELLOW, RED, MAGENTA],
-        };
-        for i in 0..36 {
-            let col = seg_colors[i % seg_colors.len()];
-            self.canvas.fill_rect(SAFE_X + i as i32 * 16, sep_y, 12, 6, col);
-        }
-
-        // ---- Main Status Panel (Loading vs Stream Inactive)
-        let box_y = sep_y + 18;
-        let box_h = 152;
-        let (panel_bg, accent, head_txt) = match info.mode {
-            TeletextMode::Loading => (DIM_BLUE, CYAN, "TUNING / BUFFERING STREAM"),
-            TeletextMode::Inactive => (DIM_RED, RED, "! STREAM INACTIVE / OFF AIR !"),
-        };
-        self.canvas.fill_rect(SAFE_X, box_y, SAFE_W, box_h, panel_bg);
-        self.canvas.fill_rect(SAFE_X, box_y, SAFE_W, 34, accent);
-
-        let blink = (tick / 20).is_multiple_of(2);
-        let head_fg = match info.mode {
-            TeletextMode::Loading => BLACK,
-            TeletextMode::Inactive => if blink { YELLOW } else { WHITE },
-        };
-        let head_w = (head_txt.len() as i32 * 16).min(SAFE_W - 16);
-        let head_x = SAFE_X + ((SAFE_W - head_w) / 2).max(8);
-        self.canvas
-            .draw_text_clipped(head_x, box_y + 7, head_txt, SAFE_W - 16, 2, 2, head_fg, None);
-
-        // Animated Teletext block scanner bar (Loading) OR bold Red/Yellow warning stripe (Inactive)
-        let bar_y = box_y + 46;
-        let cells = 28i32;
-        let cell_w = 16i32;
-        let bar_x = SAFE_X + (SAFE_W - cells * cell_w) / 2;
+        // ---- Rows 7-8: Double-Height Status Banner (Raw Teletext — blinking flash attribute!)
+        let flash_on = !(tick / 22).is_multiple_of(2);
         match info.mode {
             TeletextMode::Loading => {
-                // Smooth Knight-Rider / Ceefax carrier-acquisition sweep
-                let span = (cells - 5).max(1) as u64;
-                let phase = (tick / 3) % (span * 2);
-                let pos = if phase < span { phase } else { span * 2 - phase } as i32;
-                for c in 0..cells {
-                    let dist = (c - (pos + 2)).abs();
-                    let col = if dist == 0 {
-                        YELLOW
-                    } else if dist == 1 {
-                        CYAN
-                    } else if dist == 2 {
-                        GREEN
+                let banner = if flash_on {
+                    "*  TUNING / BUFFERING WEB STREAM  *"
+                } else {
+                    "   TUNING / BUFFERING WEB STREAM   "
+                };
+                self.put_double_height(2, 7, banner, CYAN, None);
+            }
+            TeletextMode::Inactive => {
+                self.fill_cells(0, 7, COLS, RED);
+                self.fill_cells(0, 8, COLS, RED);
+                let banner = "   STREAM INACTIVE / NO SIGNAL    ";
+                self.put_double_height(3, 7, banner, if flash_on { YELLOW } else { WHITE }, None);
+            }
+        }
+
+        // ---- Row 10: Coarse 40-Column Teletext Separated-Sixel Carrier Bar
+        match info.mode {
+            TeletextMode::Loading => {
+                // Coarse stepping sixel scan (pure 8-color Teletext blocks, zero smooth easing)
+                let step = ((tick / 6) % 34) as i32;
+                for c in 2..38 {
+                    let pos = c - 2;
+                    let (bits, col) = if pos >= step && pos < step + 4 {
+                        (0b111111, YELLOW)
+                    } else if pos == step - 1 || pos == step + 4 {
+                        (0b111111, CYAN)
                     } else {
-                        [18, 42, 112, 255]
+                        (0b001100, BLUE)
                     };
-                    self.canvas.fill_rect(bar_x + c * cell_w, bar_y, 12, 12, col);
+                    self.put_sixel(c, 10, bits, col, true);
                 }
             }
             TeletextMode::Inactive => {
-                for c in 0..cells {
-                    let col = if (c as u64 + tick / 24).is_multiple_of(2) {
-                        RED
-                    } else {
-                        [72, 16, 20, 255]
-                    };
-                    self.canvas.fill_rect(bar_x + c * cell_w, bar_y, 12, 10, col);
+                for c in 2..38 {
+                    let col = if (c + (tick / 24) as i32) % 2 == 0 { RED } else { YELLOW };
+                    self.put_sixel(c, 10, 0b001111, col, true);
                 }
             }
         }
 
-        // Live telemetry rows inside the status panel
-        let info_y = bar_y + 24;
+        // ---- Rows 12-15: Pure 40-Column Fixed-Width Teletext Data Rows on Black (No modern card box)
         let secs = info.elapsed_secs.max(0.0) as u32;
         let elapsed_str = format!("{:02}:{:02}", secs / 60, secs % 60);
-        let status_label = match info.mode {
-            TeletextMode::Loading => "STATUS :",
-            TeletextMode::Inactive => "REASON :",
-        };
         let status_val = if info.status_line.trim().is_empty() {
             match info.mode {
-                TeletextMode::Loading => "ACQUIRING CARRIER SIGNAL...",
-                TeletextMode::Inactive => "NO CARRIER OR STREAM OFFLINE",
+                TeletextMode::Loading => "ACQUIRING CARRIER...",
+                TeletextMode::Inactive => "OFF AIR / NO CARRIER",
             }
         } else {
             info.status_line.trim()
         };
-        self.canvas.draw_text(SAFE_X + 14, info_y, status_label, 1, 2, YELLOW, None);
-        self.canvas.draw_text_clipped(
-            SAFE_X + 86,
-            info_y,
-            status_val,
-            SAFE_W - 100,
-            1,
-            2,
-            WHITE,
-            None,
-        );
-
-        self.canvas.draw_text(SAFE_X + 14, info_y + 24, "SOURCE :", 1, 2, YELLOW, None);
-        let src_line = if info.source_host.trim().is_empty() {
-            info.source_kind.to_string()
+        let host_val = if info.source_host.trim().is_empty() {
+            info.source_kind
         } else {
-            format!("{}  ({})", info.source_kind, info.source_host.trim())
+            info.source_host.trim()
         };
-        self.canvas.draw_text_clipped(
-            SAFE_X + 86,
-            info_y + 24,
-            &src_line,
-            SAFE_W - 100,
-            1,
-            2,
-            CYAN,
-            None,
-        );
 
-        let third_lbl = match info.mode {
-            TeletextMode::Loading => "WAIT   :",
-            TeletextMode::Inactive => "SIGNAL :",
-        };
-        let third_val = match info.mode {
-            TeletextMode::Loading => format!("{elapsed_str}  (HOLDING FOR FIRST FRAME)"),
-            TeletextMode::Inactive => format!("LOST AFTER {elapsed_str} · PRESS R TO RETRY"),
-        };
-        self.canvas.draw_text(SAFE_X + 14, info_y + 48, third_lbl, 1, 2, YELLOW, None);
-        self.canvas.draw_text_clipped(
-            SAFE_X + 86,
-            info_y + 48,
-            &third_val,
-            SAFE_W - 100,
-            1,
-            2,
-            if info.mode == TeletextMode::Loading { GREEN } else { YELLOW },
-            None,
-        );
+        self.put_text(1, 12, "STATUS", YELLOW, None);
+        self.put_text(10, 12, status_val, WHITE, None);
 
-        // ---- Teletext Page Directory (classic Ceefax dotted-leader index)
-        let dir_y = box_y + box_h + 18;
-        let rows = [
-            ("100", "PREVUE CABLE GUIDE", "[G]", YELLOW),
-            ("200", "EPISODES / GAME CATALOG", "[E]", CYAN),
-            ("300", "RETRY / RE-TUNE CHANNEL", "[R]", GREEN),
-            ("400", "CHANNEL UP / DOWN", "[ ] / [ [", WHITE),
-        ];
-        for (i, (pg, label, key, col)) in rows.iter().enumerate() {
-            let y = dir_y + i as i32 * 22;
-            self.canvas.draw_text(SAFE_X + 10, y, pg, 1, 2, YELLOW, None);
-            self.canvas.draw_text(SAFE_X + 54, y, label, 1, 2, *col, None);
-            // Dotted leader
-            let dot_start = SAFE_X + 54 + label.len() as i32 * 8 + 8;
-            let kw = key.len() as i32 * 8;
-            let dot_end = SAFE_X + SAFE_W - kw - 18;
-            let mut dx = dot_start;
-            while dx < dot_end {
-                self.canvas.draw_text(dx, y, ".", 1, 2, [96, 128, 176, 255], None);
-                dx += 12;
-            }
-            self.canvas.draw_text(SAFE_X + SAFE_W - kw - 10, y, key, 1, 2, WHITE, None);
+        self.put_text(1, 13, "CARRIER", YELLOW, None);
+        self.put_text(10, 13, host_val, CYAN, None);
+
+        self.put_text(1, 14, "SERVICE", YELLOW, None);
+        self.put_text(10, 14, info.source_kind, GREEN, None);
+
+        self.put_text(1, 15, if info.mode == TeletextMode::Loading { "ELAPSED" } else { "OFFLINE" }, YELLOW, None);
+        let time_note = match info.mode {
+            TeletextMode::Loading => format!("{elapsed_str}  WAITING FOR VIDEO FRAME"),
+            TeletextMode::Inactive => format!("{elapsed_str}  PRESS R TO RE-TUNE"),
+        };
+        self.put_text(10, 15, &time_note, if info.mode == TeletextMode::Loading { WHITE } else { YELLOW }, None);
+
+        // ---- Row 17: Full-Width Blue Mosaic Separator Strip
+        for c in 0..COLS {
+            self.put_sixel(c, 17, 0b001100, CYAN, false);
         }
 
-        // ---- Bottom Iconic 4-Color Teletext Fastext Buttons (Red / Green / Yellow / Cyan)
-        let fast_y = SAFE_Y + 404;
-        let fast_h = 26;
-        let fast_w = SAFE_W / 4;
-        let buttons = [
-            ("R:RETRY", RED, WHITE),
-            ("G:GUIDE", GREEN, BLACK),
-            ("E:LIST", YELLOW, BLACK),
-            ("]:NEXT CH", CYAN, BLACK),
-        ];
-        for (i, (txt, bg, fg)) in buttons.iter().enumerate() {
-            let bx = SAFE_X + i as i32 * fast_w;
-            let bw = if i == 3 { SAFE_W - i as i32 * fast_w } else { fast_w - 4 };
-            self.canvas.fill_rect(bx, fast_y, bw, fast_h, *bg);
-            let tw = txt.len() as i32 * 8;
-            self.canvas.draw_text(bx + (bw - tw) / 2, fast_y + 5, txt, 1, 2, *fg, None);
-        }
+        // ---- Rows 18-20: Authentic 2-Column Ceefax Page Index
+        self.put_text(1, 18, "100", YELLOW, None);
+        self.put_text(5, 18, "GUIDE ...... G", WHITE, None);
+        self.put_text(21, 18, "300", YELLOW, None);
+        self.put_text(25, 18, "RETRY ...... R", GREEN, None);
+
+        self.put_text(1, 19, "200", YELLOW, None);
+        self.put_text(5, 19, "CATALOG .... E", CYAN, None);
+        self.put_text(21, 19, "400", YELLOW, None);
+        self.put_text(25, 19, "CH +/- ... ]/[", WHITE, None);
+
+        // ---- Row 21: Solid Blue Service Notice Strip (classic BBC Ceefax sub-footer)
+        self.fill_cells(0, 21, COLS, BLUE);
+        self.put_text(1, 21, "VICTR TELETEXT SERVICE   40-COL WST", YELLOW, None);
+
+        // ---- Row 23: Authentic 4-Color Teletext Fastext Line (colored text directly on black, no pill boxes!)
+        self.put_text(1, 23, "RETRY(R)", RED, None);
+        self.put_text(11, 23, "GUIDE(G)", GREEN, None);
+        self.put_text(21, 23, "LIST(E)", YELLOW, None);
+        self.put_text(31, 23, "NEXT(])", CYAN, None);
 
         // Unique frame ID in separate high-bit namespace from Guide & video frames
         let id = 0x4000_0000_0000_0000 | self.frame_counter;
