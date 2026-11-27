@@ -1733,6 +1733,16 @@ impl CrtApp {
         if matches!(ch.kind, ChannelKind::LiveStream { .. } | ChannelKind::Guide) {
             return;
         }
+        if !self.guide.active {
+            let (pos, len) = {
+                let vis = self.visible_channels();
+                (vis.iter().position(|c| c.number == channel_number), vis.len())
+            };
+            if let Some(pos) = pos {
+                self.guide.selected_idx = pos;
+                self.guide.clamp_selection(len);
+            }
+        }
         self.ensure_channel_episodes(&ch);
         let active_id = self.active_watch.as_ref().map(|w| w.item_id.as_str());
         let init_idx = ch.default_item_index(active_id);
@@ -6055,7 +6065,9 @@ impl CrtApp {
             return;
         }
 
-        // Global Cable Guide toggle: Home/Guide button OR Select+Start chord (works even mid-game!)
+        // Global Cable Guide / Game List toggle: Home/Guide button OR Select+Start chord (works even mid-game!)
+        // When inside a multi-item game channel (CH 03 ROMs, PuzzleScript, PICO-8), jump straight to its
+        // Item Picker so 1 press returns to the game list (and B/Circle backs out to the full Cable Guide).
         let chord_down = (mask & (retro::BTN_SELECT | retro::BTN_START)) == (retro::BTN_SELECT | retro::BTN_START);
         if !chord_down {
             self.gp_chord_fired = false;
@@ -6065,6 +6077,19 @@ impl CrtApp {
             self.gp_chord_fired = true;
         }
         if self.has_channels() && ((pressed & retro::BTN_GUIDE) != 0 || chord_trigger) {
+            if !self.guide.active && (retro_playing || web_playing) {
+                let game_picker_ch = self
+                    .current_channel
+                    .filter(|&n| n > 1)
+                    .and_then(|n| self.channel_by_number(n))
+                    .filter(|ch| !matches!(ch.kind, ChannelKind::LiveStream { .. } | ChannelKind::Guide) && !ch.items().is_empty())
+                    .map(|ch| ch.number);
+                if let Some(ch_num) = game_picker_ch {
+                    self.sim.switch_channel();
+                    self.open_episode_picker(ch_num);
+                    return;
+                }
+            }
             self.toggle_guide();
             return;
         }
@@ -6786,7 +6811,7 @@ impl CrtApp {
 
                 ui.add_space(3.0);
                 ui.label(
-                    RichText::new("Gamepad: Home or Select+Start = Guide · D-Pad = Move · A = Tune · B = Back · X = List/Seen · Y = Fav · LB/RB = Page.")
+                    RichText::new("Gamepad: Home or Select+Start = Guide/Game List · D-Pad = Move · A = Tune · B = Back · X = List/Seen · Y = Fav · LB/RB = Page.")
                         .weak()
                         .small(),
                 );
