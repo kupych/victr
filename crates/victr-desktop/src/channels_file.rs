@@ -148,6 +148,30 @@ pub fn config_path() -> Option<PathBuf> {
     crate::settings::presets_dir().and_then(|d| d.parent().map(|p| p.join("channels.json")))
 }
 
+pub fn watch_state_path() -> Option<PathBuf> {
+    crate::settings::presets_dir().and_then(|d| d.parent().map(|p| p.join("channels_state.json")))
+}
+
+pub fn load_watch_state() -> crate::provider::OpenChannelWatchState {
+    let Some(path) = watch_state_path() else {
+        return Default::default();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Default::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+pub fn save_watch_state(state: &crate::provider::OpenChannelWatchState) {
+    let Some(path) = watch_state_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(state) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 pub fn load_config_from(path: &Path) -> Result<ChannelsFileConfig, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("Couldn't read {}: {e}", path.display()))?;
     serde_json::from_str(&text).map_err(|e| format!("Invalid channels.json: {e}"))
@@ -901,6 +925,7 @@ enum FileEvent {
 
 pub struct ChannelsFileManager {
     pub cfg: ChannelsFileConfig,
+    pub watch_state: crate::provider::OpenChannelWatchState,
     pub channels: Vec<Channel>,
     pub file_exists: bool,
     pub status: String,
@@ -919,6 +944,7 @@ impl ChannelsFileManager {
     pub fn new_offline() -> Self {
         Self {
             cfg: ChannelsFileConfig::default(),
+            watch_state: crate::provider::OpenChannelWatchState::default(),
             channels: Vec::new(),
             file_exists: false,
             status: String::new(),
@@ -936,8 +962,24 @@ impl ChannelsFileManager {
 
     pub fn new() -> Self {
         let mut mgr = Self::new_offline();
+        mgr.watch_state = load_watch_state();
         mgr.reload_from_disk();
         mgr
+    }
+
+    pub fn set_item_played(&mut self, item_id: &str, played: bool) {
+        self.watch_state.set_played(item_id, played);
+        save_watch_state(&self.watch_state);
+    }
+
+    pub fn save_resume(&mut self, item_id: &str, pos_secs: f64, duration_secs: f64) {
+        self.watch_state.save_resume(item_id, pos_secs, duration_secs);
+        save_watch_state(&self.watch_state);
+    }
+
+    pub fn record_last_item(&mut self, source_key: &str, item_id: &str) {
+        self.watch_state.record_last_item(source_key, item_id);
+        save_watch_state(&self.watch_state);
     }
 
     fn ensure_web_galleries(&mut self) {

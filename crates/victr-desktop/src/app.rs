@@ -1294,6 +1294,11 @@ impl CrtApp {
             }
         }
         channels_file::apply_overrides(&mut raw, &self.channels_file.cfg);
+        provider::apply_open_watch_state(
+            &mut raw,
+            &self.channels_file.watch_state,
+            &self.app_cfg.favorite_items,
+        );
         if raw.is_empty() {
             self.lineup.clear();
             return;
@@ -1352,6 +1357,7 @@ impl CrtApp {
             true
         };
         let _ = settings::save_app_config(&self.app_cfg);
+        self.rebuild_lineup();
         let short: String = title.chars().take(22).collect();
         self.osd.show_action(&format!(
             "{} {}",
@@ -1417,6 +1423,7 @@ impl CrtApp {
             "plex" => self.plex.set_item_played(item_id, played),
             "folders" => self.folders.set_item_played(item_id, played),
             "custom" => self.custom.set_item_played(item_id, played),
+            "channels" => self.channels_file.set_item_played(item_id, played),
             _ => {}
         }
         if let Some(w) = &mut self.active_watch {
@@ -1441,6 +1448,12 @@ impl CrtApp {
             "custom" => {
                 if w.dwell_secs >= 15.0 && !w.marked_played {
                     self.custom.save_resume(&w.item_id, w.last_pos, w.duration_secs);
+                    self.rebuild_lineup();
+                }
+            }
+            "channels" => {
+                if w.dwell_secs >= 15.0 && !w.marked_played && w.duration_secs > 10.0 {
+                    self.channels_file.save_resume(&w.item_id, w.last_pos, w.duration_secs);
                     self.rebuild_lineup();
                 }
             }
@@ -1668,6 +1681,9 @@ impl CrtApp {
             self.jellyfin.begin_watch(&target);
         } else if target.provider_id == "plex" {
             self.plex.begin_watch(&target);
+        } else if target.provider_id == "channels" && !target.item.id.is_empty() && target.item.id != target.source_key {
+            self.channels_file.record_last_item(&target.source_key, &target.item.id);
+            self.rebuild_lineup();
         }
         // Automatically switch TV profile / preset if this channel's type (or override) maps to one
         self.apply_channel_profile(&target.channel_type, target.profile_override.as_deref());
@@ -5780,12 +5796,43 @@ impl CrtApp {
                         if ui.small_button("Ch +").clicked() {
                             self.surf_channel(1);
                         }
-                        if self.active_watch.is_some() {
+                        if let Some(w_snap) = self.active_watch.as_ref().map(|w| (w.channel_number, w.item_id.clone(), w.title.clone(), w.marked_played)) {
+                            let (w_ch, w_iid, w_title, w_played) = w_snap;
+                            let is_fav = !w_iid.is_empty() && self.app_cfg.favorite_items.contains(&w_iid);
                             if ui.small_button("Prev").clicked() {
                                 self.step_episode(-1);
                             }
                             if ui.small_button("Next").clicked() {
                                 self.step_episode(1);
+                            }
+                            if ui.small_button("List (E)").on_hover_text("Browse episodes/games on this channel (E)").clicked() {
+                                self.open_episode_picker(w_ch);
+                            }
+                            let seen_lbl = if w_played {
+                                RichText::new("Watched").color(Color32::from_rgb(138, 240, 178)).strong()
+                            } else {
+                                RichText::new("Mark Watched")
+                            };
+                            if ui
+                                .add(egui::Button::new(seen_lbl).selected(w_played).small())
+                                .on_hover_text("Mark this episode or game as watched/played so it won't auto-play again (W)")
+                                .clicked()
+                            {
+                                self.toggle_current_watched();
+                            }
+                            if !w_iid.is_empty() {
+                                let fav_lbl = if is_fav {
+                                    RichText::new("Fav *").color(Color32::from_rgb(255, 214, 96)).strong()
+                                } else {
+                                    RichText::new("Fav *")
+                                };
+                                if ui
+                                    .add(egui::Button::new(fav_lbl).selected(is_fav).small())
+                                    .on_hover_text("Favorite this item to float it to the top (*)")
+                                    .clicked()
+                                {
+                                    self.toggle_favorite_item(&w_iid, &w_title);
+                                }
                             }
                         }
                     });

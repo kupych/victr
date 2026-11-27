@@ -1,20 +1,33 @@
 // ViCTR Web (onvic.tr) — Thin ES-module shell over victr-web WASM + WebGPU.
+// Supports direct HLS/MP4/image streams, Owncast & PeerTube auto-resolve,
+// shareable ?m3u= & ?feed=channels.json lineups with 90s Prevue Cable Guide (G),
+// localStorage watched/favorite/last-episode memory, and ?embed=1 mode.
 import init, { VictrWeb } from "./pkg/victr_web.js";
 
-const STARTER_CHANNELS = [
+const WATCH_STORAGE_KEY = "victr_web_watch_state_v1";
+
+const DEFAULT_LINEUP = [
   {
-    slug: "nhk",
-    num: 80,
-    callsign: "NHK",
+    number: 80,
+    id: "nhk-world-live",
     name: "NHK World-Japan",
-    url: "https://nhkwlive-ojp.akamaized.net/hls/live/2003459/nhkwlive-ojp-en/index.m3u8",
+    callsign: "NHK",
+    kind: "live",
+    group: "News & Culture",
+    now_title: "24/7 Live Broadcast",
+    overview: "Free international public broadcast from Japan — news, documentaries, and culture.",
+    stream_url: "https://nhkwlive-ojp.akamaized.net/hls/live/2003459/nhkwlive-ojp-en/index.m3u8",
   },
   {
-    slug: "dw",
-    num: 81,
-    callsign: "DW",
+    number: 81,
+    id: "dw-news-live",
     name: "DW News",
-    url: "https://dwamdstream102.akamaized.net/hls/live/2015525/dwstream102/index.m3u8",
+    callsign: "DW",
+    kind: "live",
+    group: "News & Culture",
+    now_title: "24/7 International News",
+    overview: "Free 24/7 English international news and documentary broadcast from Deutsche Welle.",
+    stream_url: "https://dwamdstream102.akamaized.net/hls/live/2015525/dwstream102/index.m3u8",
   },
 ];
 
@@ -34,10 +47,25 @@ let audioCtx = null;
 let audioSource = null;
 let audioProc = null;
 let audioUnlocked = false;
-let currentSource = { type: "pattern", key: "demo_scene", url: "", title: "Demo Scene", ch: 80, callsign: "LIVE" };
-let activeStarterIdx = -1;
 let toastTimer = null;
 let proxyBase = "";
+let activeFeedUrl = "";
+let activeM3uUrl = "";
+let lineupDefs = [...DEFAULT_LINEUP];
+
+let currentSource = {
+  type: "pattern",
+  key: "demo_scene",
+  url: "",
+  title: "Demo Scene",
+  ch: 0,
+  callsign: "LIVE",
+  sourceKey: "",
+  itemId: "",
+  itemPlayed: false,
+  itemFavorite: false,
+  hasItems: false,
+};
 
 function showToast(msg) {
   toastEl.textContent = msg;
@@ -67,6 +95,23 @@ function proxiedUrl(rawUrl) {
   return proxyBase + encodeURIComponent(rawUrl);
 }
 
+function persistWatchState() {
+  if (!victr) return;
+  try {
+    localStorage.setItem(WATCH_STORAGE_KEY, victr.export_watch_state_json());
+  } catch {
+    // Private browsing or storage quota disabled
+  }
+}
+
+function loadPersistedWatchState() {
+  if (!victr) return;
+  try {
+    const raw = localStorage.getItem(WATCH_STORAGE_KEY);
+    if (raw) victr.import_watch_state_json(raw);
+  } catch {}
+}
+
 // ---- WebAudio Analog TV DSP Bridge
 function ensureAudioGraph() {
   if (!victr) return;
@@ -87,9 +132,7 @@ function ensureAudioGraph() {
     try {
       audioSource = audioCtx.createMediaElementSource(video);
       audioSource.connect(audioProc);
-    } catch {
-      // Cross-origin video without CORS cannot be tapped into WebAudio; fallback to direct element audio
-    }
+    } catch {}
   }
   if (audioCtx && audioCtx.state === "suspended") {
     audioCtx.resume().catch(() => {});
@@ -122,19 +165,215 @@ function isHlsUrl(url) {
   return /\.m3u8(\?.*)?$/i.test(url);
 }
 
-function tuneUrl(rawUrl, opts = {}) {
-  const url = (rawUrl || "").trim();
-  if (!url || !victr) return;
+function isVideoFileUrl(url) {
+  return /\.(mp4|webm|ogv|m4v|mov)(\?.*)?$/i.test(url);
+}
+
+function isJsonFeedUrl(url) {
+  return /\.json(\?.*)?$/i.test(url);
+}
+
+function isM3uPlaylistUrl(url) {
+  return /\.m3u(\?.*)?$/i.test(url);
+}
+
+// ---- M3U / M3U8 Multi-Channel Playlist Parser
+function parseM3uPlaylist(text) {
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  let pending = null;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("#EXTINF:")) {
+      const commaIdx = line.indexOf(",");
+      const attrs = commaIdx >= 0 ? line.slice(8, commaIdx) : line.slice(8);
+      const title = commaIdx >= 0 ? line.slice(commaIdx + 1).trim() : "";
+      const attr = (key) => {
+        const m = attrs.match(new RegExp(`${key}="([^"]*)"`, "i"));
+        return m ? m[1].trim() : "";
+      };
+      pending = {
+        name: title || attr("tvg-name") || "Live Channel",
+        callsign: attr("tvg-id").replace(/[^A-Za-z0-9]/g, "").slice(0, 5),
+        group: attr("group-title") || "Live",
+        number: parseInt(attr("tvg-chno") || "0", 10) || undefined,
+      };
+    } else if (!line.startsWith("#")) {
+      const meta = pending || { name: line.replace(/^https?:\/\//i, "").split("/")[0], group: "Live" };
+      out.push({
+        number: meta.number,
+        name: meta.name,
+        callsign: meta.callsign || "",
+        kind: "live",
+        group: meta.group || "Live",
+        now_title: meta.name,
+        stream_url: line,
+      });
+      pending = null;
+    }
+  }
+  return out;
+}
+
+// ---- Indie Streamer Auto-Resolvers (PeerTube & Owncast)
+async function resolveIndieUrl(rawUrl) {
+  const url = rawUrl.trim();
+  if (isHlsUrl(url) || isVideoFileUrl(url) || isImageUrl(url) || url.startsWith("blob:")) {
+    return { streamUrl: url };
+  }
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { streamUrl: url };
+  }
+
+  // 1. PeerTube watch link (/w/<id> or /videos/watch/<id>)
+  const ptMatch = parsed.pathname.match(/^\/(?:w|videos\/watch)\/([A-Za-z0-9_-]+)/);
+  if (ptMatch) {
+    try {
+      const api = `${parsed.origin}/api/v1/videos/${ptMatch[1]}`;
+      const resp = await fetch(proxiedUrl(api));
+      if (resp.ok) {
+        const data = await resp.json();
+        const hlsUrl = data.streamingPlaylists?.[0]?.playlistUrl;
+        const mp4Url = data.files?.[0]?.fileUrl || data.streamingPlaylists?.[0]?.files?.[0]?.fileUrl;
+        const streamUrl = hlsUrl || mp4Url;
+        if (streamUrl) {
+          return {
+            streamUrl,
+            title: data.name || data.channel?.displayName || "PeerTube",
+            callsign: (data.channel?.displayName || "PTUBE").replace(/[^A-Za-z0-9]/g, "").slice(0, 5),
+            overview: data.description || "",
+          };
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Owncast instance root URL (probes /api/status)
+  if (parsed.pathname === "/" || parsed.pathname === "" || parsed.pathname === "/embed/video") {
+    try {
+      const resp = await fetch(proxiedUrl(`${parsed.origin}/api/status`));
+      if (resp.ok) {
+        const st = await resp.json();
+        if (typeof st.online === "boolean") {
+          return {
+            streamUrl: `${parsed.origin}/hls/stream.m3u8`,
+            title: st.streamTitle || st.name || parsed.hostname,
+            callsign: (st.name || "CAST").replace(/[^A-Za-z0-9]/g, "").slice(0, 5),
+            offline: !st.online,
+            offlineDetail: st.offlineMessage || "OWNCAST STREAM CURRENTLY OFFLINE",
+          };
+        }
+      }
+    } catch {}
+  }
+
+  return { streamUrl: url };
+}
+
+async function loadM3uFeed(url) {
+  try {
+    showToast("Loading M3U lineup…");
+    const resp = await fetch(proxiedUrl(url));
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const text = await resp.text();
+    const defs = parseM3uPlaylist(text);
+    if (!defs.length) throw new Error("No channels found in M3U playlist");
+    activeM3uUrl = url;
+    activeFeedUrl = "";
+    lineupDefs = defs;
+    victr.set_lineup_json(JSON.stringify(lineupDefs));
+    showToast(`Loaded ${defs.length} channels — press G for Guide!`);
+    return true;
+  } catch (err) {
+    showToast(`M3U load failed: ${err.message || err}`);
+    return false;
+  }
+}
+
+async function loadJsonFeed(url) {
+  try {
+    showToast("Loading channel feed…");
+    const resp = await fetch(proxiedUrl(url));
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    const rawList = Array.isArray(data) ? data : Array.isArray(data.channels) ? data.channels : [];
+    if (!rawList.length) throw new Error("No channels in feed JSON");
+    activeFeedUrl = url;
+    activeM3uUrl = "";
+    lineupDefs = rawList;
+    victr.set_lineup_json(JSON.stringify(lineupDefs));
+    showToast(`Loaded ${rawList.length} channels — press G for Guide!`);
+    return true;
+  } catch (err) {
+    showToast(`Feed load failed: ${err.message || err}`);
+    return false;
+  }
+}
+
+async function tuneUrl(rawUrl, opts = {}) {
+  const trimmed = (rawUrl || "").trim();
+  if (!trimmed || !victr) return;
+
+  // Allow pasting a .json feed or .m3u lineup directly into the Tune bar!
+  if (!opts.skipFeedDetect) {
+    if (isJsonFeedUrl(trimmed)) {
+      if (await loadJsonFeed(trimmed)) {
+        if (!victr.is_guide_active()) victr.toggle_guide();
+        syncUiFromEngine();
+      }
+      return;
+    }
+    if (isM3uPlaylistUrl(trimmed)) {
+      if (await loadM3uFeed(trimmed)) {
+        if (!victr.is_guide_active()) victr.toggle_guide();
+        syncUiFromEngine();
+      }
+      return;
+    }
+  }
+
   stopCurrentStream();
   victr.switch_channel_effect();
 
   const chNum = opts.ch || 80;
-  const callsign = (opts.callsign || "LIVE").toUpperCase().slice(0, 5);
-  const title = opts.title || url.replace(/^https?:\/\//i, "").split("/")[0];
+  let callsign = (opts.callsign || "LIVE").toUpperCase().slice(0, 5);
+  let title = opts.title || trimmed.replace(/^https?:\/\//i, "").split("/")[0];
+  let url = trimmed;
 
-  currentSource = { type: "url", url, title, ch: chNum, callsign };
-  $("stream-url").value = url;
+  // Show Teletext while probing Owncast/PeerTube or buffering
+  victr.set_teletext(true, false, chNum, callsign, title, trimmed, "ACQUIRING CARRIER...");
+
+  const resolved = await resolveIndieUrl(trimmed);
+  url = resolved.streamUrl || trimmed;
+  if (resolved.title && !opts.title) title = resolved.title;
+  if (resolved.callsign && !opts.callsign) callsign = resolved.callsign.toUpperCase();
+
+  currentSource = {
+    type: "url",
+    url: trimmed,
+    title,
+    ch: chNum,
+    callsign,
+    sourceKey: opts.sourceKey || "",
+    itemId: opts.itemId || "",
+    itemPlayed: Boolean(opts.itemPlayed),
+    itemFavorite: Boolean(opts.itemFavorite),
+    hasItems: Boolean(opts.hasItems),
+  };
+  $("stream-url").value = trimmed;
+  victr.set_active_context(chNum, currentSource.sourceKey, currentSource.itemId, `CH ${String(chNum).padStart(2, "0")} ${callsign} · ${title}`);
+  persistWatchState();
   victr.show_osd_channel(chNum, callsign, title);
+  syncUiFromEngine();
+
+  if (resolved.offline) {
+    victr.set_teletext(true, true, chNum, callsign, title, trimmed, resolved.offlineDetail || "STREAM OFFLINE");
+    return;
+  }
 
   if (isImageUrl(url)) {
     victr.set_teletext(true, false, chNum, callsign, title, url, "LOADING IMAGE...");
@@ -151,9 +390,8 @@ function tuneUrl(rawUrl, opts = {}) {
     return;
   }
 
-  // Video / HLS stream -> show authentic 1980s Teletext carrier screen while buffering
-  victr.set_teletext(true, false, chNum, callsign, title, url, "ACQUIRING CARRIER...");
   const effectiveUrl = proxiedUrl(url);
+  const startSecs = Number(opts.startSecs || 0);
 
   const onPlaying = () => {
     victr.set_teletext(false, false, chNum, callsign, title, url, "");
@@ -164,7 +402,19 @@ function tuneUrl(rawUrl, opts = {}) {
   };
 
   video.onplaying = onPlaying;
-  video.onerror = () => onFail("VIDEO DECODE / CORS ERROR");
+  video.onerror = () => onFail("VIDEO DECODE OR CORS BLOCKED");
+  video.onloadedmetadata = () => {
+    if (startSecs > 1 && Number.isFinite(video.duration) && startSecs < video.duration - 5) {
+      video.currentTime = startSecs;
+    }
+  };
+  video.onended = () => {
+    if (currentSource.ch > 0 && currentSource.itemId) {
+      victr.toggle_item_watched(currentSource.itemId);
+      persistWatchState();
+      stepEpisode(1);
+    }
+  };
 
   if (isHlsUrl(url) && window.Hls && window.Hls.isSupported()) {
     hls = new window.Hls({
@@ -173,7 +423,6 @@ function tuneUrl(rawUrl, opts = {}) {
       maxBufferLength: 12,
       capLevelToPlayerSize: false,
     });
-    // Prefer <=480p rendition to match 480i CRT raster cleanly when available
     hls.on(window.Hls.Events.MANIFEST_PARSED, (_e, data) => {
       const levels = data.levels || [];
       let best = -1;
@@ -204,26 +453,74 @@ function tuneUrl(rawUrl, opts = {}) {
   }
 }
 
-function tuneStarter(index) {
-  const len = STARTER_CHANNELS.length;
-  activeStarterIdx = ((index % len) + len) % len;
-  const ch = STARTER_CHANNELS[activeStarterIdx];
-  document.querySelectorAll(".chip").forEach((el) => el.classList.toggle("active", el.dataset.slug === ch.slug));
-  tuneUrl(ch.url, { ch: ch.num, callsign: ch.callsign, title: ch.name });
+function applyTuneTarget(t) {
+  if (!t || !t.stream_url) return;
+  if (t.profile_override) {
+    victr.set_preset_by_name(t.profile_override);
+  }
+  tuneUrl(t.stream_url, {
+    ch: t.channel_number,
+    callsign: t.callsign,
+    title: t.item_title || t.channel_name,
+    sourceKey: t.source_key,
+    itemId: t.item_id,
+    itemPlayed: t.item_played,
+    itemFavorite: t.item_favorite,
+    hasItems: t.has_items,
+    startSecs: t.start_secs || 0,
+    skipFeedDetect: true,
+  });
+}
+
+function handleGuideActionJson(raw) {
+  if (!raw || raw === "{}") return;
+  const res = JSON.parse(raw);
+  if (res.action === "tune" && res.target) {
+    applyTuneTarget(res.target);
+  }
+  syncUiFromEngine();
+}
+
+function tuneChannelNumber(chNum) {
+  if (!victr || chNum <= 0) return;
+  handleGuideActionJson(victr.resolve_channel_json(chNum));
+}
+
+function surfChannel(delta) {
+  const next = victr.surf_channel_num(delta);
+  if (next > 0) tuneChannelNumber(next);
+}
+
+function stepEpisode(delta) {
+  if (!currentSource.ch || !currentSource.itemId) return;
+  const raw = victr.step_episode_json(currentSource.ch, currentSource.itemId, delta);
+  if (raw && raw !== "{}") {
+    applyTuneTarget(JSON.parse(raw));
+  } else {
+    victr.show_osd_action(delta >= 0 ? "LAST ITEM" : "FIRST ITEM");
+  }
 }
 
 function tunePattern(key, label) {
   stopCurrentStream();
-  activeStarterIdx = -1;
-  currentSource = { type: "pattern", key, url: "", title: label, ch: 0, callsign: "TEST" };
+  currentSource = {
+    type: "pattern",
+    key,
+    url: "",
+    title: label,
+    ch: 0,
+    callsign: "TEST",
+    sourceKey: "",
+    itemId: "",
+    itemPlayed: false,
+    itemFavorite: false,
+    hasItems: false,
+  };
   victr.switch_channel_effect();
   victr.set_teletext(false, false, 0, "", "", "", "");
   victr.set_pattern(key);
   victr.show_osd_action(label.toUpperCase());
-  document.querySelectorAll(".chip").forEach((el) => {
-    const match = (key === "demo_scene" && el.dataset.slug === "demo") || (key === "color_bars" && el.dataset.slug === "bars");
-    el.classList.toggle("active", match);
-  });
+  syncUiFromEngine();
 }
 
 async function startTabMirror() {
@@ -240,7 +537,18 @@ async function startTabMirror() {
     mediaStream = stream;
     video.srcObject = stream;
     await video.play();
-    currentSource = { type: "mirror", url: "", title: "AV 1 · Live Mirror", ch: 0, callsign: "AV1" };
+    currentSource = {
+      type: "mirror",
+      url: "",
+      title: "AV 1 · Live Mirror",
+      ch: 0,
+      callsign: "AV1",
+      sourceKey: "",
+      itemId: "",
+      itemPlayed: false,
+      itemFavorite: false,
+      hasItems: false,
+    };
     victr.switch_channel_effect();
     victr.set_teletext(false, false, 0, "AV1", "Live Mirror", "", "");
     victr.show_osd_channel(0, "AV1", "LIVE CAPTURE");
@@ -248,6 +556,7 @@ async function startTabMirror() {
       victr.show_osd_action("AV1 DISCONNECTED");
       tunePattern("demo_scene", "Demo Scene");
     });
+    syncUiFromEngine();
     showToast("Mirroring live tab/window onto CRT!");
   } catch (err) {
     if (err?.name !== "AbortError" && err?.name !== "NotAllowedError") {
@@ -265,20 +574,47 @@ async function loadLocalFile(file) {
     victr.upload_image_bitmap(bmp);
     bmp.close();
     victr.show_osd_action(file.name.slice(0, 22).toUpperCase());
-    currentSource = { type: "file", url: "", title: file.name, ch: 0, callsign: "IMG" };
+    currentSource = { type: "file", url: "", title: file.name, ch: 0, callsign: "IMG", sourceKey: "", itemId: "", itemPlayed: false, itemFavorite: false, hasItems: false };
+    syncUiFromEngine();
   } else if (file.type.startsWith("video/")) {
     const blobUrl = URL.createObjectURL(file);
-    tuneUrl(blobUrl, { ch: 0, callsign: "VCR", title: file.name });
-    currentSource = { type: "file", url: "", title: file.name, ch: 0, callsign: "VCR" };
+    tuneUrl(blobUrl, { ch: 0, callsign: "VCR", title: file.name, skipFeedDetect: true });
+    currentSource.type = "file";
+  } else if (/\.m3u8?$/i.test(file.name)) {
+    const text = await file.text();
+    const defs = parseM3uPlaylist(text);
+    if (defs.length) {
+      lineupDefs = defs;
+      victr.set_lineup_json(JSON.stringify(lineupDefs));
+      if (!victr.is_guide_active()) victr.toggle_guide();
+      showToast(`Loaded ${defs.length} channels from ${file.name}`);
+      syncUiFromEngine();
+    }
+  } else if (/\.json$/i.test(file.name)) {
+    const data = JSON.parse(await file.text());
+    const rawList = Array.isArray(data) ? data : Array.isArray(data.channels) ? data.channels : [];
+    if (rawList.length) {
+      lineupDefs = rawList;
+      victr.set_lineup_json(JSON.stringify(lineupDefs));
+      if (!victr.is_guide_active()) victr.toggle_guide();
+      showToast(`Loaded ${rawList.length} channels from ${file.name}`);
+      syncUiFromEngine();
+    }
   } else {
-    showToast("Drop an MP4/WebM video or PNG/JPG/WebP image.");
+    showToast("Drop an MP4/WebM video, image, .m3u playlist, or channels.json.");
   }
 }
 
 function buildShareUrl() {
   const s = JSON.parse(victr.get_settings_json());
   const out = new URL(window.location.origin + window.location.pathname);
-  if (currentSource.type === "url" && currentSource.url) {
+  if (activeFeedUrl) {
+    out.searchParams.set("feed", activeFeedUrl);
+    if (currentSource.ch > 1) out.searchParams.set("ch", String(currentSource.ch));
+  } else if (activeM3uUrl) {
+    out.searchParams.set("m3u", activeM3uUrl);
+    if (currentSource.ch > 1) out.searchParams.set("ch", String(currentSource.ch));
+  } else if (currentSource.type === "url" && currentSource.url) {
     out.searchParams.set("url", currentSource.url);
     if (currentSource.title) out.searchParams.set("title", currentSource.title);
     if (currentSource.ch) out.searchParams.set("ch", String(currentSource.ch));
@@ -313,14 +649,30 @@ function syncUiFromEngine() {
   $("sl-vol").value = String(s.volume);
   $("btn-power").classList.toggle("active", s.power_on);
   $("btn-crop").classList.toggle("active", s.crop_43);
+  $("btn-guide").classList.toggle("active", s.guide_active);
+  $("btn-guide").textContent = s.guide_active ? "Exit Guide (G)" : "Cable Guide (G)";
   $("btn-mute").textContent = s.muted ? "Unmute" : "Mute";
   $("btn-whack").classList.toggle("hidden", !s.chaos);
   $("gpu-badge").textContent = `${s.backend} · ${s.hdr_active ? "HDR" : "SDR"} · ${s.screen_inches.toFixed(1)}"`;
+
+  const itemBar = $("active-item-bar");
+  itemBar.classList.toggle("hidden", !currentSource.hasItems || !currentSource.itemId);
+  if (currentSource.hasItems && currentSource.itemId) {
+    $("btn-watched").textContent = currentSource.itemPlayed ? "Watched" : "Mark Watched";
+    $("btn-watched").classList.toggle("active", currentSource.itemPlayed);
+    $("btn-fav").classList.toggle("active", currentSource.itemFavorite);
+  }
 }
 
-function applyUrlParamsOnBoot() {
+async function applyUrlParamsOnBoot() {
   const params = new URLSearchParams(window.location.search);
   proxyBase = params.get("proxy") || "";
+  if (params.get("embed") === "1" || params.get("embed") === "true") {
+    document.body.classList.add("embed-mode");
+  }
+
+  loadPersistedWatchState();
+  victr.set_lineup_json(JSON.stringify(lineupDefs));
 
   const presetParam = params.get("preset");
   if (presetParam) victr.set_preset_by_name(presetParam);
@@ -336,19 +688,41 @@ function applyUrlParamsOnBoot() {
     victr.set_crop_43(true);
   }
 
-  // Support both ?url=... and clean shareable path slugs (/nhk, /dw, /demo, /bars)
+  // Load multi-channel ?feed= or ?m3u= if provided
+  if (params.get("feed")) {
+    const ok = await loadJsonFeed(params.get("feed"));
+    if (ok) {
+      const wantCh = parseInt(params.get("ch") || "0", 10);
+      if (wantCh > 1) tuneChannelNumber(wantCh);
+      else victr.toggle_guide();
+      syncUiFromEngine();
+      return;
+    }
+  } else if (params.get("m3u")) {
+    const ok = await loadM3uFeed(params.get("m3u"));
+    if (ok) {
+      const wantCh = parseInt(params.get("ch") || "0", 10);
+      if (wantCh > 1) tuneChannelNumber(wantCh);
+      else victr.toggle_guide();
+      syncUiFromEngine();
+      return;
+    }
+  }
+
   const slug = window.location.pathname.replace(/^\/+|\/+$/g, "").toLowerCase();
   const explicitUrl = params.get("url") || params.get("src");
   if (explicitUrl) {
-    tuneUrl(explicitUrl, {
+    await tuneUrl(explicitUrl, {
       ch: parseInt(params.get("ch") || "80", 10) || 80,
       callsign: params.get("tag") || "LIVE",
       title: params.get("title") || "",
     });
+  } else if (slug === "guide" || params.get("guide") === "1") {
+    victr.toggle_guide();
   } else if (slug === "nhk") {
-    tuneStarter(0);
+    tuneChannelNumber(80);
   } else if (slug === "dw") {
-    tuneStarter(1);
+    tuneChannelNumber(81);
   } else if (slug === "bars" || params.get("pattern") === "color_bars") {
     tunePattern("color_bars", "Color Bars");
   } else if (slug === "demo" || params.get("pattern") === "demo_scene") {
@@ -356,14 +730,12 @@ function applyUrlParamsOnBoot() {
   } else if (params.has("pattern")) {
     tunePattern(params.get("pattern"), params.get("pattern"));
   } else {
-    // Default landing experience: tune NHK World live right away so it feels like turning on a TV!
-    tuneStarter(0);
+    tuneChannelNumber(80);
   }
   syncUiFromEngine();
 }
 
 function wireControls() {
-  // Populate presets dropdown
   const presets = JSON.parse(VictrWeb.preset_names_json());
   const selPreset = $("sel-preset");
   presets.forEach((name, idx) => {
@@ -373,7 +745,6 @@ function wireControls() {
     selPreset.appendChild(opt);
   });
 
-  // Unlock WebAudio on first user gesture
   const unlockOnce = () => ensureAudioGraph();
   window.addEventListener("pointerdown", unlockOnce, { once: true });
   window.addEventListener("keydown", unlockOnce, { once: true });
@@ -382,31 +753,52 @@ function wireControls() {
     victr?.show_osd_action("TV SOUND ON");
   });
 
-  // Drawer toggle
   drawerTab.addEventListener("click", () => document.body.classList.toggle("drawer-open"));
   $("btn-drawer-close").addEventListener("click", () => document.body.classList.remove("drawer-open"));
   $("btn-remote-hdr").addEventListener("click", () => remoteEl.classList.toggle("hidden"));
   $("btn-remote-close").addEventListener("click", () => remoteEl.classList.add("hidden"));
 
-  // Stream form & starter chips
   $("stream-form").addEventListener("submit", (e) => {
     e.preventDefault();
     ensureAudioGraph();
     tuneUrl($("stream-url").value);
   });
 
+  $("btn-guide").addEventListener("click", () => {
+    ensureAudioGraph();
+    victr.toggle_guide();
+    syncUiFromEngine();
+  });
+
+  $("btn-list").addEventListener("click", () => {
+    victr.guide_open_picker();
+    syncUiFromEngine();
+  });
+  $("btn-watched").addEventListener("click", () => {
+    if (!currentSource.itemId) return;
+    currentSource.itemPlayed = victr.toggle_item_watched(currentSource.itemId);
+    persistWatchState();
+    syncUiFromEngine();
+  });
+  $("btn-fav").addEventListener("click", () => {
+    if (!currentSource.itemId) return;
+    currentSource.itemFavorite = victr.toggle_item_favorite(currentSource.itemId, currentSource.title);
+    persistWatchState();
+    syncUiFromEngine();
+  });
+  $("btn-next").addEventListener("click", () => stepEpisode(1));
+
   document.querySelectorAll(".chip").forEach((el) => {
     el.addEventListener("click", () => {
       ensureAudioGraph();
       const s = el.dataset.slug;
-      if (s === "nhk") tuneStarter(0);
-      else if (s === "dw") tuneStarter(1);
+      if (s === "nhk") tuneChannelNumber(80);
+      else if (s === "dw") tuneChannelNumber(81);
       else if (s === "demo") tunePattern("demo_scene", "Demo Scene");
       else if (s === "bars") tunePattern("color_bars", "Color Bars");
     });
   });
 
-  // Share link, Mirror Tab, File open
   const copyShare = async () => {
     const link = buildShareUrl();
     try {
@@ -428,16 +820,9 @@ function wireControls() {
     if (file) loadLocalFile(file);
   });
 
-  // Receiver buttons
-  $("btn-power").addEventListener("click", () => {
-    victr.toggle_power();
-    syncUiFromEngine();
-  });
+  $("btn-power").addEventListener("click", () => { victr.toggle_power(); syncUiFromEngine(); });
   $("btn-degauss").addEventListener("click", () => victr.degauss());
-  $("btn-crop").addEventListener("click", () => {
-    victr.toggle_crop_43();
-    syncUiFromEngine();
-  });
+  $("btn-crop").addEventListener("click", () => { victr.toggle_crop_43(); syncUiFromEngine(); });
   $("btn-pp").addEventListener("click", () => {
     const inches = victr.snap_pixel_perfect();
     syncUiFromEngine();
@@ -450,7 +835,6 @@ function wireControls() {
   });
   $("btn-whack").addEventListener("click", () => victr.whack());
 
-  // Preset & knobs
   selPreset.addEventListener("change", () => {
     victr.set_preset(parseInt(selPreset.value, 10));
     syncUiFromEngine();
@@ -474,18 +858,9 @@ function wireControls() {
   bindPatch("sl-curv", "curvature", (el) => parseFloat(el.value));
   bindPatch("sl-snr", "signal_db", (el) => parseFloat(el.value));
 
-  $("btn-mute").addEventListener("click", () => {
-    ensureAudioGraph();
-    victr.toggle_mute();
-    syncUiFromEngine();
-  });
-  $("sl-vol").addEventListener("input", (e) => {
-    ensureAudioGraph();
-    victr.set_volume(parseFloat(e.target.value));
-    syncUiFromEngine();
-  });
+  $("btn-mute").addEventListener("click", () => { ensureAudioGraph(); victr.toggle_mute(); syncUiFromEngine(); });
+  $("sl-vol").addEventListener("input", (e) => { ensureAudioGraph(); victr.set_volume(parseFloat(e.target.value)); syncUiFromEngine(); });
 
-  // Clickable Remote buttons
   remoteEl.querySelectorAll("[data-act]").forEach((btn) => {
     btn.addEventListener("click", () => {
       ensureAudioGraph();
@@ -493,8 +868,19 @@ function wireControls() {
         case "power": victr.toggle_power(); syncUiFromEngine(); break;
         case "mute": victr.toggle_mute(); syncUiFromEngine(); break;
         case "info": victr.show_osd_channel(currentSource.ch, currentSource.callsign, currentSource.title); break;
-        case "ch-prev": tuneStarter(activeStarterIdx < 0 ? 0 : activeStarterIdx - 1); break;
-        case "ch-next": tuneStarter(activeStarterIdx < 0 ? 0 : activeStarterIdx + 1); break;
+        case "guide": victr.toggle_guide(); syncUiFromEngine(); break;
+        case "list": victr.guide_open_picker(); syncUiFromEngine(); break;
+        case "watched":
+          if (victr.is_guide_active()) {
+            victr.guide_toggle_selected_watched();
+          } else if (currentSource.itemId) {
+            currentSource.itemPlayed = victr.toggle_item_watched(currentSource.itemId);
+          }
+          persistWatchState();
+          syncUiFromEngine();
+          break;
+        case "ch-prev": surfChannel(-1); break;
+        case "ch-next": surfChannel(1); break;
         case "vol-down": victr.adjust_volume(-0.05); syncUiFromEngine(); break;
         case "vol-up": victr.adjust_volume(0.05); syncUiFromEngine(); break;
         case "play":
@@ -516,90 +902,149 @@ function wireControls() {
     });
   });
 
-  // Canvas zoom / pan / double-click reset
+  // Canvas zoom / pan / click-to-tune inside 90s Prevue Cable Guide
   let dragging = false;
+  let moved = false;
   let lastX = 0;
   let lastY = 0;
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
+    if (victr.is_guide_active()) {
+      victr.guide_move(e.deltaY > 0 ? 1 : -1);
+      return;
+    }
     const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
     victr.zoom_by(factor);
   }, { passive: false });
   canvas.addEventListener("pointerdown", (e) => {
     dragging = true;
+    moved = false;
     lastX = e.clientX;
     lastY = e.clientY;
     canvas.setPointerCapture(e.pointerId);
   });
   canvas.addEventListener("pointermove", (e) => {
     if (!dragging) return;
+    if (Math.hypot(e.clientX - lastX, e.clientY - lastY) > 4) moved = true;
+    if (victr.is_guide_active()) return;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     victr.pan_by((e.clientX - lastX) * dpr, (e.clientY - lastY) * dpr);
     lastX = e.clientX;
     lastY = e.clientY;
   });
-  canvas.addEventListener("pointerup", () => { dragging = false; });
-  canvas.addEventListener("dblclick", () => victr.reset_view());
+  canvas.addEventListener("pointerup", (e) => {
+    if (!moved && victr.is_guide_active()) {
+      const rect = canvas.getBoundingClientRect();
+      const nx = (e.clientX - rect.left) / Math.max(1, rect.width);
+      const ny = (e.clientY - rect.top) / Math.max(1, rect.height);
+      handleGuideActionJson(victr.guide_click_json(nx, ny));
+    }
+    dragging = false;
+  });
+  canvas.addEventListener("dblclick", () => {
+    if (!victr.is_guide_active()) victr.reset_view();
+  });
 
   // Drag & drop files anywhere on window
   const dropEl = $("drop-overlay");
   let dragDepth = 0;
-  window.addEventListener("dragenter", (e) => {
-    e.preventDefault();
-    dragDepth++;
-    dropEl.classList.remove("hidden");
-  });
+  window.addEventListener("dragenter", (e) => { e.preventDefault(); dragDepth++; dropEl.classList.remove("hidden"); });
   window.addEventListener("dragover", (e) => e.preventDefault());
-  window.addEventListener("dragleave", () => {
-    dragDepth = Math.max(0, dragDepth - 1);
-    if (dragDepth === 0) dropEl.classList.add("hidden");
-  });
+  window.addEventListener("dragleave", () => { dragDepth = Math.max(0, dragDepth - 1); if (dragDepth === 0) dropEl.classList.add("hidden"); });
   window.addEventListener("drop", (e) => {
     e.preventDefault();
     dragDepth = 0;
     dropEl.classList.add("hidden");
     const file = e.dataTransfer?.files?.[0];
-    if (file) {
-      ensureAudioGraph();
-      loadLocalFile(file);
-    }
+    if (file) { ensureAudioGraph(); loadLocalFile(file); }
   });
 
-  // Keyboard remote shortcuts
+  // Keyboard TV remote + Guide controls
   window.addEventListener("keydown", (e) => {
     const tag = document.activeElement?.tagName;
     if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
 
+    // Live `/` search typing inside Guide
+    if (victr.is_guide_searching()) {
+      if (e.key === "Escape") { victr.guide_close_or_back(); return; }
+      if (e.key === "Backspace") { e.preventDefault(); victr.guide_search_pop(); return; }
+      if (e.key === "Enter") { e.preventDefault(); handleGuideActionJson(victr.guide_confirm_json()); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); victr.guide_move(-1); return; }
+      if (e.key === "ArrowDown") { e.preventDefault(); victr.guide_move(1); return; }
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        victr.guide_search_push(e.key);
+        return;
+      }
+      return;
+    }
+
     if (e.key === "Escape") {
-      remoteEl.classList.add("hidden");
+      if (!remoteEl.classList.contains("hidden")) { remoteEl.classList.add("hidden"); return; }
+      if (victr.guide_close_or_back()) { syncUiFromEngine(); return; }
       document.body.classList.remove("drawer-open");
       return;
     }
-    if (e.key === "?") {
-      e.preventDefault();
-      remoteEl.classList.toggle("hidden");
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key === "1") {
-      e.preventDefault();
-      victr.snap_pixel_perfect();
-      syncUiFromEngine();
-      return;
-    }
-    if (e.shiftKey && (e.key === "Z" || e.key === "z")) {
-      e.preventDefault();
-      victr.toggle_crop_43();
-      syncUiFromEngine();
-      return;
-    }
+    if (e.key === "?") { e.preventDefault(); remoteEl.classList.toggle("hidden"); return; }
+    if ((e.ctrlKey || e.metaKey) && e.key === "1") { e.preventDefault(); victr.snap_pixel_perfect(); syncUiFromEngine(); return; }
+    if (e.shiftKey && (e.key === "Z" || e.key === "z")) { e.preventDefault(); victr.toggle_crop_43(); syncUiFromEngine(); return; }
     if (e.ctrlKey || e.metaKey || e.altKey) return;
 
+    if (e.key === "/" && victr.is_guide_active()) { e.preventDefault(); victr.guide_search_start(); return; }
+    if (e.key === "*") {
+      e.preventDefault();
+      if (victr.is_guide_active()) {
+        victr.guide_toggle_selected_favorite();
+      } else if (currentSource.itemId) {
+        currentSource.itemFavorite = victr.toggle_item_favorite(currentSource.itemId, currentSource.title);
+      }
+      persistWatchState();
+      syncUiFromEngine();
+      return;
+    }
+    if (/^[0-9]$/.test(e.key)) {
+      const ch = victr.push_digit(e.key);
+      if (ch > 0) tuneChannelNumber(ch);
+      return;
+    }
+
+    if (victr.is_guide_active()) {
+      if (e.key === "ArrowUp") { e.preventDefault(); victr.guide_move(-1); return; }
+      if (e.key === "ArrowDown") { e.preventDefault(); victr.guide_move(1); return; }
+      if (e.key === "ArrowLeft") { e.preventDefault(); victr.guide_shift_h(-1); return; }
+      if (e.key === "ArrowRight") { e.preventDefault(); victr.guide_shift_h(1); return; }
+      if (e.key === "Backspace") { e.preventDefault(); victr.guide_close_or_back(); return; }
+      if (e.key === "Enter") {
+        e.preventDefault();
+        const dialed = victr.commit_digits();
+        if (dialed > 0) tuneChannelNumber(dialed);
+        else handleGuideActionJson(victr.guide_confirm_json());
+        return;
+      }
+    } else if (e.key === "Enter") {
+      const dialed = victr.commit_digits();
+      if (dialed > 0) { tuneChannelNumber(dialed); return; }
+    }
+
     switch (e.key) {
+      case "g": case "G": victr.toggle_guide(); syncUiFromEngine(); break;
+      case "e": case "E": victr.guide_open_picker(); syncUiFromEngine(); break;
+      case "w": case "W":
+        if (victr.is_guide_active()) {
+          victr.guide_toggle_selected_watched();
+        } else if (currentSource.itemId) {
+          currentSource.itemPlayed = victr.toggle_item_watched(currentSource.itemId);
+        }
+        persistWatchState();
+        syncUiFromEngine();
+        break;
+      case "n": case "N": stepEpisode(1); break;
+      case "p": case "P": stepEpisode(-1); break;
       case "m": case "M": victr.toggle_mute(); syncUiFromEngine(); break;
       case "-": victr.adjust_volume(-0.05); syncUiFromEngine(); break;
       case "=": case "+": victr.adjust_volume(0.05); syncUiFromEngine(); break;
-      case "[": tuneStarter(activeStarterIdx < 0 ? 0 : activeStarterIdx - 1); break;
-      case "]": tuneStarter(activeStarterIdx < 0 ? 0 : activeStarterIdx + 1); break;
+      case "[": case "PageDown": surfChannel(-1); break;
+      case "]": case "PageUp": surfChannel(1); break;
       case "d": case "D": victr.degauss(); break;
       case "k": case "K": victr.whack(); break;
       case "i": case "I": victr.show_osd_channel(currentSource.ch, currentSource.callsign, currentSource.title); break;
@@ -637,14 +1082,23 @@ async function boot() {
 
   window.addEventListener("resize", resizeCanvas);
   wireControls();
-  applyUrlParamsOnBoot();
+  await applyUrlParamsOnBoot();
 
   let lastTs = performance.now();
+  let lastResumeSave = performance.now();
   function frame(now) {
     const dt = (now - lastTs) / 1000;
     lastTs = now;
-    if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0 && !video.ended) {
+    const dialed = victr.poll_digit_commit();
+    if (dialed > 0) tuneChannelNumber(dialed);
+
+    if (!victr.is_guide_active() && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0 && !video.ended) {
       victr.upload_video_frame(video);
+    }
+    if (currentSource.hasItems && currentSource.itemId && !video.paused && Number.isFinite(video.duration) && now - lastResumeSave > 15000) {
+      lastResumeSave = now;
+      victr.save_item_resume(currentSource.itemId, video.currentTime, video.duration);
+      persistWatchState();
     }
     try {
       victr.tick_and_render(dt);

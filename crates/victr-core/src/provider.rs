@@ -530,11 +530,15 @@ impl Channel {
     }
 
     /// Returns the next episode after `current_item_id` (for auto-advance on Series & Block channels).
+    /// Prefers the next unwatched item so already-watched items aren't replayed unless all are watched.
     pub fn next_after(&self, current_item_id: &str) -> Option<TuneTarget> {
         match &self.kind {
             ChannelKind::Series { episodes, .. } => {
                 let pos = episodes.iter().position(|e| e.id == current_item_id)?;
-                let next = episodes.get(pos + 1)?;
+                let next = episodes
+                    .get(pos + 1..)
+                    .and_then(|tail| tail.iter().find(|e| !e.played))
+                    .or_else(|| episodes.get(pos + 1))?;
                 Some(TuneTarget {
                     channel_number: self.number,
                     provider_id: self.provider_id.clone(),
@@ -823,14 +827,139 @@ pub fn pick_next_episode_index(episodes: &[MediaItem], next_up_id: Option<&str>)
         return None;
     }
     if let Some(id) = next_up_id {
-        if let Some(pos) = episodes.iter().position(|e| e.id == id && (!e.played || e.resume_secs > 10.0)) {
-            return Some(pos);
+        if let Some(pos) = episodes.iter().position(|e| e.id == id) {
+            if !episodes[pos].played || episodes[pos].resume_secs > 10.0 {
+                return Some(pos);
+            }
+            // The last-played item was marked watched: advance to the first unwatched item after it.
+            if let Some(rel) = episodes[pos + 1..].iter().position(|e| !e.played) {
+                return Some(pos + 1 + rel);
+            }
         }
     }
     if let Some(pos) = episodes.iter().position(|e| e.resume_secs > 10.0 && !e.played) {
         return Some(pos);
     }
     episodes.iter().position(|e| !e.played).or(Some(0))
+}
+
+// ------------------------------------------------------------------ Open Channel Watch State
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ItemWatchEntry {
+    #[serde(default)]
+    pub played: bool,
+    #[serde(default)]
+    pub resume_secs: f64,
+}
+
+/// Persistent watched/resume status and last-played item memory for open/inline channels
+/// (PuzzleScript Gallery, PICO-8 BBS, `channels.json` series/blocks, and `victr-web` feeds).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct OpenChannelWatchState {
+    #[serde(default)]
+    pub items: std::collections::HashMap<String, ItemWatchEntry>,
+    /// Last tuned `MediaItem::id` per channel (`Channel::source_key`).
+    #[serde(default)]
+    pub last_item_by_channel: std::collections::HashMap<String, String>,
+}
+
+impl OpenChannelWatchState {
+    pub fn set_played(&mut self, item_id: &str, played: bool) {
+        if item_id.trim().is_empty() {
+            return;
+        }
+        let e = self.items.entry(item_id.to_string()).or_default();
+        e.played = played;
+        if played {
+            e.resume_secs = 0.0;
+        }
+    }
+
+    pub fn save_resume(&mut self, item_id: &str, pos_secs: f64, duration_secs: f64) {
+        if item_id.trim().is_empty() {
+            return;
+        }
+        let e = self.items.entry(item_id.to_string()).or_default();
+        if duration_secs > 30.0 && pos_secs / duration_secs >= 0.90 {
+            e.played = true;
+            e.resume_secs = 0.0;
+        } else if pos_secs > 10.0 {
+            e.resume_secs = pos_secs;
+        }
+    }
+
+    pub fn record_last_item(&mut self, source_key: &str, item_id: &str) {
+        if source_key.trim().is_empty() || item_id.trim().is_empty() {
+            return;
+        }
+        self.last_item_by_channel
+            .insert(source_key.to_string(), item_id.to_string());
+    }
+}
+
+/// Hydrates watched/resume state and remembers the last-played item for open channels
+/// (`provider_id == "channels"` or `"web"`). For unnumbered collections (like PuzzleScript
+/// Gallery, PICO-8 BBS, or open playlists), also stable-sorts items so:
+/// 0. Unwatched Favorites -> 1. Unwatched -> 2. Watched Favorites -> 3. Watched.
+pub fn apply_open_watch_state(
+    channels: &mut [Channel],
+    state: &OpenChannelWatchState,
+    favorite_items: &std::collections::BTreeSet<String>,
+) {
+    for ch in channels.iter_mut() {
+        if ch.provider_id != "channels" && ch.provider_id != "web" {
+            continue;
+        }
+        let last_id = state.last_item_by_channel.get(&ch.source_key).cloned();
+        match &mut ch.kind {
+            ChannelKind::Series { episodes, next_up_episode_id, .. } => {
+                for ep in episodes.iter_mut() {
+                    if let Some(entry) = state.items.get(&ep.id) {
+                        ep.played = entry.played;
+                        ep.resume_secs = entry.resume_secs;
+                    }
+                }
+                let is_numbered_series = episodes.iter().any(|e| e.season.is_some() || e.episode.is_some());
+                if !is_numbered_series {
+                    // Open gallery / collection: Unwatched Favorites -> Unwatched -> Watched Favorites -> Watched
+                    episodes.sort_by_key(|e| {
+                        let fav = favorite_items.contains(&e.id);
+                        match (e.played, fav) {
+                            (false, true) => 0u8,
+                            (false, false) => 1u8,
+                            (true, true) => 2u8,
+                            (true, false) => 3u8,
+                        }
+                    });
+                }
+                if let Some(lid) = last_id {
+                    if let Some(idx) = pick_next_episode_index(episodes, Some(&lid)) {
+                        *next_up_episode_id = episodes.get(idx).map(|e| e.id.clone());
+                    }
+                } else if let Some(idx) = pick_next_episode_index(episodes, None) {
+                    *next_up_episode_id = episodes.get(idx).map(|e| e.id.clone());
+                }
+            }
+            ChannelKind::Block { items, .. } => {
+                for it in items.iter_mut() {
+                    if let Some(entry) = state.items.get(&it.id) {
+                        it.played = entry.played;
+                        it.resume_secs = entry.resume_secs;
+                    }
+                }
+            }
+            ChannelKind::MovieGenre { movies, .. } => {
+                for it in movies.iter_mut() {
+                    if let Some(entry) = state.items.get(&it.id) {
+                        it.played = entry.played;
+                        it.resume_secs = entry.resume_secs;
+                    }
+                }
+            }
+            ChannelKind::Guide | ChannelKind::LiveStream { .. } => {}
+        }
+    }
 }
 
 pub fn pick_next_episode<'a>(episodes: &'a [MediaItem], next_up_id: Option<&str>) -> Option<&'a MediaItem> {
@@ -1042,5 +1171,68 @@ mod tests {
         // Live streams start at CH 80
         assert_eq!(lineup[5].number, 80);
         assert_eq!(lineup[5].name, "Retro News");
+    }
+
+    #[test]
+    fn open_watch_state_sorts_unwatched_favorites_and_remembers_last_item() {
+        let mk = |id: &str, title: &str| MediaItem {
+            id: id.into(),
+            title: title.into(),
+            season: None,
+            episode: None,
+            overview: String::new(),
+            runtime_secs: 0.0,
+            played: false,
+            resume_secs: 0.0,
+            artwork_id: String::new(),
+            stream_url: format!("web://https://example.org/{id}"),
+        };
+        let mut channels = vec![Channel {
+            number: 71,
+            provider_id: "channels".into(),
+            source_key: "cfg:puzzlescript".into(),
+            callsign: "PZLS".into(),
+            name: "PuzzleScript Gallery".into(),
+            artwork_id: String::new(),
+            channel_type: "web".into(),
+            profile_override: None,
+            kind: ChannelKind::Series {
+                series_id: "cfg:puzzlescript".into(),
+                overview: String::new(),
+                is_continue: false,
+                is_favorite: false,
+                episodes: vec![
+                    mk("p1", "Sokoban 1"),
+                    mk("p2", "Ice Cave"),
+                    mk("p3", "Laser Grid"),
+                    mk("p4", "Box World"),
+                ],
+                next_up_episode_id: None,
+                loaded_episodes: true,
+            },
+        }];
+
+        let mut state = OpenChannelWatchState::default();
+        state.set_played("p1", true);
+        state.record_last_item("cfg:puzzlescript", "p3");
+        let mut favs = std::collections::BTreeSet::new();
+        favs.insert("p4".to_string());
+
+        apply_open_watch_state(&mut channels, &state, &favs);
+
+        // Order: Unwatched Fav (p4) -> Unwatched (p2, p3) -> Watched (p1)
+        let ids: Vec<&str> = channels[0].items().iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["p4", "p2", "p3", "p1"]);
+
+        // Tuning resumes the remembered unwatched item (p3) instead of starting at #1
+        let now = channels[0].resolve_now(1_700_000_000).unwrap();
+        assert_eq!(now.item.id, "p3");
+
+        // Once p3 is marked watched, tuning skips watched items and picks an unwatched one (p4)
+        state.set_played("p3", true);
+        apply_open_watch_state(&mut channels, &state, &favs);
+        let now2 = channels[0].resolve_now(1_700_000_000).unwrap();
+        assert_eq!(now2.item.id, "p4");
+        assert!(!now2.item.played);
     }
 }

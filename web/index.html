@@ -56,16 +56,23 @@
         <section class="group">
           <div class="group-title">TUNE &amp; SHARE</div>
           <form id="stream-form" class="row">
-            <input id="stream-url" type="url" placeholder="Paste .m3u8, .mp4, .webm, or image URL…" autocomplete="off" />
+            <input id="stream-url" type="url" placeholder="Paste .m3u8, Owncast, PeerTube, .m3u, or feed URL…" autocomplete="off" />
             <button type="submit" class="btn accent">Tune</button>
           </form>
           <div class="row wrap">
-            <button id="btn-share" class="btn sm accent" title="Copy a shareable onvic.tr link with your current stream, preset & 4:3 crop">Copy Share Link</button>
-            <button id="btn-mirror" class="btn sm" title="Mirror any browser tab (YouTube, Twitch, WeatherStar) or emulator window onto the CRT">Mirror Tab / Window</button>
+            <button id="btn-guide" class="btn sm accent" title="Open 90s Prevue Cable Guide (G)">Cable Guide (G)</button>
+            <button id="btn-share" class="btn sm" title="Copy a shareable onvic.tr link with your current stream, feed, preset & 4:3 crop">Copy Share Link</button>
+            <button id="btn-mirror" class="btn sm" title="Mirror any browser tab or emulator window onto the CRT">Mirror Tab</button>
             <label class="btn sm file-btn" title="Open a local video or image file">
               Open File…
               <input id="file-input" type="file" accept="video/*,image/*" hidden />
             </label>
+          </div>
+          <div id="active-item-bar" class="row wrap hidden">
+            <button id="btn-list" class="btn sm" title="Browse episodes/items on this channel (E)">List (E)</button>
+            <button id="btn-watched" class="btn sm" title="Mark watched so it won't auto-play again (W)">Mark Watched</button>
+            <button id="btn-fav" class="btn sm" title="Favorite this item to float it to the top (*)">Fav *</button>
+            <button id="btn-next" class="btn sm" title="Next unwatched item (N)">Next (N)</button>
           </div>
           <div class="channel-chips">
             <button class="chip" data-slug="nhk">CH 80 · NHK World</button>
@@ -161,6 +168,11 @@
       <button class="rbtn pwr" data-act="power">POWER</button>
       <button class="rbtn" data-act="mute">MUTE</button>
       <button class="rbtn" data-act="info">INFO</button>
+    </div>
+    <div class="rem-grid cols-3">
+      <button class="rbtn" data-act="guide">GUIDE (G)</button>
+      <button class="rbtn" data-act="list">LIST (E)</button>
+      <button class="rbtn" data-act="watched">SEEN (W)</button>
     </div>
     <div class="rem-grid cols-3">
       <button class="rbtn" data-act="ch-prev">CH -</button>
