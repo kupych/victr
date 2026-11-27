@@ -3,6 +3,7 @@
 /.linker
 /.cargo/config.toml
 /shots
+/web/pkg
 /*.desktop
 mpv-shot*.jpg
 mpv-shot*.png

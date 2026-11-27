@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ViCTR — Virtual CRT Television Receiver (onvic.tr)</title>
+  <meta name="description" content="Watch any web stream, video, or mirrored tab through a real-time physics-based CRT television simulator in your browser." />
+  <link rel="stylesheet" href="./style.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/hls.js@1.5.18/dist/hls.min.js"></script>
+</head>
+<body>
+  <canvas id="crt"></canvas>
+  <video id="video" crossorigin="anonymous" playsinline autoplay muted></video>
+
+  <!-- Drag & Drop Overlay -->
+  <div id="drop-overlay" class="hidden">
+    <div class="drop-box">
+      <div class="drop-title">DROP VIDEO OR IMAGE ONTO CRT</div>
+      <div class="drop-sub">MP4 · WebM · PNG · JPG · WebP — stays 100% local in your browser</div>
+    </div>
+  </div>
+
+  <!-- WebGPU Fallback / Error Banner -->
+  <div id="webgpu-error" class="modal hidden">
+    <div class="modal-card">
+      <h2>WebGPU Required</h2>
+      <p id="webgpu-error-msg">ViCTR Web runs a full multi-pass CRT physics simulation using WebGPU.</p>
+      <p class="muted">Try Chrome 113+, Edge 113+, Safari 26+, or Firefox with WebGPU enabled — or download the native desktop app for Vulkan/Metal/DX12 + full mpv/Jellyfin/Plex/libretro support.</p>
+    </div>
+  </div>
+
+  <!-- Subtle floating pills (auto-fade when idle) -->
+  <div id="sound-pill" class="pill hidden" title="Click anywhere or press M to enable simulated TV speaker & RF sound">
+    Click for TV Sound
+  </div>
+  <div id="toast" class="pill hidden"></div>
+
+  <!-- Retro Walnut & Brushed-Metal Right-Edge Pull Tab -->
+  <button id="drawer-tab" aria-label="Toggle Quick Menu" title="Open Quick Menu">
+    <span class="tab-chevron">&lsaquo;</span>
+  </button>
+
+  <!-- Slide-in Quick Menu Drawer -->
+  <aside id="drawer" aria-label="ViCTR Quick Menu">
+    <div class="drawer-inner">
+      <header class="drawer-header">
+        <span class="brand">VICTR <small>onvic.tr</small></span>
+        <div class="header-actions">
+          <button id="btn-remote-hdr" class="btn sm" title="Toggle clickable TV Remote (?)">Remote (?)</button>
+          <button id="btn-drawer-close" class="btn sm" title="Slide Quick Menu closed">Close &rsaquo;</button>
+        </div>
+      </header>
+
+      <div class="drawer-scroll">
+        <!-- Stream & Share -->
+        <section class="group">
+          <div class="group-title">TUNE &amp; SHARE</div>
+          <form id="stream-form" class="row">
+            <input id="stream-url" type="url" placeholder="Paste .m3u8, .mp4, .webm, or image URL…" autocomplete="off" />
+            <button type="submit" class="btn accent">Tune</button>
+          </form>
+          <div class="row wrap">
+            <button id="btn-share" class="btn sm accent" title="Copy a shareable onvic.tr link with your current stream, preset & 4:3 crop">Copy Share Link</button>
+            <button id="btn-mirror" class="btn sm" title="Mirror any browser tab (YouTube, Twitch, WeatherStar) or emulator window onto the CRT">Mirror Tab / Window</button>
+            <label class="btn sm file-btn" title="Open a local video or image file">
+              Open File…
+              <input id="file-input" type="file" accept="video/*,image/*" hidden />
+            </label>
+          </div>
+          <div class="channel-chips">
+            <button class="chip" data-slug="nhk">CH 80 · NHK World</button>
+            <button class="chip" data-slug="dw">CH 81 · DW News</button>
+            <button class="chip" data-slug="demo">Demo Scene</button>
+            <button class="chip" data-slug="bars">Color Bars</button>
+          </div>
+        </section>
+
+        <!-- Receiver Quick Actions -->
+        <section class="group">
+          <div class="group-title">RECEIVER</div>
+          <div class="row wrap">
+            <button id="btn-power" class="btn sm active">Power</button>
+            <button id="btn-degauss" class="btn sm" title="Fire PTC degaussing coil (D)">Degauss</button>
+            <button id="btn-crop" class="btn sm" title="Crop widescreen video to fill 4:3 CRT (Shift+Z)">4:3 Crop</button>
+            <button id="btn-pp" class="btn sm" title="Snap 1:1 pixel-perfect phosphors (Ctrl+1)">1:1</button>
+            <button id="btn-reset-view" class="btn sm" title="Reset zoom & pan (Double-click)">Reset View</button>
+            <button id="btn-fs" class="btn sm" title="Toggle fullscreen (F)">Fullscreen</button>
+            <button id="btn-whack" class="btn sm hidden" title="Slap cabinet back into lock (K)">Whack!</button>
+          </div>
+        </section>
+
+        <!-- Preset & Signal -->
+        <section class="group">
+          <div class="group-title">TV PRESET &amp; SIGNAL</div>
+          <div class="row">
+            <label class="lbl" for="sel-preset">Preset</label>
+            <select id="sel-preset"></select>
+          </div>
+          <div class="row">
+            <label class="lbl" for="sel-input">Input</label>
+            <select id="sel-input">
+              <option value="rf">RF Antenna (Broadcast)</option>
+              <option value="composite">Composite Video</option>
+              <option value="svideo">S-Video (Y/C)</option>
+              <option value="component">Component / RGB</option>
+            </select>
+          </div>
+          <div class="row">
+            <label class="lbl" for="sel-mask">Mask</label>
+            <select id="sel-mask">
+              <option value="slot_mask">Slot Mask</option>
+              <option value="shadow_mask">Shadow Mask (Dots)</option>
+              <option value="aperture_grille">Aperture Grille (Trinitron)</option>
+            </select>
+          </div>
+          <div class="row checks">
+            <label><input id="chk-vcr" type="checkbox" /> VCR Tape</label>
+            <label><input id="chk-bezel" type="checkbox" checked /> Bezel</label>
+            <label><input id="chk-chaos" type="checkbox" /> Chaos</label>
+          </div>
+        </section>
+
+        <!-- Picture Knobs -->
+        <section class="group">
+          <div class="group-title">PICTURE KNOBS</div>
+          <label class="slider-row"><span>Brightness</span><input id="sl-bright" type="range" min="-0.5" max="0.5" step="0.01" /></label>
+          <label class="slider-row"><span>Contrast</span><input id="sl-contrast" type="range" min="0.5" max="1.6" step="0.01" /></label>
+          <label class="slider-row"><span>Color</span><input id="sl-color" type="range" min="0" max="1.8" step="0.01" /></label>
+          <label class="slider-row"><span>Curvature</span><input id="sl-curv" type="range" min="0" max="0.28" step="0.005" /></label>
+          <label class="slider-row"><span>RF Signal</span><input id="sl-snr" type="range" min="0" max="45" step="0.5" /></label>
+        </section>
+
+        <!-- Sound -->
+        <section class="group">
+          <div class="group-title">ANALOG SOUND DSP</div>
+          <div class="row">
+            <button id="btn-mute" class="btn sm">Mute</button>
+            <input id="sl-vol" type="range" min="0" max="1" step="0.02" value="0.7" />
+          </div>
+          <div class="row checks">
+            <label><input id="chk-speaker" type="checkbox" checked /> TV Speaker</label>
+            <label><input id="chk-mono" type="checkbox" /> Mono</label>
+          </div>
+        </section>
+
+        <footer class="drawer-footer">
+          <div id="gpu-badge" class="muted">Initializing WebGPU…</div>
+          <div class="muted">Scroll: zoom · Drag: pan · Shift+Z: 4:3 · Ctrl+1: 1:1 · ?: Remote</div>
+        </footer>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Clickable Retro TV Remote (?) -->
+  <div id="remote" class="remote hidden" role="dialog" aria-label="TV Remote">
+    <div class="remote-hdr">
+      <span>TV Remote (?)</span>
+      <button id="btn-remote-close" class="icon-x" aria-label="Close">&times;</button>
+    </div>
+    <div class="rem-grid cols-3">
+      <button class="rbtn pwr" data-act="power">POWER</button>
+      <button class="rbtn" data-act="mute">MUTE</button>
+      <button class="rbtn" data-act="info">INFO</button>
+    </div>
+    <div class="rem-grid cols-3">
+      <button class="rbtn" data-act="ch-prev">CH -</button>
+      <button class="rbtn" data-act="play">PLAY/||</button>
+      <button class="rbtn" data-act="ch-next">CH +</button>
+      <button class="rbtn" data-act="vol-down">VOL -</button>
+      <button class="rbtn" data-act="retry">RETRY (R)</button>
+      <button class="rbtn" data-act="vol-up">VOL +</button>
+    </div>
+    <div class="rem-sep"></div>
+    <div class="rem-grid cols-3">
+      <button class="rbtn" data-act="crop">4:3 Crop</button>
+      <button class="rbtn" data-act="pp">1:1</button>
+      <button class="rbtn" data-act="degauss">Degauss</button>
+    </div>
+    <div class="rem-grid cols-2">
+      <button class="rbtn" data-act="fs">Fullscreen (F)</button>
+      <button class="rbtn" data-act="share">Share Link</button>
+    </div>
+    <div class="rem-tip">Drop any video/image · Mirror any tab via Quick Menu</div>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

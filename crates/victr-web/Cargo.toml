@@ -1,0 +1,31 @@
+[package]
+name = "victr-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Thin WASM + WebGPU browser engine for ViCTR (onvic.tr), sharing victr-core's CRT physics, WGSL shaders, OSD, Teletext, and analog audio DSP."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+victr-core = { path = "../victr-core" }
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "=0.2.128"
+wasm-bindgen-futures = "0.4"
+web-time = "1.1"
+wgpu = { version = "30.0.2", default-features = false, features = ["std", "wgsl", "webgpu"] }
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "Window",
+    "Document",
+    "HtmlCanvasElement",
+    "HtmlVideoElement",
+    "HtmlImageElement",
+    "ImageBitmap",
+    "console",
+]

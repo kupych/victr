@@ -6,7 +6,7 @@
 //! while still passing through scanlines, shadow mask triads, and glass bloom.
 
 use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 
 pub const OSD_W: usize = 640;
 pub const OSD_H: usize = 480;

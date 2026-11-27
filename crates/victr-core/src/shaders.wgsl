@@ -360,9 +360,20 @@ fn pat_ramp(uv: vec2<f32>) -> vec3<f32> {
 fn pat_image(uv: vec2<f32>) -> vec3<f32> {
     if U.i0.w == 0 { return vec3<f32>(0.1); }
     let ta = 4.0 / 3.0;
-    let img_aspect = U.p0.z;
+    let raw_aspect = U.p0.z;
+    let crop_fill = raw_aspect < 0.0;
+    let img_aspect = abs(raw_aspect);
     var q = uv;
-    if img_aspect > ta {
+    if crop_fill {
+        // Pan-and-scan crop to fill the 4:3 CRT screen without letterbox/pillarbox bars
+        if img_aspect > ta {
+            let w = ta / img_aspect;
+            q.x = (uv.x - 0.5) * w + 0.5;
+        } else {
+            let h = img_aspect / ta;
+            q.y = (uv.y - 0.5) * h + 0.5;
+        }
+    } else if img_aspect > ta {
         let h = ta / img_aspect;
         q.y = (uv.y - 0.5) / h + 0.5;
     } else {

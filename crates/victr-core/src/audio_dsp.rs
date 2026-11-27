@@ -9,6 +9,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 pub const RATE: f32 = 48000.0;
@@ -57,7 +58,10 @@ impl AudioRing {
                 if self.buf.lock().unwrap().len() < self.cap {
                     break;
                 }
+                #[cfg(not(target_arch = "wasm32"))]
                 std::thread::sleep(Duration::from_millis(1));
+                #[cfg(target_arch = "wasm32")]
+                return;
             }
             let mut b = self.buf.lock().unwrap();
             if self.session.load(Ordering::Relaxed) != session {
@@ -630,6 +634,17 @@ impl Processor {
             or = soft_clip(or);
             out[2 * i] = (ol * 32767.0) as i16;
             out[2 * i + 1] = (or * 32767.0) as i16;
+        }
+    }
+
+    /// Processes a stereo block directly into separate L/R `f32` channels (for WebAudio).
+    pub fn process_f32(&mut self, p: &AudioParams, ring: &AudioRing, out_l: &mut [f32], out_r: &mut [f32]) {
+        let n = out_l.len().min(out_r.len());
+        let mut tmp = vec![0i16; n * 2];
+        self.process(p, ring, &mut tmp);
+        for i in 0..n {
+            out_l[i] = tmp[2 * i] as f32 / 32767.0;
+            out_r[i] = tmp[2 * i + 1] as f32 / 32767.0;
         }
     }
 }

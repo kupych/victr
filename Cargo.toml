@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/victr-core",
     "crates/victr-desktop",
+    "crates/victr-web",
 ]
 default-members = ["crates/victr-desktop"]
 

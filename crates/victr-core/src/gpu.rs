@@ -20,6 +20,8 @@ pub struct FrameInput {
     pub image: Option<(u64, std::sync::Arc<(usize, usize, Vec<u8>)>)>,
     /// Optional 640x480 RGBA8 post-decoder CRT TV OSD (green/white channel & volume overlay).
     pub osd: Option<(u64, std::sync::Arc<Vec<u8>>)>,
+    /// When true, center-crops widescreen input images/videos to fill the 4:3 CRT raster.
+    pub crop_43: bool,
     pub clear_burn: bool,
     pub burn_now: bool,
     pub reset_trails: bool,
@@ -317,6 +319,7 @@ pub struct Gpu {
     p_comp: wgpu::RenderPipeline,
     p_present: wgpu::RenderPipeline,
     p_present_format: wgpu::TextureFormat,
+    #[allow(dead_code)]
     p_present_sdr_rgba8: wgpu::RenderPipeline,
 
     dummy_view: wgpu::TextureView,
@@ -1024,8 +1027,9 @@ impl Gpu {
         let burn_rate_eff = if fi.burn_now { 0.35 } else { u.burn_rate };
         let p = &u.phos;
 
+        let eff_aspect = if fi.crop_43 { -self.img_aspect.abs() } else { self.img_aspect.abs() };
         GpuUniforms {
-            p0: [u.time, u.field_phase, self.img_aspect, burn_rate_eff],
+            p0: [u.time, u.field_phase, eff_aspect, burn_rate_eff],
             u0: [u.frame, u.pattern.max(0) as u32, u.src_w.max(1) as u32, u.src_h.max(1) as u32],
             i0: [u.field, u.interlaced, u.vcr, self.has_img as i32],
             i1: [u.input, u.comb, u.mask, u.bezel],
@@ -1323,7 +1327,64 @@ impl Gpu {
         self.run_pass(encoder, surface_view, &self.p_present, &bg, 0);
     }
 
+    /// Zero-copy WebGPU upload from an HTML `<video>`, `<canvas>`, or `ImageBitmap`.
+    #[cfg(target_arch = "wasm32")]
+    pub fn upload_external_image(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: wgpu::ExternalImageSource,
+        width: u32,
+        height: u32,
+    ) {
+        let w = width.max(1);
+        let h = height.max(1);
+        let cur = self.img_tex.size();
+        let need_new = !self.has_img || cur.width != w || cur.height != h;
+        if need_new {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("img_ext_tex"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            self.img_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            self.img_tex = tex;
+        }
+        queue.copy_external_image_to_texture(
+            &wgpu::CopyExternalImageSourceInfo {
+                source,
+                origin: wgpu::Origin2d::ZERO,
+                flip_y: false,
+            },
+            wgpu::CopyExternalImageDestInfo {
+                texture: &self.img_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+                color_space: wgpu::PredefinedColorSpace::Srgb,
+                premultiplied_alpha: false,
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.img_aspect = w as f32 / h as f32;
+        self.has_img = true;
+        // Bump img_id so any subsequent CPU image upload (e.g. Teletext) won't collide.
+        self.img_id = self.img_id.wrapping_add(1).max(1);
+    }
+
+    pub fn clear_image(&mut self) {
+        self.has_img = false;
+    }
+
     /// Renders an SDR sRGB `Rgba8Unorm` copy of the full window (CRT + UI) and reads it back for PNG export.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn capture_sdr_rgba8(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<(u32, u32, Vec<u8>), String> {
         let w = self.surface_config.width.max(1);
         let h = self.surface_config.height.max(1);

@@ -855,6 +855,7 @@ impl Sim {
             u,
             image: None,
             osd: None,
+            crop_43: false,
             clear_burn: false,
             burn_now: false,
             reset_trails: false,
