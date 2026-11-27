@@ -1692,6 +1692,14 @@ impl CrtApp {
         self.osd.show_volume(self.s.volume, self.muted);
     }
 
+    fn toggle_crop(&mut self) {
+        self.crop = !self.crop;
+        if let Some(p) = &self.player {
+            p.crop(self.crop);
+        }
+        self.osd.show_action(if self.crop { "4:3 CROP ON" } else { "4:3 CROP OFF" });
+    }
+
     fn show_info_osd(&mut self) {
         if self.guide.active {
             self.osd.show_channel(1, "GUIDE", "", self.s.mono);
@@ -3735,10 +3743,15 @@ impl CrtApp {
                     ui.label(RichText::new(format!("{} — {}", self.video_name, st)).small());
                     ui.label(RichText::new("via headless Chromium CDP (640×480)").weak().small());
                 }
-                if ui.checkbox(&mut self.crop, "Crop widescreen to fill 4:3").changed() {
+                if ui
+                    .checkbox(&mut self.crop, "Crop widescreen to fill 4:3 (Shift+Z)")
+                    .on_hover_text("Pan-and-scan widescreen video so it fills the 4:3 CRT screen without letterbox bars (shortcut: Shift+Z).")
+                    .changed()
+                {
                     if let Some(p) = &self.player {
                         p.crop(self.crop);
                     }
+                    self.osd.show_action(if self.crop { "4:3 CROP ON" } else { "4:3 CROP OFF" });
                 }
                 ui.checkbox(&mut self.use_my_mpv, "Use my mpv settings (mpv.conf, key bindings, scripts)")
                     .on_hover_text("Loads your own mpv configuration. Your mpv keys work while the mouse is over the TV.");
@@ -4613,6 +4626,18 @@ impl CrtApp {
                     if self.s.chaos && ui.small_button("Whack!").clicked() {
                         self.sim.whack();
                     }
+                    let crop_lbl = if self.crop {
+                        RichText::new("4:3 Crop").color(Color32::from_rgb(255, 214, 96)).strong()
+                    } else {
+                        RichText::new("4:3 Crop")
+                    };
+                    if ui
+                        .add(egui::Button::new(crop_lbl).selected(self.crop).small())
+                        .on_hover_text("Crop widescreen video to fill 4:3 screen (Shift+Z)")
+                        .clicked()
+                    {
+                        self.toggle_crop();
+                    }
                     if ui.small_button("Reset view").clicked() {
                         self.zoom = 1.0;
                         self.pan = [0.0, 0.0];
@@ -4769,7 +4794,7 @@ impl CrtApp {
 
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new("Scroll to zoom · Drag to pan · Double-click to reset · G for Cable Guide.")
+                    RichText::new("Scroll to zoom · Drag to pan · Double-click to reset · G: Guide · Shift+Z: 4:3 Crop.")
                         .weak()
                         .small(),
                 );
@@ -5411,6 +5436,13 @@ impl CrtApp {
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M)) {
                 self.toggle_mute();
+                remote_consumed = true;
+            }
+            if !retro_playing
+                && !web_playing
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Z))
+            {
+                self.toggle_crop();
                 remote_consumed = true;
             }
             if self.s.chaos && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::K)) {
